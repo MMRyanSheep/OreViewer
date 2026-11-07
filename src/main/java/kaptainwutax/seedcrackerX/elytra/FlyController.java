@@ -1,14 +1,22 @@
 package kaptainwutax.seedcrackerX.elytra;
 
+import java.util.Map;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.monster.Shulker;
 import net.minecraft.world.entity.player.Abilities;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.InventoryMenu;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
@@ -34,6 +42,239 @@ import net.minecraft.world.phys.Vec3;
  */
 public final class FlyController {
    public static final int CRUISE_Y = 140;
+
+   // ------------------------------------------------------------------ held-item selection
+   //
+   // The hunt both digs through ship hulls and fights shulkers. Breaking speed
+   // and attack damage are calculated on the SERVER from the item in the
+   // selected hotbar slot, so changing Inventory.selected alone is not enough:
+   // the client must also tell the server which slot is active. Vanilla does
+   // that from MultiPlayerGameMode.tick() -> ensureHasSentCarriedItem(), but our
+   // code runs on END_CLIENT_TICK (after Minecraft.tick()), so we send the
+   // packet ourselves as well. Vanilla will repeat the same idempotent packet
+   // on the next tick.
+   //
+   // IMPORTANT: MultiPlayerGameMode.sameDestroyTarget() compares the held stack
+   // with the one recorded when the break started. Changing the held item in
+   // the middle of a dig resets the server-side break progress, which is the
+   // "progress keeps resetting" symptom. The mining session therefore equips
+   // its pickaxe exactly once, BEFORE startDestroyBlock(), and never swaps
+   // again until the block is gone.
+   private enum ToolIntent { MINE, ATTACK }
+
+   private static final Map<Item, Integer> PICKAXE_RANK = Map.ofEntries(
+      Map.entry(Items.WOODEN_PICKAXE, 1),
+      Map.entry(Items.COPPER_PICKAXE, 2),
+      Map.entry(Items.STONE_PICKAXE, 3),
+      Map.entry(Items.GOLDEN_PICKAXE, 4),
+      Map.entry(Items.IRON_PICKAXE, 5),
+      Map.entry(Items.DIAMOND_PICKAXE, 6),
+      Map.entry(Items.NETHERITE_PICKAXE, 7)
+   );
+   private static final Map<Item, Integer> WEAPON_SCORE = Map.ofEntries(
+      Map.entry(Items.MACE, 100),
+      Map.entry(Items.TRIDENT, 95),
+      Map.entry(Items.NETHERITE_SWORD, 90),
+      Map.entry(Items.NETHERITE_AXE, 85),
+      Map.entry(Items.DIAMOND_SWORD, 80),
+      Map.entry(Items.DIAMOND_AXE, 75),
+      Map.entry(Items.IRON_SWORD, 65),
+      Map.entry(Items.IRON_AXE, 62),
+      Map.entry(Items.GOLDEN_SWORD, 55),
+      Map.entry(Items.GOLDEN_AXE, 52),
+      Map.entry(Items.STONE_SWORD, 45),
+      Map.entry(Items.STONE_AXE, 42),
+      Map.entry(Items.COPPER_SWORD, 35),
+      Map.entry(Items.COPPER_AXE, 32),
+      Map.entry(Items.WOODEN_SWORD, 25),
+      Map.entry(Items.WOODEN_AXE, 22)
+   );
+   private static final long TOOL_MOVE_COOLDOWN_MS = 1200L;
+   private static final int MAX_TOOL_MOVES = 6;
+
+   private static long lastToolMoveMs;
+   private static int toolMoves;
+   private static String lastToolAction = "未切换";
+
+   public static void resetToolState() {
+      FlyController.lastToolMoveMs = 0L;
+      FlyController.toolMoves = 0;
+      FlyController.lastToolAction = "未切换";
+   }
+
+   /** Equip the fastest pickaxe for {@code state}. Safe to call every tick (no-op when unchanged). */
+   public static boolean equipForMining(LocalPlayer player, BlockState state) {
+      return equip(player, state, ToolIntent.MINE);
+   }
+
+   /** Equip the hardest-hitting melee weapon. Safe to call every tick. */
+   public static boolean equipForAttack(LocalPlayer player) {
+      return equip(player, null, ToolIntent.ATTACK);
+   }
+
+   public static String toolDiagnostics(LocalPlayer player) {
+      if (player == null) {
+         return "手持=? 工具状态=" + FlyController.lastToolAction;
+      }
+      ItemStack held = player.getInventory().getSelectedItem();
+      return "手持=" + itemName(held)
+         + " 槽=" + (player.getInventory().getSelectedSlot() + 1)
+         + " 工具状态=" + FlyController.lastToolAction;
+   }
+
+   private static boolean equip(LocalPlayer player, BlockState state, ToolIntent intent) {
+      if (player == null) {
+         return false;
+      }
+      Inventory inventory = player.getInventory();
+      int slot = bestHotbarSlot(inventory, state, intent);
+      if (slot < 0) {
+         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "快捷栏无镐" : "快捷栏无武器") + "，尝试从背包搬出";
+         return moveToolFromInventory(player, state, intent);
+      }
+      if (slot != inventory.getSelectedSlot()) {
+         selectSlot(player, slot);
+         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘切镐" : "攻击切武器")
+            + " → 槽" + (slot + 1) + " " + itemName(inventory.getItem(slot));
+      } else {
+         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘" : "攻击")
+            + "沿用 " + itemName(inventory.getItem(slot));
+      }
+      return true;
+   }
+
+   private static void selectSlot(LocalPlayer player, int slot) {
+      try {
+         player.getInventory().setSelectedSlot(slot);
+         if (player.connection != null) {
+            player.connection.send(new ServerboundSetCarriedItemPacket(slot));
+         }
+      } catch (Throwable ignored) {
+         // Vanilla's ensureHasSentCarriedItem() still syncs the slot next tick.
+      }
+   }
+
+   private static int bestHotbarSlot(Inventory inventory, BlockState state, ToolIntent intent) {
+      int best = -1;
+      double bestScore = 0.0;
+      for (int i = 0; i < Inventory.getSelectionSize(); i++) {
+         double value = toolScore(inventory.getItem(i), state, intent);
+         if (value > bestScore) {
+            bestScore = value;
+            best = i;
+         }
+      }
+      if (best < 0) {
+         return -1;
+      }
+      // Already holding an equally good tool: do not switch (a switch would
+      // reset an in-progress block break).
+      int current = inventory.getSelectedSlot();
+      if (toolScore(inventory.getItem(current), state, intent) >= bestScore) {
+         return current;
+      }
+      return best;
+   }
+
+   private static double toolScore(ItemStack stack, BlockState state, ToolIntent intent) {
+      if (stack == null || stack.isEmpty()) {
+         return -1.0;
+      }
+      Item item = stack.getItem();
+      double base;
+      if (intent == ToolIntent.MINE) {
+         Integer rank = PICKAXE_RANK.get(item);
+         if (rank == null) {
+            return -1.0;
+         }
+         base = 100.0 + rank * 10.0;
+         if (state != null) {
+            try {
+               base += stack.getDestroySpeed(state);
+            } catch (Throwable ignored) {
+            }
+         }
+      } else {
+         Integer score = WEAPON_SCORE.get(item);
+         if (score == null) {
+            return -1.0;
+         }
+         base = score;
+      }
+      try {
+         if (stack.isEnchanted()) {
+            base += 3.0;
+         }
+         if (stack.getMaxDamage() > 0) {
+            base += Math.min(2.0, (stack.getMaxDamage() - stack.getDamageValue()) / 500.0);
+         }
+      } catch (Throwable ignored) {
+      }
+      return base;
+   }
+
+   /** QUICK_MOVE a tool from the main inventory into a free hotbar slot. */
+   private static boolean moveToolFromInventory(LocalPlayer player, BlockState state, ToolIntent intent) {
+      Minecraft mc = Minecraft.getInstance();
+      if (mc == null || mc.gameMode == null || !(player.containerMenu instanceof InventoryMenu)) {
+         return false;
+      }
+      if (FlyController.toolMoves >= MAX_TOOL_MOVES) {
+         FlyController.lastToolAction += "（搬运次数已用尽）";
+         return false;
+      }
+      long now = System.currentTimeMillis();
+      if (now - FlyController.lastToolMoveMs < TOOL_MOVE_COOLDOWN_MS) {
+         return false;
+      }
+      Inventory inventory = player.getInventory();
+      boolean freeSlot = false;
+      for (int i = 0; i < Inventory.getSelectionSize(); i++) {
+         if (inventory.getItem(i).isEmpty()) {
+            freeSlot = true;
+            break;
+         }
+      }
+      if (!freeSlot) {
+         FlyController.lastToolAction += "（快捷栏已满，无法搬入）";
+         return false;
+      }
+      int best = -1;
+      double bestScore = 0.0;
+      for (int i = Inventory.getSelectionSize(); i < 36; i++) {
+         double value = toolScore(inventory.getItem(i), state, intent);
+         if (value > bestScore) {
+            bestScore = value;
+            best = i;
+         }
+      }
+      if (best < 0) {
+         FlyController.lastToolAction += "（背包中也没有，保持当前手持）";
+         return false;
+      }
+      try {
+         // InventoryMenu maps slots 9..35 straight to inventory slots 9..35.
+         mc.gameMode.handleContainerInput(0, best, 0, ContainerInput.QUICK_MOVE, player);
+         FlyController.lastToolMoveMs = now;
+         FlyController.toolMoves++;
+         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘" : "攻击")
+            + "：从背包槽 " + best + " 搬出工具";
+         return true;
+      } catch (Throwable ignored) {
+         return false;
+      }
+   }
+
+   private static String itemName(ItemStack stack) {
+      if (stack == null || stack.isEmpty()) {
+         return "空手";
+      }
+      try {
+         return stack.getItemName().getString();
+      } catch (Throwable ignored) {
+         return stack.getItem().toString();
+      }
+   }
 
    /** What {@link #navigate} decided to do on the last tick. */
    public enum NavState {
@@ -246,6 +487,10 @@ public final class FlyController {
          return this.blocked(mc, player);
       }
 
+      // Select the pickaxe BEFORE the vanilla break session starts. Once
+      // startDestroyBlock() has recorded destroyingItem, changing the held
+      // stack makes sameDestroyTarget() fail and resets the break progress.
+      equipForMining(player, level.getBlockState(blocker));
       this.miningPos = blocker;
       this.miningDir = hit.getDirection();
       this.miningStartMs = now;
@@ -489,6 +734,12 @@ public final class FlyController {
          return NavState.MINING;
       }
       this.offAimTicks = 0;
+      // A threat attack may have swapped to a sword while the crosshair was
+      // being re-aimed. Re-assert the pickaxe before the FIRST break packet,
+      // never after miningStarted (that would discard accumulated progress).
+      if (!this.miningStarted && !mc.gameMode.isDestroying()) {
+         equipForMining(player, level.getBlockState(pos));
+      }
       try {
          if (!mc.gameMode.isDestroying()) {
             mc.gameMode.startDestroyBlock(pos, direction);
@@ -539,7 +790,49 @@ public final class FlyController {
       this.steerRaw(mc, player, target, slow);
    }
 
+   public boolean isMining() {
+      return this.miningPos != null;
+   }
+
+   /**
+    * Fly straight onto a dropped item so vanilla pickup can collect it.
+    *
+    * <p>Deliberately does NOT run the obstacle ray trace / detour logic here:
+    * item pickup is a pure AABB overlap test on the server and ignores line of
+    * sight. A drop resting against a wall or inside the ship hull is therefore
+    * collectable from just outside that wall. Running {@link #navigate} for the
+    * drop instead made the controller detour, dig or hover a few blocks away
+    * until the (too short) pickup grace expired - the "saw the drop, said it
+    * cannot be picked up, switched target" bug.</p>
+    *
+    * @return true when the player is already close enough to let vanilla pick it up.
+    */
+   public boolean approachForPickup(Minecraft mc, LocalPlayer player, Vec3 itemPos) {
+      if (player == null || itemPos == null) {
+         return false;
+      }
+      double dx = itemPos.x - player.getX();
+      double dz = itemPos.z - player.getZ();
+      double dy = itemPos.y - player.getY();
+      double horizontal = Math.sqrt(dx * dx + dz * dz);
+      if (horizontal <= 0.7 && Math.abs(dy) <= 0.9) {
+         this.hover(mc, player, false);
+         return true;
+      }
+      this.stopMining(mc);
+      // Aim the feet slightly BELOW the item: the vanilla pickup test inflates
+      // the player AABB by ~1 block horizontally, so aligning foot/item height
+      // matters more than reaching the exact eye-level point.
+      Vec3 target = new Vec3(itemPos.x, itemPos.y - 0.35, itemPos.z);
+      this.steerRaw(mc, player, target, true, 0.35);
+      return false;
+   }
+
    private void steerRaw(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow) {
+      this.steerRaw(mc, player, target, slow, VERTICAL_DEADZONE);
+   }
+
+   private void steerRaw(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow, double verticalDeadzone) {
       this.ensureFlight(player);
       double dx = target.x - player.getX();
       double dz = target.z - player.getZ();
@@ -560,8 +853,8 @@ public final class FlyController {
          mc.options.keySprint.setDown(!slow);
 
          double climb = target.y - player.getY();
-         mc.options.keyJump.setDown(climb > VERTICAL_DEADZONE);
-         mc.options.keyShift.setDown(climb < -VERTICAL_DEADZONE);
+         mc.options.keyJump.setDown(climb > verticalDeadzone);
+         mc.options.keyShift.setDown(climb < -verticalDeadzone);
       }
    }
 

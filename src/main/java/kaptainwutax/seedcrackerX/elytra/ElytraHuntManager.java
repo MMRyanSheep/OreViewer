@@ -101,7 +101,20 @@ public final class ElytraHuntManager {
    // is still in the world - only the old Java reference is stale. Re-resolve
    // by the recorded anchor instead of jumping to the next candidate.
    private static final long TARGET_REBIND_GRACE_MS = 5000L;
-   private static final long POPPED_PICKUP_GRACE_MS = 8000L;
+   // A dropped elytra is a real, visible target: chase it with a generous
+   // budget instead of an 8-second wall-clock grace. The old timer started the
+   // moment ANY phase first saw the drop, so time spent clearing a shulker,
+   // descending, or digging through the hull silently consumed it. The first
+   // tick of TAKING then immediately declared "cannot pick up" and switched
+   // ships. All drop timers below are owned by chaseDrop() and are renewed
+   // while the player is still making progress towards the item.
+   private static final long DROP_CHASE_TIMEOUT_MS = 45000L;
+   /** No-progress window before switching from a straight approach to a dig/route. */
+   private static final long DROP_STALL_MS = 2500L;
+   /** How long to hover on top of the item waiting for the server-side pickup. */
+   private static final long DROP_PICKUP_WAIT_MS = 6000L;
+   /** Length of one "dig through the blocker" attempt when the direct path stalls. */
+   private static final long DROP_DIG_MS = 8000L;
    private static final double REBIND_RADIUS = 8.0;
    private static final double DROP_RADIUS = 48.0;
    private static final long THREAT_TIMEOUT_MS = 25000L;
@@ -196,7 +209,13 @@ public final class ElytraHuntManager {
    /** World-space anchor of the target frame; survives client entity re-syncs. */
    private BlockPos targetFramePos;
    private long targetMissingSinceMs;
-   private long poppedSinceMs;
+   /** Start of the current drop chase (TAKING + DROP only); 0 = not chasing yet. */
+   private long dropChaseSinceMs;
+   private double dropBestDistance;
+   private long dropProgressSinceMs;
+   private long dropDigUntilMs;
+   private long dropCloseSinceMs;
+   private String dropIssue;
    private int rebindCount;
    private String targetIssue;
    private long threatSinceMs;
@@ -221,7 +240,7 @@ public final class ElytraHuntManager {
       this.droppedItem = null;
       this.targetFramePos = null;
       this.targetMissingSinceMs = 0L;
-      this.poppedSinceMs = 0L;
+      this.resetDropChase();
       this.rebindCount = 0;
       this.targetIssue = null;
       this.threatSinceMs = 0L;
@@ -229,6 +248,16 @@ public final class ElytraHuntManager {
       this.obstacleSinceMs = 0L;
       this.pickupOnly = false;
       this.itemPopped = false;
+   }
+
+   /** Forget all drop-chase progress (new candidate, or the frame got its elytra back). */
+   private void resetDropChase() {
+      this.dropChaseSinceMs = 0L;
+      this.dropBestDistance = Double.MAX_VALUE;
+      this.dropProgressSinceMs = 0L;
+      this.dropDigUntilMs = 0L;
+      this.dropCloseSinceMs = 0L;
+      this.dropIssue = null;
    }
 
    // ------------------------------------------------------------------ start / stop
@@ -269,6 +298,7 @@ public final class ElytraHuntManager {
       }
 
       BaritoneBridge.ensureIdle();
+      FlyController.resetToolState();
       // Elytra already in the inventory are NOT a reason to refuse: they are
       // the baseline for this run, and only newly picked-up ones count as a haul.
       this.baselineElytra = countElytra(player);
@@ -420,6 +450,18 @@ public final class ElytraHuntManager {
             + " mayfly=" + (player != null && player.getAbilities().mayfly)
             + " flying=" + (player != null && player.getAbilities().flying)
             + " 上次原因=" + (this.lastReason == null ? "无" : this.lastReason),
+         ChatFormatting.AQUA
+      );
+      this.info(
+         FlyController.toolDiagnostics(player)
+            + " 掉落物距离=" + (player == null || this.droppedItem == null
+               ? "无" : String.format("%.1f", player.position().distanceTo(this.droppedItem.position())))
+            + " 吸取计时=" + (this.dropChaseSinceMs == 0L
+               ? 0 : (System.currentTimeMillis() - this.dropChaseSinceMs)) + "ms"
+            + " 最近距离=" + (this.dropBestDistance == Double.MAX_VALUE
+               ? "无" : String.format("%.1f", this.dropBestDistance))
+            + " 吸取状态=" + (this.dropIssue == null
+               ? (this.dropDigUntilMs != 0L ? "挖路" : "直线接近") : this.dropIssue),
          ChatFormatting.AQUA
       );
       if (!this.queue.isEmpty()) {
@@ -1003,6 +1045,13 @@ public final class ElytraHuntManager {
          // frame for a while rather than abandoning this ship.
          return false;
       }
+      // A dropped elytra close to the player has priority over a guard. Combat
+      // consumes entire ticks and used to burn the (wall-clock) pickup grace
+      // before the state machine ever got a chance to fly to the item.
+      if (this.pickupOnly && this.droppedItem != null && !this.droppedItem.isRemoved()
+         && player.distanceToSqr(this.droppedItem) < 144.0) {
+         return false;
+      }
       Vec3 goal = this.threatGoal(player);
       Entity threat = FlyController.findThreat(level, player, goal);
       if (threat == null) {
@@ -1026,8 +1075,13 @@ public final class ElytraHuntManager {
             threat.getClass().getSimpleName(), threat.getId(), threat.blockPosition());
       }
       // Clearing a guard is not a normal approach step: do not let it consume
-      // the verify / approach / take timeout.
+      // the verify / approach / take timeout, nor the drop-chase budget. The
+      // old grace silently expired while the player was still fighting.
       this.phaseStartMs = now;
+      if (this.dropChaseSinceMs != 0L) {
+         this.dropChaseSinceMs = now;
+         this.dropProgressSinceMs = now;
+      }
       double distance = player.position().distanceTo(threat.position());
       if (distance <= 3.2) {
          this.flight.hover(mc, player, false);
@@ -1036,6 +1090,11 @@ public final class ElytraHuntManager {
             && player.getAttackStrengthScale(0.0F) >= 0.9F
             && player.distanceToSqr(threat) < THREAT_ATTACK_RANGE_SQ
             && now - this.lastCombatMs >= COMBAT_COOLDOWN_MS) {
+            // Damage is computed server-side from the selected hotbar slot.
+            // Never swap while a block break is still accumulating progress.
+            if (!this.flight.isMining()) {
+               FlyController.equipForAttack(player);
+            }
             mc.gameMode.attack(player, threat);
             player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
             this.lastCombatMs = now;
@@ -1074,9 +1133,11 @@ public final class ElytraHuntManager {
          }
          this.droppedItem = drop;
          this.pickupOnly = true;
-         if (this.poppedSinceMs == 0L) {
-            this.poppedSinceMs = now;
-         }
+         // Do NOT start the pickup timer here. refreshTarget() is called from
+         // every phase, so a drop seen early (e.g. popped by the mining key)
+         // would burn the whole budget while combat/detours were still running.
+         // chaseDrop() owns the timer and only starts it once it is actually
+         // flying towards the item.
          this.targetMissingSinceMs = 0L;
          this.targetIssue = null;
          return TargetStatus.DROP;
@@ -1106,7 +1167,8 @@ public final class ElytraHuntManager {
          if (!stack.isEmpty() && stack.getItem() == Items.ELYTRA) {
             this.pickupOnly = false;
             this.itemPopped = false;
-            this.poppedSinceMs = 0L;
+            // Keep the chase budget running: a client-side frame/drop flicker
+            // must not reset the timer forever and pin us to one ship.
             this.targetMissingSinceMs = 0L;
             this.targetIssue = null;
             return TargetStatus.FRAME;
@@ -1217,6 +1279,20 @@ public final class ElytraHuntManager {
          }
          return;
       }
+      if (status == TargetStatus.DROP) {
+         // The elytra is already on the ground: hand it straight to the TAKING
+         // chase. The old code stayed in APPROACHING, hovered and waited for
+         // the inventory count to change, then hit the approach timeout and
+         // abandoned a perfectly good drop.
+         this.itemPopped = true;
+         this.attackAttempts = 0;
+         this.lastAttackMs = 0L;
+         this.resetDropChase();
+         this.phaseStartMs = now;
+         this.phase = Phase.TAKING;
+         this.info("检测到掉落的鞘翅，开始吸取追踪…", ChatFormatting.AQUA);
+         return;
+      }
       long approachLimit = this.pickupOnly ? VERIFY_APPROACH_TIMEOUT_MS : APPROACH_TIMEOUT_MS;
       if (now - this.phaseStartMs > approachLimit) {
          this.nextCandidateWithReason(player, now, "贴身接近超时");
@@ -1249,7 +1325,7 @@ public final class ElytraHuntManager {
          this.attackAttempts = 0;
          this.lastAttackMs = 0L;
          this.itemPopped = false;
-         this.poppedSinceMs = 0L;
+         this.resetDropChase();
          this.phase = Phase.TAKING;
          this.info("准星已对准展示框，停止挖掘并直接取物", ChatFormatting.AQUA);
          return;
@@ -1287,7 +1363,7 @@ public final class ElytraHuntManager {
       this.attackAttempts = 0;
       this.lastAttackMs = 0L;
       this.itemPopped = false;
-      this.poppedSinceMs = 0L;
+      this.resetDropChase();
       this.phase = Phase.TAKING;
       this.info("已就位（朝向误差 0°），开始左键取物", ChatFormatting.AQUA);
    }
@@ -1337,23 +1413,7 @@ public final class ElytraHuntManager {
       }
       if (status == TargetStatus.DROP) {
          this.itemPopped = true;
-         if (this.poppedSinceMs == 0L) {
-            this.poppedSinceMs = now;
-         }
-         Entity drop = this.droppedItem;
-         if (now - this.poppedSinceMs > POPPED_PICKUP_GRACE_MS) {
-            this.nextCandidateWithReason(
-               player, now,
-               drop == null ? "鞘翅已弹出但未拾取到" : "鞘翅已掉落但无法吸取"
-            );
-            return;
-         }
-         if (drop != null && !drop.isRemoved() && player.distanceToSqr(drop) > 2.25) {
-            this.flight.navigate(mc, level, player, drop.position().add(0.0, 0.3, 0.0), true, true);
-            this.throttledInfo("正在吸取掉落的鞘翅…", now);
-         } else {
-            this.flight.hover(mc, player, false);
-         }
+         this.chaseDrop(mc, player, level, this.droppedItem, now);
          return;
       }
 
@@ -1394,12 +1454,111 @@ public final class ElytraHuntManager {
          && player.distanceToSqr(frame) < 36.0
          && now - this.lastAttackMs >= 1000L
          && mc.gameMode != null) {
+         if (!this.flight.isMining()) {
+            FlyController.equipForAttack(player);
+         }
          mc.gameMode.attack(player, frame);
          player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
          this.attackAttempts++;
          this.lastAttackMs = now;
          LOGGER.info("[elytra] 左键攻击展示框 #{} at {}", this.attackAttempts, frame.blockPosition());
       }
+   }
+
+   /**
+    * Chase one dropped elytra until the inventory count changes.
+    *
+    * <p>The old implementation used an 8-second wall-clock grace that started
+    * the first time ANY phase noticed the drop. Time spent killing a shulker,
+    * descending or digging through the hull silently consumed it, so the first
+    * TAKING tick immediately reported "cannot pick up" and switched ships. Here
+    * the timer belongs to the chase, is generous, and is only abandoned after a
+    * real lack of progress. A stalled direct approach gets a bounded dig/route
+    * window instead of giving up.</p>
+    */
+   private void chaseDrop(Minecraft mc, LocalPlayer player, ClientLevel level, Entity drop, long now) {
+      if (drop == null || drop.isRemoved()) {
+         this.flight.hover(mc, player, false);
+         this.throttledInfo("等待掉落鞘翅重新同步…", now);
+         return;
+      }
+      if (this.dropChaseSinceMs == 0L) {
+         this.dropChaseSinceMs = now;
+         this.dropBestDistance = Double.MAX_VALUE;
+         this.dropProgressSinceMs = now;
+         this.dropCloseSinceMs = 0L;
+         this.dropDigUntilMs = 0L;
+         this.dropIssue = null;
+         LOGGER.info(
+            "[elytra] 开始吸取掉落鞘翅 id={} at {} 距离={}",
+            drop.getId(), drop.blockPosition(),
+            String.format("%.2f", player.position().distanceTo(drop.position()))
+         );
+      }
+      // The chase owns this phase's timeout; combat / detours must not consume it.
+      this.phaseStartMs = now;
+      double distance = player.position().distanceTo(drop.position());
+      if (distance < this.dropBestDistance - 0.15) {
+         this.dropBestDistance = distance;
+         this.dropProgressSinceMs = now;
+      }
+
+      // A dig window must keep full control of the input keys for its whole
+      // duration: approachForPickup() calls stopMining() and would otherwise
+      // reset the server-side break progress every single tick.
+      if (this.dropDigUntilMs != 0L && now < this.dropDigUntilMs) {
+         FlyController.NavState state = this.flight.navigate(
+            mc, level, player, drop.position().add(0.0, 0.3, 0.0), true, true
+         );
+         this.dropIssue = "挖路中（导航=" + state + "，最近 "
+            + String.format("%.1f", this.dropBestDistance) + " 格）";
+         this.throttledInfo("正在挖开 / 绕行接近掉落的鞘翅…", now);
+         return;
+      }
+      if (this.dropDigUntilMs != 0L) {
+         this.dropDigUntilMs = 0L;
+         this.dropProgressSinceMs = now;
+      }
+
+      boolean close = this.flight.approachForPickup(mc, player, drop.position());
+      if (close) {
+         if (this.dropCloseSinceMs == 0L) {
+            this.dropCloseSinceMs = now;
+         }
+         this.flight.hover(mc, player, false);
+         if (now - this.dropCloseSinceMs > DROP_PICKUP_WAIT_MS) {
+            String full = player.getInventory().getFreeSlot() < 0 ? "（背包已满）" : "";
+            this.nextCandidateWithReason(
+               player, now,
+               "已贴到掉落鞘翅（" + String.format("%.2f", distance) + " 格）仍未拾取" + full
+                  + "，等待 " + (DROP_PICKUP_WAIT_MS / 1000L) + " 秒"
+            );
+         } else {
+            this.throttledInfo("已贴到掉落物上，等待服务端拾取…", now);
+         }
+         return;
+      }
+      this.dropCloseSinceMs = 0L;
+
+      if (now - this.dropProgressSinceMs > DROP_STALL_MS) {
+         this.dropDigUntilMs = now + DROP_DIG_MS;
+         this.dropIssue = "直线靠近受阻，改为挖掘 / 绕行";
+         this.info("吸取路径被挡，正在挖开 / 绕行接近掉落物…", ChatFormatting.YELLOW);
+         return;
+      }
+      if (now - this.dropChaseSinceMs > DROP_CHASE_TIMEOUT_MS) {
+         String full = player.getInventory().getFreeSlot() < 0 ? "，背包已满" : "";
+         this.nextCandidateWithReason(
+            player, now,
+            "掉落鞘翅追踪 " + (DROP_CHASE_TIMEOUT_MS / 1000L) + " 秒仍未拾取（最近 "
+               + String.format("%.1f", this.dropBestDistance) + " 格，"
+               + (this.dropIssue == null ? "直线接近" : this.dropIssue) + full + "）"
+         );
+         return;
+      }
+      this.throttledInfo(
+         "正在吸取掉落的鞘翅（距 " + String.format("%.1f", distance) + " 格）…", now
+      );
    }
 
    // ------------------------------------------------------------------ collection / finish
