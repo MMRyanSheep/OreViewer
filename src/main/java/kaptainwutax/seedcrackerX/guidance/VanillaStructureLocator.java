@@ -45,6 +45,7 @@ import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
+import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.minecraft.world.level.levelgen.structure.BuiltinStructures;
 import net.minecraft.world.level.levelgen.structure.Structure;
 import net.minecraft.world.level.levelgen.structure.StructurePiece;
@@ -140,11 +141,14 @@ public final class VanillaStructureLocator {
     * {@code hasShip} is the offline filter (unknown/fallback counts as true so
     * an undetectable ship is never discarded), {@code shipKnown} tells the
     * caller whether the result came from a real jigsaw template inspection.
+    * {@code shipPos} is the centre of the actual {@code end_city/ship} piece's
+    * bounding box - null when templates were unavailable or the piece could not
+    * be resolved. The city's {@code /locate} position is NOT the ship position.
     */
-   private record Hit(BlockPos pos, double distance, boolean hasShip, boolean shipKnown) {
+   private record Hit(BlockPos pos, double distance, boolean hasShip, boolean shipKnown, BlockPos shipPos) {
    }
 
-   private record Generated(Holder<Structure> holder, boolean hasShip, boolean shipKnown) {
+   private record Generated(Holder<Structure> holder, boolean hasShip, boolean shipKnown, BlockPos shipPos) {
    }
 
    private record CachedResult(long time, List<BlockPos> positions) {
@@ -245,6 +249,11 @@ public final class VanillaStructureLocator {
     * generated jigsaw start contains the vanilla {@code end_city/ship} piece.
     * The filtering is only an acceleration - the caller must still verify the
     * item frame on site (custom datapacks / worldgen can invalidate it).
+    *
+    * <p>Each candidate also carries the ship piece's bounding-box centre
+    * ({@link CityCandidate#shipPos()}). This is NOT the city's placement
+    * start: measured offsets across three seeds were 35-136 blocks in X/Z and
+    * 30-110 blocks in Y. Navigation and entity scans must use that point.</p>
     */
    public static CityResult findEndCitiesWithShip(long seed, BlockPos origin, int need) {
       if (need <= 0) {
@@ -252,7 +261,9 @@ public final class VanillaStructureLocator {
       }
 
       long now = System.currentTimeMillis();
-      String cacheKey = "END_CITY@SHIP@" + seed + "@" + need + "@" + (origin.getX() >> 7) + "," + (origin.getZ() >> 7);
+      // V2: candidates now carry the resolved ship position; never reuse a
+      // pre-V2 cache entry that only had the city's /locate coordinate.
+      String cacheKey = "END_CITY@SHIP@V2@" + seed + "@" + need + "@" + (origin.getX() >> 7) + "," + (origin.getZ() >> 7);
       CachedCityResult cached = CITY_RESULT_CACHE.get(cacheKey);
       if (cached != null && now - cached.time() < RESULT_TTL_MS) {
          return new CityResult(true, cached.cities());
@@ -272,12 +283,14 @@ public final class VanillaStructureLocator {
       List<CityCandidate> cities = new ArrayList<>();
       for (Hit hit : hits) {
          if (hit.hasShip()) {
-            cities.add(new CityCandidate(hit.pos(), hit.shipKnown()));
+            cities.add(new CityCandidate(hit.pos(), hit.shipKnown(), hit.shipPos()));
             if (cities.size() >= need) {
                break;
             }
          }
       }
+      long located = cities.stream().filter(CityCandidate::shipLocated).count();
+      LOGGER.info("[guidance] ship candidates: {} total, {} with resolved ship position", cities.size(), located);
       if (CITY_RESULT_CACHE.size() > 32) {
          CITY_RESULT_CACHE.clear();
       }
@@ -519,7 +532,7 @@ public final class VanillaStructureLocator {
       if (templateManager == null) {
          // Placement + weighted pick only (same fallback as VeinSim). Without
          // real templates we cannot tell whether a ship exists: do not veto.
-         return new Generated(holder, true, false);
+         return new Generated(holder, true, false, null);
       }
       Structure structure = holder.value();
       boolean endCity = holder.unwrapKey()
@@ -544,13 +557,18 @@ public final class VanillaStructureLocator {
          if (start.isValid()) {
             // Only end cities need the (per-piece) ship inspection; other
             // guidance targets keep the exact old behaviour and cost.
-            return new Generated(holder, !endCity || hasShipPiece(start), endCity);
+            // Capture the ship piece's bounding box centre while the generated
+            // start is still available - this is the only place where the real
+            // ship coordinate (not the city's /locate position) can be read.
+            boolean hasShip = !endCity || hasShipPiece(start);
+            BlockPos shipPos = endCity ? shipPosOf(start) : null;
+            return new Generated(holder, hasShip, endCity, shipPos);
          }
       } catch (Throwable t) {
          if (genFailures++ < 3) {
             LOGGER.warn("[guidance] generation check failed at {}", chunk, t);
          }
-         return new Generated(holder, true, false);
+         return new Generated(holder, true, false, null);
       }
       return null;
    }
@@ -563,6 +581,48 @@ public final class VanillaStructureLocator {
     * loose string checks remain as fallbacks for other versions/datapacks.
     * Any uncertainty resolves to {@code true} so a real ship is never lost.
     */
+   /**
+    * Centre of the real end-ship piece's bounding box, in world coordinates.
+    * The city's placement start is the tower base; the ship hangs off a tower
+    * and is often 20-60 blocks away, so navigation must use this instead.
+    * Uses exactly the same identification rules as {@link #hasShipPiece}.
+    */
+   private static BlockPos shipPosOf(StructureStart start) {
+      if (start == null) {
+         return null;
+      }
+      try {
+         for (StructurePiece piece : start.getPieces()) {
+            if (piece == null) {
+               continue;
+            }
+            String name = templateNameOf(piece).toLowerCase(Locale.ROOT);
+            boolean ship = "ship".equals(name)
+               || name.endsWith("/ship")
+               || name.contains("end_city/ship")
+               || name.contains("end_city\\ship");
+            if (!ship) {
+               String s = describePiece(piece).toLowerCase(Locale.ROOT);
+               ship = s.contains("end_city/ship") || s.contains("end_city\\ship")
+                  || s.contains("end_ship")
+                  || (s.contains("ship") && !s.contains("shipwreck"));
+            }
+            if (!ship) {
+               continue;
+            }
+            BoundingBox box = piece.getBoundingBox();
+            if (box == null) {
+               return null;
+            }
+            BlockPos centre = box.getCenter();
+            return new BlockPos(centre.getX(), centre.getY(), centre.getZ());
+         }
+      } catch (Throwable t) {
+         LOGGER.warn("[guidance] ship bounding box unavailable", t);
+      }
+      return null;
+   }
+
    private static boolean hasShipPiece(StructureStart start) {
       if (start == null) {
          return true;
@@ -705,7 +765,10 @@ public final class VanillaStructureLocator {
                ? ctx.generator().getBaseHeight(located.getX(), located.getZ(), Types.WORLD_SURFACE_WG, ctx.height(), ctx.randomState())
                : spec.fixedY();
             BlockPos pos = new BlockPos(located.getX(), y, located.getZ());
-            out.add(new Hit(pos, horizontalDistance(origin, pos), generated.hasShip(), generated.shipKnown()));
+            out.add(new Hit(
+               pos, horizontalDistance(origin, pos),
+               generated.hasShip(), generated.shipKnown(), generated.shipPos()
+            ));
             hitThisRing = true;
          }
          if (hitThisRing && firstHitRing < 0) {
@@ -737,7 +800,7 @@ public final class VanillaStructureLocator {
       for (ChunkPos chunk : ctx.state().getRingPositionsFor(rings)) {
          BlockPos located = rings.getLocatePos(chunk);
          BlockPos pos = new BlockPos(located.getX(), spec.fixedY(), located.getZ());
-         out.add(new Hit(pos, horizontalDistance(origin, pos), true, false));
+         out.add(new Hit(pos, horizontalDistance(origin, pos), true, false, null));
       }
    }
 

@@ -70,8 +70,18 @@ public final class ElytraHuntManager {
    private static final double ARRIVE_XZ = 12.0;
    private static final double SLOW_RADIUS = 32.0;
    private static final double SCAN_RADIUS = 96.0;
+   // An end ship sits around y=70..100 while cruising happens at CRUISE_Y=140.
+   // ItemFrame entities are only synced to clients within the server's entity
+   // tracking range, so scanning from the cruise altitude always sees zero
+   // frames. VERIFYING therefore descends to a point beside the ship first.
+   private static final double SHIP_APPROACH_LIFT = 6.0;
+   // Measured range of ship bounding-box centres is y=95..171 across three
+   // seeds; the city placement start is only y=60..66.
+   private static final int DEFAULT_SHIP_Y = 120;
+   private static final int MAX_VERIFY_SCANS = 8;
+   private static final long VERIFY_APPROACH_TIMEOUT_MS = 20000L;
    // Sweeps may have to dig through an end-ship hull, so give them more room.
-   private static final long VERIFY_TIMEOUT_MS = 15000L;
+   private static final long VERIFY_TIMEOUT_MS = 30000L;
    private static final long TRAVEL_TIMEOUT_MS = 120000L;
    private static final long APPROACH_TIMEOUT_MS = 15000L;
    private static final long TAKE_TIMEOUT_MS = 10000L;
@@ -86,6 +96,12 @@ public final class ElytraHuntManager {
    private static final long SCAN_INTERVAL_MS = 1000L;
    private static final long INFO_INTERVAL_MS = 3000L;
    private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
+   // Approach points around the ship: stay outside the hull but well inside
+   // entity tracking range. A new angle is used for every re-scan attempt.
+   private static final double[][] VERIFY_OFFSETS = {
+      {20, 20}, {-20, 20}, {20, -20}, {-20, -20},
+      {26, 0}, {-26, 0}, {0, 26}, {0, -26}
+   };
 
    public enum Phase {
       IDLE,
@@ -108,6 +124,8 @@ public final class ElytraHuntManager {
       Entity dropped;
       int frames;
       int entities;
+      /** First real structure/entity hit, used to correct an imprecise offline ship Y. */
+      BlockPos structureHint;
    }
 
    private final FlyController flight = new FlyController();
@@ -128,6 +146,11 @@ public final class ElytraHuntManager {
    private Entity targetFrame;
    private Entity droppedItem;
    private Vec3 sweepTarget;
+   /** Point beside the ship the player must reach before scans are meaningful. */
+   private Vec3 verifyPoint;
+   private int verifyScans;
+   private int verifyOffsetIndex;
+   private BlockPos structureHint;
    private ScanResult lastScan;
    private String lastReason;
    private BlockPos lastOrigin;
@@ -297,9 +320,18 @@ public final class ElytraHuntManager {
          ChatFormatting.AQUA
       );
       this.info(
-         "当前候选=" + (this.current == null ? "无" : format(this.current.pos()))
-            + " 重扫轮次=" + this.rescanRound
+         "城坐标=" + (this.current == null ? "无" : format(this.current.pos()))
+            + " 船坐标=" + (this.current == null
+               ? "无" : (this.current.shipLocated() ? format(this.current.shipPos()) : "离线未解析"))
+            + " 扫描中心=" + (this.current == null ? "无" : format(this.current.target()))
+            + " 结构提示=" + (this.structureHint == null ? "无" : format(this.structureHint)),
+         ChatFormatting.AQUA
+      );
+      this.info(
+         "重扫=" + this.verifyScans + "/" + MAX_VERIFY_SCANS
+            + " 外推轮次=" + this.rescanRound
             + " 巡航高度=" + this.flight.cruiseY()
+            + " 玩家高度=" + (player == null ? -1 : (int)player.getY())
             + " 抬升次数=" + this.flight.liftRetries()
             + " 导航=" + this.flight.navState()
             + " 挖掘=" + (this.flight.miningBlock() == null ? "无" : format(this.flight.miningBlock())),
@@ -468,6 +500,10 @@ public final class ElytraHuntManager {
       this.targetFrame = null;
       this.droppedItem = null;
       this.sweepTarget = null;
+      this.verifyPoint = null;
+      this.verifyScans = 0;
+      this.verifyOffsetIndex = 0;
+      this.structureHint = null;
       this.lastScan = null;
       this.flight.hover(Minecraft.getInstance(), player, true);
       this.attempts = 0;
@@ -488,8 +524,8 @@ public final class ElytraHuntManager {
       double dx = 0.0;
       double dz = 0.0;
       if (INSTANCE.current != null) {
-         dx = INSTANCE.current.pos().getX() - player.getX();
-         dz = INSTANCE.current.pos().getZ() - player.getZ();
+         dx = INSTANCE.current.target().getX() - player.getX();
+         dz = INSTANCE.current.target().getZ() - player.getZ();
       }
       double length = Math.sqrt(dx * dx + dz * dz);
       if (length < 1.0) {
@@ -522,21 +558,37 @@ public final class ElytraHuntManager {
       this.sweepCount = 0;
       this.lastScan = null;
       this.lastScanMs = 0L;
+      this.verifyScans = 0;
+      this.verifyOffsetIndex = 0;
+      this.structureHint = null;
       this.attackAttempts = 0;
       this.lastAttackMs = 0L;
       this.phaseStartMs = now;
       this.phase = Phase.TRAVELLING;
-      BlockPos pos = this.current.pos();
+      BlockPos city = this.current.pos();
+      BlockPos ship = this.current.target();
+      // Prepare the low-altitude approach point for the VERIFYING phase.
+      this.verifyPoint = this.buildVerifyPoint(ship);
       LOGGER.info(
-         "[elytra] 换点 #{} -> {} shipKnown={} 剩余 {}",
-         this.attempts, pos, this.current.shipKnown(), this.queue.size()
+         "[elytra] 换点 #{} 城={} 船={} shipKnown={} shipLocated={} 剩余 {}",
+         this.attempts, city, this.current.shipPos(), this.current.shipKnown(),
+         this.current.shipLocated(), this.queue.size()
       );
-      this.info("飞往候选 #" + this.attempts + " (" + pos.getX() + ", " + pos.getZ() + ")，剩余 " + this.queue.size(), ChatFormatting.AQUA);
+      this.info(
+         "飞往船坐标 #" + this.attempts + " (" + ship.getX() + ", " + ship.getY() + ", " + ship.getZ() + ")"
+            + (this.current.shipLocated() ? "" : "（离线未解析船坐标，暂用城坐标）")
+            + "，剩余 " + this.queue.size(),
+         ChatFormatting.AQUA
+      );
    }
 
    private void nextCandidateWithReason(LocalPlayer player, long now, String reason) {
       this.lastReason = reason;
-      LOGGER.info("[elytra] 候选 {} 失败：{}", this.current == null ? "?" : this.current.pos(), reason);
+      LOGGER.info(
+         "[elytra] 候选 城={} 船={} 失败：{}",
+         this.current == null ? "?" : this.current.pos(),
+         this.current == null ? "?" : this.current.shipPos(), reason
+      );
       this.info(reason + "，换下一个候选", ChatFormatting.YELLOW);
       this.nextCandidate(player, now);
    }
@@ -552,7 +604,8 @@ public final class ElytraHuntManager {
          this.nextCandidateWithReason(player, now, "飞行超时");
          return;
       }
-      BlockPos pos = this.current.pos();
+      // Fly to the ship, not to the city's /locate position.
+      BlockPos pos = this.current.target();
       Vec3 target = new Vec3(pos.getX() + 0.5, this.flight.cruiseY(), pos.getZ() + 0.5);
       double horiz = Math.hypot(target.x - player.getX(), target.z - player.getZ());
       if (horiz < ARRIVE_XZ && Math.abs(player.getY() - this.flight.cruiseY()) < 20.0) {
@@ -563,7 +616,7 @@ public final class ElytraHuntManager {
          this.sweepTarget = null;
          this.lastScan = null;
          this.phase = Phase.VERIFYING;
-         this.info("已抵达候选上空，开始区块 / 结构 / 展示框三段校验…", ChatFormatting.AQUA);
+         this.info("已抵达船坐标上空，正在下降到船体高度并校验区块 / 结构 / 展示框…", ChatFormatting.AQUA);
          return;
       }
       // Long-distance cruising prefers a detour / a higher altitude over digging.
@@ -599,25 +652,58 @@ public final class ElytraHuntManager {
          this.nextCandidate(player, now);
          return;
       }
+      BlockPos ship = this.current.target();
+
+      // Phase 1: descend to the ship. From CRUISE_Y=140 the server never syncs
+      // the ship's ItemFrame entities to the client, so a scan up there always
+      // reports "no elytra" even when the frame is intact.
+      if (this.verifyPoint != null) {
+         double d = player.position().distanceTo(this.verifyPoint);
+         if (d > 6.0 && now - this.phaseStartMs < VERIFY_APPROACH_TIMEOUT_MS) {
+            // Towers can stand between the cruise altitude and the ship; digging
+            // through them is allowed here (the approach path is the same one
+            // the user asked to be mined/routed around).
+            FlyController.NavState state = this.flight.navigate(mc, level, player, this.verifyPoint, true, true);
+            if (state == FlyController.NavState.BLOCKED) {
+               this.verifyOffsetIndex++;
+               this.verifyPoint = this.buildVerifyPoint(ship);
+               this.phaseStartMs = now;
+               this.info("下降路径被阻挡，换一个角度接近船体…", ChatFormatting.YELLOW);
+            } else if (obstacleWork(state)) {
+               // A detour must not eat up the descent timeout.
+               this.phaseStartMs = now;
+            }
+            this.throttledInfo("正在下降到船体高度以同步展示框实体（还差 " + (int)d + " 格）…", now);
+            return;
+         }
+         this.verifyPoint = null;
+         this.lastScanMs = 0L;
+         this.phaseStartMs = now;
+      }
+
+      // Phase 2: an explicit sweep waypoint (chunk-load workaround).
       if (this.sweepTarget != null) {
          double d = Math.hypot(this.sweepTarget.x - player.getX(), this.sweepTarget.z - player.getZ());
          if (d > ARRIVE_XZ && now - this.phaseStartMs < VERIFY_TIMEOUT_MS) {
             FlyController.NavState state = this.flight.navigate(mc, level, player, this.sweepTarget, true, true);
             if (obstacleWork(state)) {
-               // Detours / digging through a hull must not eat up the sweep timeout.
                this.phaseStartMs = now;
             }
             return;
          }
          this.sweepTarget = null;
       }
+
       this.flight.hover(mc, player, true);
       if (now - this.lastScanMs < SCAN_INTERVAL_MS) {
          return;
       }
       this.lastScanMs = now;
-      ScanResult scan = this.scan(level, player, this.current.pos());
+      ScanResult scan = this.scan(level, player, ship);
       this.lastScan = scan;
+      if (scan.structureHint != null) {
+         this.structureHint = scan.structureHint;
+      }
 
       if (scan.elytraFrame != null) {
          this.targetFrame = scan.elytraFrame;
@@ -639,12 +725,12 @@ public final class ElytraHuntManager {
       }
       if (!scan.chunkLoaded) {
          if (now - this.phaseStartMs < VERIFY_TIMEOUT_MS) {
-            this.throttledInfo("等待目标区块加载…", now);
+            this.throttledInfo("等待船所在区块加载…", now);
             return;
          }
          if (this.sweepCount < MAX_SWEEPS) {
             this.sweepCount++;
-            this.sweepTarget = spiralPoint(this.current.pos(), this.sweepCount, this.flight.cruiseY());
+            this.sweepTarget = spiralPoint(ship, this.sweepCount, this.verifyY(ship));
             this.phaseStartMs = now;
             this.info("区块未完全加载，绕飞重扫 " + this.sweepCount + "/" + MAX_SWEEPS, ChatFormatting.YELLOW);
             return;
@@ -652,11 +738,57 @@ public final class ElytraHuntManager {
          this.nextCandidateWithReason(player, now, "区块长期未加载");
          return;
       }
-      if (!scan.cityPresent) {
-         this.nextCandidateWithReason(player, now, "该坐标未发现末地城结构（种子/worldgen 不符或已被拆）");
+
+      // Never judge "looted" from one scan: entity sync lags a few seconds and
+      // the offline ship Y can be slightly off. Re-approach from a new angle.
+      this.verifyScans++;
+      if (this.verifyScans < MAX_VERIFY_SCANS) {
+         this.verifyOffsetIndex++;
+         this.verifyPoint = this.buildVerifyPoint(ship);
+         this.phaseStartMs = now;
+         this.info(
+            "第 " + this.verifyScans + " 次扫描未见鞘翅（客户端实体 " + scan.entities
+               + " / 展示框 " + scan.frames + "），换位置重扫…",
+            ChatFormatting.YELLOW
+         );
          return;
       }
-      this.nextCandidateWithReason(player, now, "无船或鞘翅已被取走");
+
+      String reason;
+      if (!scan.cityPresent && scan.entities == 0) {
+         reason = "船坐标附近未发现末地城结构（种子/worldgen 不符或坐标偏差）";
+      } else if (scan.entities == 0) {
+         reason = "服务器未同步船附近实体（未真正进入实体追踪范围）";
+      } else if (scan.frames > 0) {
+         reason = "展示框存在但鞘翅已被取走";
+      } else {
+         reason = "无船或鞘翅已被取走";
+      }
+      this.nextCandidateWithReason(
+         player, now,
+         reason + "（扫描 " + this.verifyScans + " 次，实体 " + scan.entities + "，展示框 " + scan.frames + "）"
+      );
+   }
+
+   /** Low-altitude point beside the ship; on-site evidence wins when worldgen Y is clearly off. */
+   private int verifyY(BlockPos ship) {
+      int offline = ship.getY() > 0 ? ship.getY() : DEFAULT_SHIP_Y;
+      int hint = this.structureHint == null ? offline : this.structureHint.getY();
+      boolean offlineTrustworthy = this.current.shipLocated() && Math.abs(hint - offline) <= 24;
+      return (offlineTrustworthy ? offline : hint) + (int)SHIP_APPROACH_LIFT;
+   }
+
+   private Vec3 buildVerifyPoint(BlockPos ship) {
+      double[] offset = VERIFY_OFFSETS[Math.floorMod(this.verifyOffsetIndex, VERIFY_OFFSETS.length)];
+      double cx = ship.getX();
+      double cz = ship.getZ();
+      // Offline ship X/Z comes from template placement and is trustworthy.
+      // Only fall back to an on-site hint when no ship piece was resolved.
+      if (!this.current.shipLocated() && this.structureHint != null) {
+         cx = this.structureHint.getX();
+         cz = this.structureHint.getZ();
+      }
+      return new Vec3(cx + offset[0], this.verifyY(ship), cz + offset[1]);
    }
 
    private static Vec3 spiralPoint(BlockPos center, int index, int y) {
@@ -664,7 +796,13 @@ public final class ElytraHuntManager {
       return new Vec3(center.getX() + offset[0], y, center.getZ() + offset[1]);
    }
 
-   /** Three independent signals so "not loaded" is never mistaken for "looted". */
+   /**
+    * Scans around the SHIP position. Entity hits are the strongest signal: they
+    * prove the structure is real and give an exact on-site coordinate used to
+    * correct an imprecise offline ship Y. The old block lattice (step 8 in X/Z,
+    * step 10 in Y, fixed 60..150) was too coarse for a ship hull and covered
+    * the wrong height range; it is now denser and centred on the ship's own Y.
+    */
    private ScanResult scan(ClientLevel level, LocalPlayer player, BlockPos center) {
       ScanResult result = new ScanResult();
       int cx = center.getX() >> 4;
@@ -694,10 +832,16 @@ public final class ElytraHuntManager {
          result.entities++;
          if (entity.getType() == EntityTypes.SHULKER) {
             result.cityPresent = true;
+            if (result.structureHint == null) {
+               result.structureHint = entity.blockPosition();
+            }
          }
          if (entity instanceof ItemFrame) {
             result.frames++;
             result.cityPresent = true;
+            if (result.structureHint == null) {
+               result.structureHint = entity.blockPosition();
+            }
             ItemStack stack = frameItem(entity);
             if (stack != null && stack.getItem() == Items.ELYTRA && result.elytraFrame == null) {
                result.elytraFrame = entity;
@@ -705,24 +849,27 @@ public final class ElytraHuntManager {
          } else if (entity instanceof ItemEntity item && item.getItem().getItem() == Items.ELYTRA && result.dropped == null) {
             result.dropped = entity;
             result.cityPresent = true;
+            if (result.structureHint == null) {
+               result.structureHint = entity.blockPosition();
+            }
          }
       }
 
-      if (!result.cityPresent) {
+      if (result.elytraFrame == null && !result.cityPresent) {
+         int baseY = center.getY() > 0 ? center.getY() : (int)player.getY();
+         int minY = Math.max(40, baseY - 36);
+         int maxY = Math.min(220, baseY + 40);
          outer:
-         for (int x = center.getX() - 48; x <= center.getX() + 48; x += 8) {
-            for (int z = center.getZ() - 48; z <= center.getZ() + 48; z += 8) {
+         for (int x = center.getX() - 48; x <= center.getX() + 48; x += 6) {
+            for (int z = center.getZ() - 48; z <= center.getZ() + 48; z += 6) {
                if (level.getChunk(x >> 4, z >> 4, ChunkStatus.FULL, false) == null) {
                   continue;
                }
-               for (int y = 60; y <= 150; y += 10) {
-                  BlockState state = level.getBlockState(new BlockPos(x, y, z));
-                  Block block = state.getBlock();
-                  if (block == Blocks.PURPUR_BLOCK
-                     || block == Blocks.PURPUR_PILLAR
-                     || block == Blocks.END_STONE_BRICKS
-                     || block == Blocks.STAINED_GLASS.magenta()) {
+               for (int y = minY; y <= maxY; y += 6) {
+                  BlockPos at = new BlockPos(x, y, z);
+                  if (isEndCityBlock(level.getBlockState(at).getBlock())) {
                      result.cityPresent = true;
+                     result.structureHint = at;
                      break outer;
                   }
                }
@@ -730,6 +877,13 @@ public final class ElytraHuntManager {
          }
       }
       return result;
+   }
+
+   private static boolean isEndCityBlock(Block block) {
+      return block == Blocks.PURPUR_BLOCK
+         || block == Blocks.PURPUR_PILLAR
+         || block == Blocks.END_STONE_BRICKS
+         || block == Blocks.STAINED_GLASS.magenta();
    }
 
    /** Direct call with a reflective fallback in case the item frame class changed. */
