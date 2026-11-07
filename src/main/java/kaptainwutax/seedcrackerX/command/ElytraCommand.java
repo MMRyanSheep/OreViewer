@@ -34,6 +34,25 @@ public class ElytraCommand extends ClientCommand {
                })
             )
       );
+      // 0 = unlimited (collect until /os qc 停止); n = stop after n new elytra.
+      builder.then(
+         ClientCommands.literal("目标")
+            .then(
+               ClientCommands.argument("n", IntegerArgumentType.integer(0, 64)).executes(context -> {
+                  ElytraHuntManager.INSTANCE.setTargetElytra(IntegerArgumentType.getInteger(context, "n"));
+                  return 1;
+               })
+            )
+      );
+      builder.then(
+         ClientCommands.literal("target")
+            .then(
+               ClientCommands.argument("n", IntegerArgumentType.integer(0, 64)).executes(context -> {
+                  ElytraHuntManager.INSTANCE.setTargetElytra(IntegerArgumentType.getInteger(context, "n"));
+                  return 1;
+               })
+            )
+      );
    }
 
    /** Shared by the optional {@code /os elytra} alias. */

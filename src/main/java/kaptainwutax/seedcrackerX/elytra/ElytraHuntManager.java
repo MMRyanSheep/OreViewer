@@ -44,9 +44,16 @@ import org.slf4j.LoggerFactory;
  * State machine for the automatic elytra hunt.
  *
  * <p>Only one signal counts as success: the number of ELYTRA in the player's
- * inventory must exceed the baseline captured at startup. Everything else
- * (attack sent, frame emptied, item entity visible) is just an intermediate
- * observation and may be retried safely.</p>
+ * inventory must exceed the baseline. Everything else (attack sent, frame
+ * emptied, item entity visible) is just an intermediate observation and may be
+ * retried safely.</p>
+ *
+ * <p>The hunt is a <b>continuous collector</b>: elytra already in the inventory
+ * are not a reason to refuse starting, they are simply recorded as the baseline.
+ * After each pickup the baseline is refreshed and the state machine moves on to
+ * the next candidate instead of stopping. It keeps going until the configured
+ * target count is reached, the inventory is full, or {@code /os qc 停止} is
+ * used.</p>
  *
  * <p>Locating is always done on a single background executor because
  * {@link VanillaStructureLocator#findEndCitiesWithShip} runs a full jigsaw
@@ -58,19 +65,23 @@ public final class ElytraHuntManager {
    private static final String TAG = "[自动取翼] ";
 
    private static final int DEFAULT_CANDIDATES = 12;
-   private static final int MAX_CANDIDATES_TOTAL = 32;
+   private static final int MAX_QUEUE_SIZE = 32;
+   private static final int MAX_TARGET_ELYTRA = 64;
    private static final double ARRIVE_XZ = 12.0;
    private static final double SLOW_RADIUS = 32.0;
    private static final double SCAN_RADIUS = 96.0;
-   private static final long VERIFY_TIMEOUT_MS = 8000L;
+   // Sweeps may have to dig through an end-ship hull, so give them more room.
+   private static final long VERIFY_TIMEOUT_MS = 15000L;
    private static final long TRAVEL_TIMEOUT_MS = 120000L;
    private static final long APPROACH_TIMEOUT_MS = 15000L;
    private static final long TAKE_TIMEOUT_MS = 10000L;
+   // Only enforced for a finite target; unlimited collection stops on user input.
    private static final long GLOBAL_TIMEOUT_MS = 1200000L;
    private static final long LOCATE_TIMEOUT_MS = 90000L;
    private static final int ATTACK_RETRIES = 3;
    private static final int ORIGIN_PUSH = 1500;
-   private static final int MAX_RESCAN_ROUNDS = 4;
+   // Continuous collection keeps pushing outwards as nearby ships get looted.
+   private static final int MAX_RESCAN_ROUNDS = 64;
    private static final int MAX_SWEEPS = 3;
    private static final long SCAN_INTERVAL_MS = 1000L;
    private static final long INFO_INTERVAL_MS = 3000L;
@@ -83,7 +94,6 @@ public final class ElytraHuntManager {
       VERIFYING,
       APPROACHING,
       TAKING,
-      EQUIPPING,
       DONE,
       ABORTED
    }
@@ -123,6 +133,10 @@ public final class ElytraHuntManager {
    private BlockPos lastOrigin;
    private int sweepCount;
    private int baselineElytra;
+   private int collected;
+   /** 0 = keep collecting until {@code /os qc 停止}. */
+   private int targetElytra;
+   private boolean equipAttempted;
    private int candidateCount = DEFAULT_CANDIDATES;
    private int attempts;
    private int rescanRound;
@@ -185,11 +199,17 @@ public final class ElytraHuntManager {
       }
 
       BaritoneBridge.ensureIdle();
+      // Elytra already in the inventory are NOT a reason to refuse: they are
+      // the baseline for this run, and only newly picked-up ones count as a haul.
       this.baselineElytra = countElytra(player);
       if (this.baselineElytra > 0) {
-         this.fail("背包/装备栏已有鞘翅，为避免误判请先行存放后再启动");
-         return;
+         this.info(
+            "检测到背包/装备栏已有 " + this.baselineElytra + " 个鞘翅，已记为基线，将继续收集新的鞘翅",
+            ChatFormatting.YELLOW
+         );
       }
+      this.collected = 0;
+      this.equipAttempted = false;
 
       this.queue.clear();
       this.tried.clear();
@@ -205,7 +225,11 @@ public final class ElytraHuntManager {
       VanillaStructureLocator.clearCityCache();
       this.phase = Phase.LOCATING;
       this.phaseStartMs = this.globalStartMs;
-      this.info("开始离线定位带船末地城（候选数 " + this.candidateCount + "）…", ChatFormatting.GREEN);
+      this.info(
+         "开始持续收集（目标 " + (this.targetElytra == 0 ? "不限，/os qc 停止 结束" : this.targetElytra + " 个")
+            + "），离线定位带船末地城（候选数 " + this.candidateCount + "）…",
+         ChatFormatting.GREEN
+      );
       this.submitLocating(this.lastOrigin, this.candidateCount);
    }
 
@@ -220,6 +244,17 @@ public final class ElytraHuntManager {
    public void setCandidateCount(int count) {
       this.candidateCount = Math.max(1, Math.min(32, count));
       this.info("候选数量已设为 " + this.candidateCount, ChatFormatting.GREEN);
+   }
+
+   /** {@code 0} means "collect until stopped"; any other value is the haul target for one run. */
+   public void setTargetElytra(int count) {
+      this.targetElytra = Math.max(0, Math.min(MAX_TARGET_ELYTRA, count));
+      this.info(
+         this.targetElytra == 0
+            ? "目标数量设为不限（持续收集，/os qc 停止 结束）"
+            : "目标数量已设为 " + this.targetElytra + " 个鞘翅",
+         ChatFormatting.GREEN
+      );
    }
 
    /** Clear the city cache, push the origin outwards and locate again. */
@@ -256,14 +291,18 @@ public final class ElytraHuntManager {
             + " 扫描中=" + this.scanning.get()
             + " 候选数=" + this.candidateCount
             + " 队列=" + this.queue.size()
-            + " 已尝试=" + this.attempts + "/" + MAX_CANDIDATES_TOTAL,
+            + " 已尝试=" + this.attempts
+            + " 已收集=" + this.collected
+            + " 目标=" + (this.targetElytra == 0 ? "不限" : this.targetElytra),
          ChatFormatting.AQUA
       );
       this.info(
          "当前候选=" + (this.current == null ? "无" : format(this.current.pos()))
             + " 重扫轮次=" + this.rescanRound
             + " 巡航高度=" + this.flight.cruiseY()
-            + " 抬升次数=" + this.flight.liftRetries(),
+            + " 抬升次数=" + this.flight.liftRetries()
+            + " 导航=" + this.flight.navState()
+            + " 挖掘=" + (this.flight.miningBlock() == null ? "无" : format(this.flight.miningBlock())),
          ChatFormatting.AQUA
       );
       this.info(
@@ -319,23 +358,21 @@ public final class ElytraHuntManager {
          return;
       }
       long now = System.currentTimeMillis();
-      if (now - this.globalStartMs > GLOBAL_TIMEOUT_MS) {
-         this.abort("单次运行总时限已到");
+      if (this.targetElytra > 0 && now - this.globalStartMs > GLOBAL_TIMEOUT_MS) {
+         this.abort("单次运行总时限已到（已收集 " + this.collected + " 个）");
          return;
       }
-      // EQUIPPING already has its elytra; don't re-enter the success path.
-      if (this.phase != Phase.EQUIPPING && countElytra(player) > this.baselineElytra) {
-         this.succeed(mc, now);
+      if (countElytra(player) > this.baselineElytra) {
+         this.onElytraGained(mc, player, now);
          return;
       }
 
       switch (this.phase) {
          case LOCATING -> this.tickLocating(mc, player, now);
-         case TRAVELLING -> this.tickTravelling(mc, player, now);
+         case TRAVELLING -> this.tickTravelling(mc, player, level, now);
          case VERIFYING -> this.tickVerifying(mc, player, level, now);
-         case APPROACHING -> this.tickApproaching(mc, player, now);
+         case APPROACHING -> this.tickApproaching(mc, player, level, now);
          case TAKING -> this.tickTaking(mc, player, level, now);
-         case EQUIPPING -> this.tickEquipping(mc, player);
          default -> {
          }
       }
@@ -392,7 +429,7 @@ public final class ElytraHuntManager {
             if (!this.tried.add(candidate.pos().asLong())) {
                continue;
             }
-            if (this.queue.size() >= MAX_CANDIDATES_TOTAL) {
+            if (this.queue.size() >= MAX_QUEUE_SIZE) {
                break;
             }
             this.queue.add(candidate);
@@ -423,9 +460,22 @@ public final class ElytraHuntManager {
          return false;
       }
       this.rescanRound++;
+      // Compute the direction first: pushedOrigin() reads the current candidate.
       this.lastOrigin = pushedOrigin(player, this.rescanRound);
       VanillaStructureLocator.clearCityCache();
+      this.queue.clear();
+      this.current = null;
+      this.targetFrame = null;
+      this.droppedItem = null;
+      this.sweepTarget = null;
+      this.lastScan = null;
+      this.flight.hover(Minecraft.getInstance(), player, true);
+      this.attempts = 0;
       this.phaseStartMs = now;
+      this.pendingResult = null;
+      // Without this the state machine stays in TRAVELLING/VERIFYING and the
+      // asynchronously computed result is never consumed (old bug).
+      this.phase = Phase.LOCATING;
       this.info(
          "候选耗尽，沿当前方向外推 " + (ORIGIN_PUSH * this.rescanRound) + " 格重新定位（第 " + this.rescanRound + " 轮）",
          ChatFormatting.YELLOW
@@ -455,10 +505,6 @@ public final class ElytraHuntManager {
    }
 
    private void nextCandidate(LocalPlayer player, long now) {
-      if (this.attempts >= MAX_CANDIDATES_TOTAL) {
-         this.abort("已尝试 " + this.attempts + " 个候选仍未取得鞘翅");
-         return;
-      }
       if (this.queue.isEmpty()) {
          if (!this.pushOriginAndRelocate(player, now)) {
             this.abort("候选已全部耗尽");
@@ -497,7 +543,7 @@ public final class ElytraHuntManager {
 
    // ------------------------------------------------------------------ TRAVELLING
 
-   private void tickTravelling(Minecraft mc, LocalPlayer player, long now) {
+   private void tickTravelling(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
       if (this.current == null) {
          this.nextCandidate(player, now);
          return;
@@ -520,7 +566,18 @@ public final class ElytraHuntManager {
          this.info("已抵达候选上空，开始区块 / 结构 / 展示框三段校验…", ChatFormatting.AQUA);
          return;
       }
-      this.flight.steer(mc, player, target, horiz < SLOW_RADIUS);
+      // Long-distance cruising prefers a detour / a higher altitude over digging.
+      FlyController.NavState state = this.flight.navigate(mc, level, player, target, horiz < SLOW_RADIUS, false);
+      if (state == FlyController.NavState.BLOCKED) {
+         if (this.flight.lift()) {
+            this.info("前方有方块阻挡且无法绕行，抬升巡航高度至 " + this.flight.cruiseY(), ChatFormatting.YELLOW);
+         } else if (this.flight.navigate(mc, level, player, target, true, true) == FlyController.NavState.BLOCKED) {
+            // Altitude lifts exhausted: last resort is to dig through the tower.
+            this.nextCandidateWithReason(player, now, "多次抬升后仍被方块阻挡且无法挖掘");
+         } else {
+            this.throttledInfo("已无法继续抬升，改用绕行 / 挖掘处理阻挡…", now);
+         }
+      }
       if (this.flight.checkStuck(player)) {
          if (this.flight.lift()) {
             this.info("疑似卡住（撞塔 / 撞岛），抬升巡航高度至 " + this.flight.cruiseY(), ChatFormatting.YELLOW);
@@ -528,7 +585,11 @@ public final class ElytraHuntManager {
             this.nextCandidateWithReason(player, now, "多次抬升后仍无法前进");
          }
       }
-      this.throttledInfo("飞行中，距目标 " + (int)horiz + " 格，巡航高度 " + this.flight.cruiseY(), now);
+      this.throttledInfo(
+         "飞行中，距目标 " + (int)horiz + " 格，巡航高度 " + this.flight.cruiseY()
+            + "，导航=" + state,
+         now
+      );
    }
 
    // ------------------------------------------------------------------ VERIFYING
@@ -541,7 +602,11 @@ public final class ElytraHuntManager {
       if (this.sweepTarget != null) {
          double d = Math.hypot(this.sweepTarget.x - player.getX(), this.sweepTarget.z - player.getZ());
          if (d > ARRIVE_XZ && now - this.phaseStartMs < VERIFY_TIMEOUT_MS) {
-            this.flight.steer(mc, player, this.sweepTarget, true);
+            FlyController.NavState state = this.flight.navigate(mc, level, player, this.sweepTarget, true, true);
+            if (obstacleWork(state)) {
+               // Detours / digging through a hull must not eat up the sweep timeout.
+               this.phaseStartMs = now;
+            }
             return;
          }
          this.sweepTarget = null;
@@ -686,9 +751,20 @@ public final class ElytraHuntManager {
 
    // ------------------------------------------------------------------ APPROACHING
 
-   private void tickApproaching(Minecraft mc, LocalPlayer player, long now) {
+   private void tickApproaching(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
       Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
       if (target == null || target.isRemoved() || !target.isAlive()) {
+         // Breaking the block behind an item frame pops the frame and drops the
+         // elytra; that is still a win, so chase the drop instead of giving up.
+         Entity drop = this.findDroppedElytra(level);
+         if (drop != null) {
+            this.targetFrame = null;
+            this.droppedItem = drop;
+            this.pickupOnly = true;
+            this.phaseStartMs = now;
+            this.info("展示框已脱落，改为吸取掉落的鞘翅…", ChatFormatting.AQUA);
+            return;
+         }
          this.nextCandidateWithReason(player, now, "目标实体已消失");
          return;
       }
@@ -702,8 +778,14 @@ public final class ElytraHuntManager {
       double distance = player.position().distanceTo(hoverPoint);
       double arrival = this.pickupOnly ? 1.5 : 2.5;
       if (distance > arrival) {
-         this.flight.steer(mc, player, hoverPoint, true);
-         this.throttledInfo("接近目标中，还差 " + String.format("%.1f", distance) + " 格", now);
+         FlyController.NavState state = this.flight.navigate(mc, level, player, hoverPoint, true, true);
+         if (obstacleWork(state)) {
+            // A detour or a dig can legitimately take longer than a plain approach.
+            this.phaseStartMs = now;
+            this.throttledInfo("接近路径被方块阻挡，正在挖开 / 绕行…", now);
+         } else {
+            this.throttledInfo("接近目标中，还差 " + String.format("%.1f", distance) + " 格", now);
+         }
          return;
       }
       this.flight.hover(mc, player, false);
@@ -754,21 +836,29 @@ public final class ElytraHuntManager {
          return;
       }
       Entity frame = this.targetFrame;
-      if (frame == null || frame.isRemoved() || !frame.isAlive()) {
-         this.nextCandidateWithReason(player, now, "展示框被移除");
-         return;
+      boolean frameGone = frame == null || frame.isRemoved() || !frame.isAlive();
+      if (frameGone) {
+         // Mining the support block pops the item frame; the elytra is now a drop.
+         Entity popped = this.findDroppedElytra(level);
+         if (popped == null) {
+            this.nextCandidateWithReason(player, now, "展示框被移除");
+            return;
+         }
+         this.itemPopped = true;
+         this.droppedItem = popped;
       }
 
       // Once the frame is empty - or the item entity is already visible - the
       // item has been popped: stop attacking and just fly into the drop.
-      if (this.attackAttempts > 0 && (frameItem(frame).isEmpty() || this.findDroppedElytra(level) != null)) {
+      if (!frameGone && this.attackAttempts > 0
+         && (frameItem(frame).isEmpty() || this.findDroppedElytra(level) != null)) {
          this.itemPopped = true;
       }
       if (this.itemPopped) {
          Entity drop = this.findDroppedElytra(level);
          if (drop != null) {
             if (player.distanceToSqr(drop) > 2.25) {
-               this.flight.steer(mc, player, drop.position().add(0.0, 0.3, 0.0), true);
+               this.flight.navigate(mc, level, player, drop.position().add(0.0, 0.3, 0.0), true, true);
                this.throttledInfo("正在吸取掉落的鞘翅…", now);
             } else {
                this.flight.hover(mc, player, false);
@@ -783,13 +873,24 @@ public final class ElytraHuntManager {
          return;
       }
 
-      this.flight.hover(mc, player, false);
-      FlyController.aimAt(player, frame);
       if (!player.hasLineOfSight(frame)) {
-         this.flight.steer(mc, player, hoverPointFor(frame, player, 1.2), true);
-         this.throttledInfo("展示框被遮挡，正在调整位置…", now);
+         FlyController.NavState state = this.flight.navigate(
+            mc, level, player, hoverPointFor(frame, player, 2.2), true, true
+         );
+         if (obstacleWork(state)) {
+            // Detours / digging through the hull should not consume the take timeout.
+            this.phaseStartMs = now;
+         }
+         this.throttledInfo(
+            state == FlyController.NavState.MINING
+               ? "展示框被方块遮挡，正在挖开阻挡…"
+               : "展示框被遮挡，正在绕路 / 调整位置…",
+            now
+         );
          return;
       }
+      this.flight.hover(mc, player, false);
+      FlyController.aimAt(player, frame);
       if (this.attackAttempts >= ATTACK_RETRIES) {
          this.nextCandidateWithReason(player, now, "攻击 " + ATTACK_RETRIES + " 次仍未取得鞘翅");
          return;
@@ -818,35 +919,88 @@ public final class ElytraHuntManager {
       return null;
    }
 
-   // ------------------------------------------------------------------ EQUIPPING / finish
+   // ------------------------------------------------------------------ collection / finish
 
-   private void succeed(Minecraft mc, long now) {
-      this.phase = Phase.EQUIPPING;
-      this.phaseStartMs = now;
+   /** A new elytra appeared: record it, refresh the baseline and keep hunting. */
+   private void onElytraGained(Minecraft mc, LocalPlayer player, long now) {
+      int total = countElytra(player);
+      this.baselineElytra = total;
+      this.collected++;
       this.flight.release(mc);
       long seconds = (now - this.globalStartMs) / 1000L;
-      this.info("已取得鞘翅！耗时 " + seconds + " 秒，共尝试 " + this.attempts + " 个候选", ChatFormatting.GREEN);
-      LOGGER.info("[elytra] success in {} ms after {} candidates", now - this.globalStartMs, this.attempts);
-      this.tickEquipping(mc, mc.player);
+      this.info(
+         "已取得第 " + this.collected + " 个鞘翅（背包共 " + total + " 个，耗时 " + seconds
+            + " 秒，已尝试 " + this.attempts + " 个候选）",
+         ChatFormatting.GREEN
+      );
+      LOGGER.info(
+         "[elytra] collected #{} in {} ms after {} candidates",
+         this.collected, now - this.globalStartMs, this.attempts
+      );
+
+      if (!this.equipAttempted) {
+         this.equipAttempted = true;
+         this.tryEquip(mc, player);
+         // The container click moves the stack between slots synchronously;
+         // re-reading the baseline keeps the "inventory count increased" test exact.
+         this.baselineElytra = countElytra(player);
+      }
+      if (this.targetElytra > 0 && this.collected >= this.targetElytra) {
+         this.finish(mc, "已达目标数量 " + this.targetElytra + " 个");
+         return;
+      }
+      if (player.getInventory().getFreeSlot() < 0) {
+         this.finish(mc, "背包已满，无法继续拾取");
+         return;
+      }
+      this.continueHunting(player, now);
+   }
+
+   /** Reset per-candidate state and immediately pick the next ship. */
+   private void continueHunting(LocalPlayer player, long now) {
+      this.current = null;
+      this.targetFrame = null;
+      this.droppedItem = null;
+      this.sweepTarget = null;
+      this.sweepCount = 0;
+      this.pickupOnly = false;
+      this.itemPopped = false;
+      this.lastScan = null;
+      this.lastScanMs = 0L;
+      this.lastAttackMs = 0L;
+      this.attackAttempts = 0;
+      this.flight.resetForNewTarget();
+      this.phaseStartMs = now;
+      this.info("继续收集下一个鞘翅…", ChatFormatting.AQUA);
+      this.nextCandidate(player, now);
    }
 
    /** Optional and non-blocking: if the container API misbehaves, just tell the player. */
-   private void tickEquipping(Minecraft mc, LocalPlayer player) {
+   private void tryEquip(Minecraft mc, LocalPlayer player) {
       try {
          if (player != null && player.containerMenu instanceof InventoryMenu && mc.gameMode != null) {
             int invSlot = this.findElytraSlot(player);
             if (invSlot >= 0) {
                int menuSlot = invSlot < 9 ? invSlot + 36 : invSlot;
                mc.gameMode.handleContainerInput(0, menuSlot, 0, ContainerInput.QUICK_MOVE, player);
-               this.info("已尝试自动装备鞘翅（快捷移动至胸甲槽）", ChatFormatting.GREEN);
+               this.info("已尝试自动装备一个鞘翅（快捷移动至胸甲槽）", ChatFormatting.GREEN);
             }
          }
       } catch (Throwable t) {
          this.info("自动装备跳过，请手动装备鞘翅", ChatFormatting.YELLOW);
       }
+   }
+
+   private void finish(Minecraft mc, String reason) {
+      this.lastReason = reason;
       this.phase = Phase.DONE;
       this.flight.release(mc);
-      this.info("流程结束，飞行保持开启（不会掉进虚空）；可 /os qc 停止 释放按键", ChatFormatting.GREEN);
+      this.info(
+         "流程结束：" + reason + "；本次共收集 " + this.collected
+            + " 个鞘翅，飞行保持开启（不会掉进虚空）",
+         ChatFormatting.GREEN
+      );
+      LOGGER.info("[elytra] finished: {} (collected {})", reason, this.collected);
    }
 
    private int findElytraSlot(LocalPlayer player) {
@@ -864,8 +1018,8 @@ public final class ElytraHuntManager {
       this.lastReason = reason;
       this.phase = Phase.ABORTED;
       this.flight.release(Minecraft.getInstance());
-      this.info("已停止：" + reason, ChatFormatting.RED);
-      LOGGER.info("[elytra] aborted: {}", reason);
+      this.info("已停止：" + reason + "（本次共收集 " + this.collected + " 个）", ChatFormatting.RED);
+      LOGGER.info("[elytra] aborted: {} (collected {})", reason, this.collected);
       this.phase = Phase.IDLE;
    }
 
@@ -877,6 +1031,13 @@ public final class ElytraHuntManager {
    }
 
    // ------------------------------------------------------------------ helpers
+
+   /** True while the flight controller is actively routing around / through a block. */
+   private static boolean obstacleWork(FlyController.NavState state) {
+      return state == FlyController.NavState.DETOUR
+         || state == FlyController.NavState.APPROACH_MINE
+         || state == FlyController.NavState.MINING;
+   }
 
    private static boolean isEnd(ClientLevel level) {
       try {

@@ -1,14 +1,21 @@
 package kaptainwutax.seedcrackerX.elytra;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Abilities;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 /**
- * Key-simulated creative flight for the elytra hunt.
+ * Key-simulated creative flight for the elytra hunt, including obstacle handling.
  *
  * <p>Movement deliberately goes through the vanilla input pipeline (no
  * {@code setDeltaMovement}, no Baritone goal), so the server only ever sees
@@ -17,15 +24,45 @@ import net.minecraft.world.phys.Vec3;
  * vertical travel is driven by the jump / sneak keys, while pitch is still set
  * for aiming. Every call also re-asserts the flying ability, which makes this
  * independent of {@code FlyManager} / {@code BaritoneBridge.hasGoalOrPath()}.</p>
+ *
+ * <p>{@link #navigate} adds the missing "blocked path" behaviour: it ray-traces
+ * towards the requested point, first tries to fly around the obstruction via a
+ * side / over-the-top waypoint, and when there is no way around (e.g. the hull
+ * of an end ship) it breaks the front-most blocking block with the vanilla
+ * {@code MultiPlayerGameMode} start/continue destroy pipeline.</p>
  */
 public final class FlyController {
    public static final int CRUISE_Y = 140;
+
+   /** What {@link #navigate} decided to do on the last tick. */
+   public enum NavState {
+      CLEAR,          // straight line is free, flying to the target
+      DETOUR,         // flying to a waypoint that goes around an obstacle
+      APPROACH_MINE,  // flying towards the blocking block to get within reach
+      MINING,         // breaking the blocking block
+      BLOCKED,        // no detour and mining is not allowed / not possible
+      DONE,           // internal: the mined block is gone
+      FAILED          // internal: mining timed out / could not start
+   }
+
    private static final float PITCH_LIMIT = 35.0F;
    private static final double VERTICAL_DEADZONE = 2.0;
    private static final int STUCK_TICKS = 100;
    private static final double STUCK_MOVE_THRESHOLD = 1.0;
    private static final int MAX_LIFT_RETRIES = 3;
    private static final int LIFT_STEP = 20;
+
+   // Obstacle navigation. The probe is capped so a 1000-block flight never
+   // turns into a 1000-block ray trace on the render thread.
+   private static final double PROBE_DISTANCE = 48.0;
+   private static final double DETOUR_ARRIVE = 3.0;
+   private static final long DETOUR_TIMEOUT_MS = 8000L;
+   private static final int MAX_DETOUR_FAILURES = 2;
+   private static final double MINE_REACH = 4.0;
+   private static final long MINE_TIMEOUT_MS = 12000L;
+   private static final double MINING_PREFER_DISTANCE = 8.0;
+   private static final double[] SIDE_OFFSETS = {6.0, 12.0, 20.0};
+   private static final double[] SIDE_LIFTS = {0.0, 4.0, 8.0};
 
    private int cruiseY = CRUISE_Y;
    private int liftRetries;
@@ -35,6 +72,15 @@ public final class FlyController {
    private double lastZ;
    private boolean hasLastPos;
 
+   private Vec3 detourTarget;
+   private long detourStartMs;
+   private int detourFailures;
+   private BlockPos miningPos;
+   private Direction miningDir;
+   private boolean miningStarted;
+   private long miningStartMs;
+   private NavState navState = NavState.CLEAR;
+
    public int cruiseY() {
       return this.cruiseY;
    }
@@ -43,9 +89,20 @@ public final class FlyController {
       return this.liftRetries;
    }
 
+   public NavState navState() {
+      return this.navState;
+   }
+
+   public BlockPos miningBlock() {
+      return this.miningPos;
+   }
+
    public void resetForNewTarget() {
+      this.stopMining(Minecraft.getInstance());
       this.cruiseY = CRUISE_Y;
       this.liftRetries = 0;
+      this.detourTarget = null;
+      this.detourFailures = 0;
       this.resetStuck();
    }
 
@@ -65,8 +122,291 @@ public final class FlyController {
       this.hasLastPos = false;
    }
 
+   // ------------------------------------------------------------------ navigation
+
+   /**
+    * Fly towards {@code target}, dealing with solid blocks in the way.
+    *
+    * <p>Strategy: ray trace -> sidestep / climb over the obstruction -> if no
+    * route exists (or the target is enclosed), dig through the blocking layer.
+    * {@code allowMine} is false for long-distance cruising, where raising the
+    * cruise altitude is preferable to tunnelling through every tower.</p>
+    */
+   public NavState navigate(Minecraft mc, ClientLevel level, LocalPlayer player, Vec3 target, boolean slow, boolean allowMine) {
+      if (level == null || mc == null || mc.gameMode == null) {
+         this.steer(mc, player, target, slow);
+         return this.setNav(NavState.CLEAR);
+      }
+      long now = System.currentTimeMillis();
+
+      // Keep following an active waypoint instead of recomputing one every tick,
+      // which would make the player oscillate in front of the obstacle.
+      if (this.detourTarget != null) {
+         double remaining = player.position().distanceTo(this.detourTarget);
+         boolean waypointBlocked = this.firstBlocker(level, player, this.detourTarget) != null;
+         if (remaining > DETOUR_ARRIVE
+            && now - this.detourStartMs < DETOUR_TIMEOUT_MS
+            && !waypointBlocked) {
+            this.steer(mc, player, this.detourTarget, true);
+            return this.setNav(NavState.DETOUR);
+         }
+         this.detourFailures = remaining > DETOUR_ARRIVE ? this.detourFailures + 1 : 0;
+         this.detourTarget = null;
+      }
+
+      BlockHitResult hit = this.firstBlocker(level, player, target);
+
+      // A mining session is sticky: keep breaking the same block until it is
+      // gone, otherwise a tiny movement would switch targets every tick.
+      if (this.miningPos != null) {
+         if (hit == null) {
+            this.stopMining(mc);
+            this.steer(mc, player, target, slow);
+            return this.setNav(NavState.CLEAR);
+         }
+         NavState mining = this.tickMining(mc, level, player, now);
+         if (mining == NavState.DONE) {
+            this.steer(mc, player, target, slow);
+            return this.setNav(NavState.CLEAR);
+         }
+         if (mining == NavState.FAILED) {
+            this.detourFailures = MAX_DETOUR_FAILURES;
+            return this.blocked(mc, player);
+         }
+         return this.setNav(mining);
+      }
+
+      if (hit == null) {
+         this.detourFailures = 0;
+         this.steer(mc, player, target, slow);
+         return this.setNav(NavState.CLEAR);
+      }
+
+      BlockPos blocker = hit.getBlockPos();
+      boolean mineable;
+      try {
+         BlockState state = level.getBlockState(blocker);
+         mineable = !state.isAir() && state.getDestroyProgress(player, level, blocker) > 0.0F;
+      } catch (Throwable ignored) {
+         // Unbreakable / unknown block state: only a detour can help.
+         mineable = false;
+      }
+      boolean nearTarget = player.position().distanceTo(target) < MINING_PREFER_DISTANCE;
+      boolean preferMine = allowMine && mineable && (nearTarget || this.detourFailures >= MAX_DETOUR_FAILURES);
+
+      if (!preferMine) {
+         Vec3 waypoint = this.findDetour(level, player, target, blocker);
+         if (waypoint != null) {
+            this.detourTarget = waypoint;
+            this.detourStartMs = now;
+            this.steer(mc, player, waypoint, true);
+            return this.setNav(NavState.DETOUR);
+         }
+      }
+      if (!allowMine || !mineable) {
+         return this.blocked(mc, player);
+      }
+
+      this.miningPos = blocker;
+      this.miningDir = hit.getDirection();
+      this.miningStartMs = now;
+      this.miningStarted = false;
+      NavState mining = this.tickMining(mc, level, player, now);
+      if (mining == NavState.DONE) {
+         this.steer(mc, player, target, slow);
+         return this.setNav(NavState.CLEAR);
+      }
+      if (mining == NavState.FAILED) {
+         this.detourFailures = MAX_DETOUR_FAILURES;
+         return this.blocked(mc, player);
+      }
+      return this.setNav(mining);
+   }
+
+   /** Stop in place and let the caller raise the cruise altitude / change target. */
+   private NavState blocked(Minecraft mc, LocalPlayer player) {
+      this.hover(mc, player, true);
+      return this.setNav(NavState.BLOCKED);
+   }
+
+   private NavState setNav(NavState state) {
+      this.navState = state;
+      return state;
+   }
+
+   /** First solid block between the player's eyes and {@code target}, or null. */
+   private BlockHitResult firstBlocker(ClientLevel level, LocalPlayer player, Vec3 target) {
+      Vec3 eye = player.getEyePosition();
+      Vec3 delta = target.subtract(eye);
+      double length = delta.length();
+      if (length < 0.5) {
+         return null;
+      }
+      Vec3 end = length > PROBE_DISTANCE ? eye.add(delta.scale(PROBE_DISTANCE / length)) : target;
+      try {
+         BlockHitResult hit = level.clip(
+            new ClipContext(eye, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
+         );
+         return hit.getType() == HitResult.Type.BLOCK ? hit : null;
+      } catch (Throwable ignored) {
+         // Unloaded chunk / clip failure: treat as clear rather than vetoing flight.
+         return null;
+      }
+   }
+
+   /** Try side-step and over-the-top waypoints, and keep the first one with a clear two-leg path. */
+   private Vec3 findDetour(ClientLevel level, LocalPlayer player, Vec3 target, BlockPos blocker) {
+      Vec3 eye = player.getEyePosition();
+      double dx = target.x - player.getX();
+      double dz = target.z - player.getZ();
+      double horizontal = Math.sqrt(dx * dx + dz * dz);
+      if (horizontal < 1.0) {
+         return null;
+      }
+      double ux = dx / horizontal;
+      double uz = dz / horizontal;
+      double px = -uz;
+      double pz = ux;
+      double forward = Math.min(horizontal, 6.0);
+      double baseY = Math.max(player.getY(), blocker.getY() + 3.0);
+
+      for (int side = -1; side <= 1; side += 2) {
+         for (double offset : SIDE_OFFSETS) {
+            for (double lift : SIDE_LIFTS) {
+               Vec3 waypoint = new Vec3(
+                  player.getX() + ux * forward + px * side * offset,
+                  baseY + lift,
+                  player.getZ() + uz * forward + pz * side * offset
+               );
+               if (this.isInsideSolid(level, waypoint)) {
+                  continue;
+               }
+               if (!this.isClear(level, player, eye, waypoint)) {
+                  continue;
+               }
+               if (!this.isClear(level, player, waypoint, target)) {
+                  continue;
+               }
+               return waypoint;
+            }
+         }
+      }
+      Vec3 over = new Vec3(player.getX() + ux * forward, baseY + 12.0, player.getZ() + uz * forward);
+      if (!this.isInsideSolid(level, over)
+         && this.isClear(level, player, eye, over)
+         && this.isClear(level, player, over, target)) {
+         return over;
+      }
+      return null;
+   }
+
+   private boolean isInsideSolid(ClientLevel level, Vec3 point) {
+      BlockPos pos = BlockPos.containing(point);
+      BlockState state = level.getBlockState(pos);
+      return !state.getCollisionShape(level, pos).isEmpty();
+   }
+
+   private boolean isClear(ClientLevel level, LocalPlayer player, Vec3 from, Vec3 to) {
+      Vec3 delta = to.subtract(from);
+      double length = delta.length();
+      if (length < 0.001) {
+         return true;
+      }
+      Vec3 end = length > PROBE_DISTANCE ? from.add(delta.scale(PROBE_DISTANCE / length)) : to;
+      try {
+         BlockHitResult hit = level.clip(
+            new ClipContext(from, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
+         );
+         return hit.getType() != HitResult.Type.BLOCK;
+      } catch (Throwable ignored) {
+         return true;
+      }
+   }
+
+   /**
+    * Break {@link #miningPos} with the vanilla destroy pipeline. Holding
+    * {@code keyAttack} down is essential: {@code Minecraft.continueAttack(false)}
+    * calls {@code stopDestroyBlock()} every tick otherwise, which resets the
+    * server-side break progress before it can ever finish.
+    */
+   private NavState tickMining(Minecraft mc, ClientLevel level, LocalPlayer player, long now) {
+      BlockPos pos = this.miningPos;
+      if (pos == null || mc.gameMode == null) {
+         return NavState.FAILED;
+      }
+      if (level.getBlockState(pos).isAir()) {
+         this.stopMining(mc);
+         return NavState.DONE;
+      }
+      if (now - this.miningStartMs > MINE_TIMEOUT_MS) {
+         this.stopMining(mc);
+         return NavState.FAILED;
+      }
+      Vec3 center = new Vec3(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+      if (player.getEyePosition().distanceTo(center) > MINE_REACH) {
+         // steerRaw (not steer) so the pending mining session is not cancelled.
+         this.steerRaw(mc, player, center, true);
+         return NavState.APPROACH_MINE;
+      }
+
+      this.ensureFlight(player);
+      this.releaseMovementKeys(mc);
+      this.aimAtBlock(player, center);
+      if (mc.options != null) {
+         mc.options.keyAttack.setDown(true);
+         mc.options.keyUse.setDown(false);
+      }
+      Direction direction = this.miningDir == null ? Direction.UP : this.miningDir;
+      try {
+         if (!mc.gameMode.isDestroying()) {
+            mc.gameMode.startDestroyBlock(pos, direction);
+         }
+         mc.gameMode.continueDestroyBlock(pos, direction);
+         this.miningStarted = true;
+      } catch (Throwable ignored) {
+         this.stopMining(mc);
+         return NavState.FAILED;
+      }
+      return NavState.MINING;
+   }
+
+   /** Idempotent cleanup: abort any pending block break and release the attack key. */
+   private void stopMining(Minecraft mc) {
+      if (mc != null && mc.options != null) {
+         mc.options.keyAttack.setDown(false);
+      }
+      if (this.miningStarted && mc != null && mc.gameMode != null) {
+         try {
+            if (mc.gameMode.isDestroying()) {
+               mc.gameMode.stopDestroyBlock();
+            }
+         } catch (Throwable ignored) {
+         }
+      }
+      this.miningPos = null;
+      this.miningDir = null;
+      this.miningStarted = false;
+      this.miningStartMs = 0L;
+   }
+
+   private static void aimAtBlock(LocalPlayer player, Vec3 center) {
+      double dx = center.x - player.getX();
+      double dz = center.z - player.getZ();
+      double dy = center.y - player.getEyeY();
+      double horizontal = Math.sqrt(dx * dx + dz * dz);
+      player.setYRot((float)(Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
+      player.setXRot((float)Mth.clamp(-Math.toDegrees(Math.atan2(dy, Math.max(horizontal, 0.001))), -90.0F, 90.0F));
+   }
+
+   // ------------------------------------------------------------------ flight primitives
+
    /** Steer towards a world-space point. {@code slow} releases sprint near the target. */
    public void steer(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow) {
+      this.stopMining(mc);
+      this.steerRaw(mc, player, target, slow);
+   }
+
+   private void steerRaw(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow) {
       this.ensureFlight(player);
       double dx = target.x - player.getX();
       double dz = target.z - player.getZ();
@@ -77,7 +417,7 @@ public final class FlyController {
       player.setYRot(yaw);
       player.setXRot((float)Mth.clamp(pitch, -PITCH_LIMIT, PITCH_LIMIT));
 
-      if (mc.options != null) {
+      if (mc != null && mc.options != null) {
          mc.options.keyAttack.setDown(false);
          mc.options.keyUse.setDown(false);
          mc.options.keyUp.setDown(true);
@@ -94,6 +434,7 @@ public final class FlyController {
 
    /** Stop horizontal movement but stay airborne. Never disables FlyManager. */
    public void hover(Minecraft mc, LocalPlayer player, boolean levelPitch) {
+      this.stopMining(mc);
       this.ensureFlight(player);
       this.releaseMovementKeys(mc);
       if (levelPitch) {
@@ -103,11 +444,13 @@ public final class FlyController {
 
    /** Full key release, used on stop / abort / success. */
    public void release(Minecraft mc) {
+      this.stopMining(mc);
       this.releaseMovementKeys(mc);
       if (mc != null && mc.options != null) {
          mc.options.keyAttack.setDown(false);
          mc.options.keyUse.setDown(false);
       }
+      this.detourTarget = null;
       this.resetStuck();
    }
 
