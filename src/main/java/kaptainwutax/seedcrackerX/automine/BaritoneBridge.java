@@ -12,6 +12,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -155,6 +156,22 @@ public final class BaritoneBridge {
 
    private static String[] blockNames(Block... blocks) {
       return Arrays.stream(blocks).map(b -> BuiltInRegistries.BLOCK.getKey(b).toString()).toArray(String[]::new);
+   }
+
+   /**
+    * Clears any leftover Baritone goal/path so {@link #hasGoalOrPath()} is
+    * false. The elytra hunt must never set a goal (FlyManager would otherwise
+    * stop forcing {@code abilities.flying}), and Baritone may be absent.
+    */
+   public static void ensureIdle() {
+      try {
+         if (!FabricLoader.getInstance().isModLoaded("baritone")) {
+            return;
+         }
+         cancel();
+      } catch (Throwable ignored) {
+         // Baritone not installed / API changed: the hunt does not depend on it.
+      }
    }
 
    static void cancel() {

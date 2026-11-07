@@ -7,6 +7,7 @@ import kaptainwutax.seedcrackerX.automine.AutoMineManager;
 import kaptainwutax.seedcrackerX.buff.BuffManager;
 import kaptainwutax.seedcrackerX.config.Config;
 import kaptainwutax.seedcrackerX.cracker.storage.DataStorage;
+import kaptainwutax.seedcrackerX.elytra.ElytraHuntManager;
 import kaptainwutax.seedcrackerX.finder.FinderQueue;
 import kaptainwutax.seedcrackerX.fly.FlyManager;
 import kaptainwutax.seedcrackerX.guidance.GuidanceManager;
@@ -46,6 +47,9 @@ public class SeedCracker implements ModInitializer {
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> AutoMineManager.INSTANCE.onClientTick());
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> BuffManager.INSTANCE.tick());
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> FlyManager.tick());
+      // Must run after FlyManager.tick(): the hunt re-asserts flying itself and
+      // must never depend on BaritoneBridge.hasGoalOrPath()'s conservative result.
+      ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> ElytraHuntManager.INSTANCE.onClientTick());
       ClientCommandRegistrationCallback.EVENT
          .register((ClientCommandRegistrationCallback)(dispatcher, registryAccess) -> ClientCommands.registerCommands(dispatcher));
       HudElementRegistry.addLast(Identifier.fromNamespaceAndPath("seedcrackerx", "guidance"), (gui, dt) -> GuidanceManager.INSTANCE.renderHud(gui));
