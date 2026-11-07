@@ -7,6 +7,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.monster.Shulker;
 import net.minecraft.world.entity.player.Abilities;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
@@ -40,6 +41,7 @@ public final class FlyController {
       DETOUR,         // flying to a waypoint that goes around an obstacle
       APPROACH_MINE,  // flying towards the blocking block to get within reach
       MINING,         // breaking the blocking block
+      ENTITY,         // a hostile entity blocks the path and no detour was found
       BLOCKED,        // no detour and mining is not allowed / not possible
       DONE,           // internal: the mined block is gone
       FAILED          // internal: mining timed out / could not start
@@ -58,9 +60,12 @@ public final class FlyController {
    private static final double DETOUR_ARRIVE = 3.0;
    private static final long DETOUR_TIMEOUT_MS = 8000L;
    private static final int MAX_DETOUR_FAILURES = 2;
-   private static final double MINE_REACH = 4.0;
+   private static final double MINE_REACH = 3.2;
+   private static final int MAX_OFF_AIM_TICKS = 40;
    private static final long MINE_TIMEOUT_MS = 12000L;
    private static final double MINING_PREFER_DISTANCE = 8.0;
+   private static final double THREAT_PROBE_DISTANCE = 32.0;
+   private static final double THREAT_PADDING = 0.35;
    private static final double[] SIDE_OFFSETS = {6.0, 12.0, 20.0};
    private static final double[] SIDE_LIFTS = {0.0, 4.0, 8.0};
 
@@ -79,6 +84,8 @@ public final class FlyController {
    private Direction miningDir;
    private boolean miningStarted;
    private long miningStartMs;
+   private int offAimTicks;
+   private long ignoreThreatUntilMs;
    private NavState navState = NavState.CLEAR;
 
    public int cruiseY() {
@@ -103,7 +110,18 @@ public final class FlyController {
       this.liftRetries = 0;
       this.detourTarget = null;
       this.detourFailures = 0;
+      this.ignoreThreatUntilMs = 0L;
+      this.setNav(NavState.CLEAR);
       this.resetStuck();
+   }
+
+   /** Temporarily stop treating guards as obstacles (combat timed out; go for the frame directly). */
+   public void ignoreThreatsFor(long millis) {
+      this.ignoreThreatUntilMs = System.currentTimeMillis() + millis;
+   }
+
+   public boolean isIgnoringThreats() {
+      return System.currentTimeMillis() < this.ignoreThreatUntilMs;
    }
 
    /** @return false when the maximum number of altitude lifts has been used. */
@@ -152,6 +170,27 @@ public final class FlyController {
          }
          this.detourFailures = remaining > DETOUR_ARRIVE ? this.detourFailures + 1 : 0;
          this.detourTarget = null;
+      }
+
+      // A shulker is a solid obstacle and also hijacks the crosshair, which
+      // makes vanilla continueAttack() call stopDestroyBlock() instead of
+      // accumulating break progress. Try a detour first (isClear() rejects
+      // paths through hostile entities); if the hull leaves no gap, the manager
+      // clears the guard.
+      boolean nearGoal = player.position().distanceToSqr(target) < 48.0 * 48.0;
+      Entity threat = nearGoal && now > this.ignoreThreatUntilMs
+         ? findThreat(level, player, target)
+         : null;
+      if (threat != null) {
+         Vec3 waypoint = this.findDetour(level, player, target, BlockPos.containing(threat.position()));
+         if (waypoint != null) {
+            this.detourTarget = waypoint;
+            this.detourStartMs = now;
+            this.steer(mc, player, waypoint, true);
+            return this.setNav(NavState.DETOUR);
+         }
+         this.stopMining(mc);
+         return this.setNav(NavState.ENTITY);
       }
 
       BlockHitResult hit = this.firstBlocker(level, player, target);
@@ -234,6 +273,68 @@ public final class FlyController {
       return state;
    }
 
+   /**
+    * Nearest hostile living entity whose hitbox intersects the ray. In an end
+    * ship these are the shulkers guarding the elytra: they physically block
+    * flight and are pickable, so they also steal the crosshair from the block
+    * that is being mined.
+    */
+   public static Entity findThreat(ClientLevel level, LocalPlayer player, Vec3 point) {
+      if (level == null || player == null || point == null) {
+         return null;
+      }
+      return findThreat(level, player, player.getEyePosition(), point);
+   }
+
+   /** Same probe between two arbitrary points, used while choosing a detour. */
+   public static Entity findThreat(ClientLevel level, LocalPlayer player, Vec3 from, Vec3 to) {
+      if (level == null || player == null || from == null || to == null) {
+         return null;
+      }
+      Vec3 delta = to.subtract(from);
+      double length = delta.length();
+      if (length < 0.5) {
+         return null;
+      }
+      Vec3 end = length > THREAT_PROBE_DISTANCE
+         ? from.add(delta.scale(THREAT_PROBE_DISTANCE / length))
+         : to;
+      Entity best = null;
+      double bestDistance = Double.MAX_VALUE;
+      for (Entity entity : level.entitiesForRendering()) {
+         if (entity == player || entity.isRemoved() || !entity.isAlive()) {
+            continue;
+         }
+         // Deliberately only shulkers. Matching the Enemy interface would also
+         // catch every enderman on the outer islands and derail the whole hunt.
+         if (!(entity instanceof Shulker shulker)) {
+            continue;
+         }
+         var hit = shulker.getBoundingBox().inflate(THREAT_PADDING).clip(from, end);
+         if (hit.isEmpty()) {
+            continue;
+         }
+         double distance = hit.get().distanceToSqr(from);
+         if (distance < bestDistance) {
+            best = shulker;
+            bestDistance = distance;
+         }
+      }
+      return best;
+   }
+
+   /** Called by the manager once the blocking entity has been cleared. */
+   public void clearEntityState() {
+      this.detourTarget = null;
+      this.setNav(NavState.CLEAR);
+   }
+
+   /** Compact diagnostics for /os qc 调试. */
+   public String miningDiagnostics() {
+      return "挖掘方块=" + (this.miningPos == null ? "无" : this.miningPos)
+         + " 准星偏离=" + this.offAimTicks + " tick";
+   }
+
    /** First solid block between the player's eyes and {@code target}, or null. */
    private BlockHitResult firstBlocker(ClientLevel level, LocalPlayer player, Vec3 target) {
       Vec3 eye = player.getEyePosition();
@@ -312,6 +413,9 @@ public final class FlyController {
       if (length < 0.001) {
          return true;
       }
+      if (findThreat(level, player, from, to) != null) {
+         return false;
+      }
       Vec3 end = length > PROBE_DISTANCE ? from.add(delta.scale(PROBE_DISTANCE / length)) : to;
       try {
          BlockHitResult hit = level.clip(
@@ -345,6 +449,7 @@ public final class FlyController {
       Vec3 center = new Vec3(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
       if (player.getEyePosition().distanceTo(center) > MINE_REACH) {
          // steerRaw (not steer) so the pending mining session is not cancelled.
+         this.offAimTicks = 0;
          this.steerRaw(mc, player, center, true);
          return NavState.APPROACH_MINE;
       }
@@ -357,6 +462,33 @@ public final class FlyController {
          mc.options.keyUse.setDown(false);
       }
       Direction direction = this.miningDir == null ? Direction.UP : this.miningDir;
+
+      // 26.3 Minecraft.continueAttack(true) keeps a break going ONLY when
+      // hitResult is a BLOCK hit on a non-air block. An EntityHitResult (item
+      // frame, projectile, ...) or MISS makes it call stopDestroyBlock(), which
+      // sends ABORT_DESTROY_BLOCK and resets the server-side progress every
+      // single tick - that is the "progress keeps resetting" symptom. Do not
+      // push progress while the crosshair is stolen; re-aim, hold the session,
+      // and fail fast so the manager can detour or clear the obstruction.
+      HitResult crosshair = mc.hitResult;
+      boolean onTarget = crosshair instanceof BlockHitResult blockHit
+         && blockHit.getBlockPos().equals(pos);
+      if (!onTarget) {
+         this.offAimTicks++;
+         // Best effort: hand vanilla a valid BLOCK hit result. A render pick may
+         // overwrite it next frame, but when it does not the break keeps its
+         // progress. Keep an EntityHitResult intact so the manager can detect
+         // that the crosshair is on the elytra frame and switch to taking it.
+         if (crosshair == null || crosshair.getType() != HitResult.Type.ENTITY) {
+            mc.hitResult = new BlockHitResult(center, direction, pos, false);
+         }
+         if (this.offAimTicks > MAX_OFF_AIM_TICKS) {
+            this.stopMining(mc);
+            return NavState.FAILED;
+         }
+         return NavState.MINING;
+      }
+      this.offAimTicks = 0;
       try {
          if (!mc.gameMode.isDestroying()) {
             mc.gameMode.startDestroyBlock(pos, direction);
@@ -387,6 +519,7 @@ public final class FlyController {
       this.miningDir = null;
       this.miningStarted = false;
       this.miningStartMs = 0L;
+      this.offAimTicks = 0;
    }
 
    private static void aimAtBlock(LocalPlayer player, Vec3 center) {

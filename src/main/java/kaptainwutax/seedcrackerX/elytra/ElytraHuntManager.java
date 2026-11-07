@@ -104,6 +104,11 @@ public final class ElytraHuntManager {
    private static final long POPPED_PICKUP_GRACE_MS = 8000L;
    private static final double REBIND_RADIUS = 8.0;
    private static final double DROP_RADIUS = 48.0;
+   private static final long THREAT_TIMEOUT_MS = 25000L;
+   private static final long COMBAT_COOLDOWN_MS = 550L;
+   private static final double THREAT_ATTACK_RANGE_SQ = 20.25;
+   /** Total time a single candidate may spend detouring / mining / clearing guards. */
+   private static final long OBSTACLE_GRACE_MS = 45000L;
    private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
    // Approach points around the ship: stay outside the hull but well inside
    // entity tracking range. A new angle is used for every re-scan attempt.
@@ -194,6 +199,9 @@ public final class ElytraHuntManager {
    private long poppedSinceMs;
    private int rebindCount;
    private String targetIssue;
+   private long threatSinceMs;
+   private long lastCombatMs;
+   private long obstacleSinceMs;
 
    private ElytraHuntManager() {
    }
@@ -216,6 +224,9 @@ public final class ElytraHuntManager {
       this.poppedSinceMs = 0L;
       this.rebindCount = 0;
       this.targetIssue = null;
+      this.threatSinceMs = 0L;
+      this.lastCombatMs = 0L;
+      this.obstacleSinceMs = 0L;
       this.pickupOnly = false;
       this.itemPopped = false;
    }
@@ -385,6 +396,14 @@ public final class ElytraHuntManager {
             + " 目标问题=" + (this.targetIssue == null ? "无" : this.targetIssue),
          ChatFormatting.AQUA
       );
+      this.info(
+         "导航=" + this.flight.navState()
+            + " " + this.flight.miningDiagnostics()
+            + " 清怪计时=" + (this.threatSinceMs == 0L
+               ? 0 : (System.currentTimeMillis() - this.threatSinceMs)) + "ms"
+            + " 准星=" + (mc.hitResult == null ? "null" : mc.hitResult.getType()),
+         ChatFormatting.AQUA
+      );
       ScanResult s = this.lastScan;
       this.info(
          "区块已加载=" + (s != null && s.chunkLoaded)
@@ -437,6 +456,14 @@ public final class ElytraHuntManager {
       }
       if (countElytra(player) > this.baselineElytra) {
          this.onElytraGained(mc, player, now);
+         return;
+      }
+
+      // Probe the path every tick rather than trusting the previous nav state:
+      // a guard tucked into the ship hull would otherwise make the controller
+      // push into its hitbox until a timeout gives up. Long cruises ignore
+      // distant mobs - see tickThreat().
+      if (this.phase != Phase.LOCATING && this.tickThreat(mc, player, level, now)) {
          return;
       }
 
@@ -941,6 +968,95 @@ public final class ElytraHuntManager {
       }
    }
 
+   // ------------------------------------------------------------------ hostile guards
+
+   /** The point the current phase is trying to reach; used for the threat ray probe. */
+   private Vec3 threatGoal(LocalPlayer player) {
+      Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
+      if (target != null && !target.isRemoved()) {
+         return target.position();
+      }
+      if (this.targetFramePos != null) {
+         return Vec3.atCenterOf(this.targetFramePos);
+      }
+      if (this.sweepTarget != null) {
+         return this.sweepTarget;
+      }
+      if (this.verifyPoint != null) {
+         return this.verifyPoint;
+      }
+      if (this.current != null) {
+         return Vec3.atCenterOf(this.current.target());
+      }
+      return player.position().add(0.0, 0.0, 1.0);
+   }
+
+   /**
+    * Clear the shulker that blocks the path. FlyController tries a detour first;
+    * this is the fallback for a guard tucked inside the ship hull.
+    *
+    * @return true when this tick was consumed by combat (skip the normal phase).
+    */
+   private boolean tickThreat(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
+      if (this.flight.isIgnoringThreats()) {
+         // Combat timed out: stop fighting the guard and go straight for the
+         // frame for a while rather than abandoning this ship.
+         return false;
+      }
+      Vec3 goal = this.threatGoal(player);
+      Entity threat = FlyController.findThreat(level, player, goal);
+      if (threat == null) {
+         if (this.threatSinceMs != 0L) {
+            LOGGER.info("[elytra] 挡路实体已清除，恢复正常接近");
+         }
+         this.threatSinceMs = 0L;
+         this.flight.clearEntityState();
+         return false;
+      }
+      // During a long cruise, only deal with guards that are actually close;
+      // otherwise every shulker under the flight path would interrupt travel.
+      if (this.phase == Phase.TRAVELLING
+         && player.distanceToSqr(threat) > 16.0 * 16.0) {
+         this.threatSinceMs = 0L;
+         return false;
+      }
+      if (this.threatSinceMs == 0L) {
+         this.threatSinceMs = now;
+         LOGGER.info("[elytra] 路径被 {} id={} at {} 阻挡，开始清除",
+            threat.getClass().getSimpleName(), threat.getId(), threat.blockPosition());
+      }
+      // Clearing a guard is not a normal approach step: do not let it consume
+      // the verify / approach / take timeout.
+      this.phaseStartMs = now;
+      double distance = player.position().distanceTo(threat.position());
+      if (distance <= 3.2) {
+         this.flight.hover(mc, player, false);
+         FlyController.aimAt(player, threat);
+         if (mc.gameMode != null
+            && player.getAttackStrengthScale(0.0F) >= 0.9F
+            && player.distanceToSqr(threat) < THREAT_ATTACK_RANGE_SQ
+            && now - this.lastCombatMs >= COMBAT_COOLDOWN_MS) {
+            mc.gameMode.attack(player, threat);
+            player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+            this.lastCombatMs = now;
+         }
+      } else {
+         Vec3 stand = threat.position().add(
+            player.position().subtract(threat.position()).normalize().scale(3.0)
+         );
+         this.flight.navigate(mc, level, player, stand, true, true);
+      }
+      this.throttledInfo("前方有潜影贝挡路，正在清除 / 绕行…", now);
+      if (now - this.threatSinceMs > THREAT_TIMEOUT_MS) {
+         LOGGER.warn("[elytra] 清除挡路实体超时 {} ms，改为无视守卫直接取物", now - this.threatSinceMs);
+         this.threatSinceMs = 0L;
+         this.flight.ignoreThreatsFor(15000L);
+         this.flight.clearEntityState();
+         this.info("清怪超时，改为直接靠近取物（15 秒）…", ChatFormatting.YELLOW);
+      }
+      return true;
+   }
+
    // ------------------------------------------------------------------ live target resolution
 
    /**
@@ -1142,14 +1258,24 @@ public final class ElytraHuntManager {
       if (distance > arrival) {
          FlyController.NavState state = this.flight.navigate(mc, level, player, hoverPoint, true, true);
          if (obstacleWork(state)) {
-            // A detour or a dig can legitimately take longer than a plain approach.
+            if (this.obstacleSinceMs == 0L) {
+               this.obstacleSinceMs = now;
+            }
+            if (now - this.obstacleSinceMs > OBSTACLE_GRACE_MS) {
+               this.nextCandidateWithReason(player, now, "通路持续受阻（绕行 / 挖掘 / 清怪）");
+               return;
+            }
+            // A detour, a dig or clearing a guard can legitimately take longer
+            // than a plain approach - do not let APPROACH_TIMEOUT fire.
             this.phaseStartMs = now;
             this.throttledInfo("接近路径被方块阻挡，正在挖开 / 绕行…", now);
          } else {
+            this.obstacleSinceMs = 0L;
             this.throttledInfo("接近目标中，还差 " + String.format("%.1f", distance) + " 格", now);
          }
          return;
       }
+      this.obstacleSinceMs = 0L;
       this.flight.hover(mc, player, false);
       if (this.pickupOnly) {
          // Success is judged by the inventory count at the top of the tick.
@@ -1390,7 +1516,9 @@ public final class ElytraHuntManager {
    private static boolean obstacleWork(FlyController.NavState state) {
       return state == FlyController.NavState.DETOUR
          || state == FlyController.NavState.APPROACH_MINE
-         || state == FlyController.NavState.MINING;
+         || state == FlyController.NavState.MINING
+         || state == FlyController.NavState.ENTITY
+         || state == FlyController.NavState.BLOCKED;
    }
 
    private static boolean isEnd(ClientLevel level) {
