@@ -1,0 +1,10 @@
+pluginManagement {
+    repositories {
+        maven { name = 'AliyunGradlePlugins'; url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { name = 'Fabric'; url = 'https://maven.fabricmc.net' }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'OpenSeed26.3'

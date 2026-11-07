@@ -1,0 +1,59 @@
+package kaptainwutax.seedcrackerX.command;
+
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.mojang.brigadier.context.CommandContext;
+import com.seedfinding.mcfeature.structure.RegionStructure.Data;
+import java.util.List;
+import kaptainwutax.seedcrackerX.SeedCracker;
+import kaptainwutax.seedcrackerX.config.StructureSave;
+import kaptainwutax.seedcrackerX.cracker.DataAddedEvent;
+import kaptainwutax.seedcrackerX.cracker.storage.DataStorage;
+import kaptainwutax.seedcrackerX.util.Log;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.minecraft.ChatFormatting;
+import net.minecraft.locale.Language;
+
+public class DataCommand extends ClientCommand {
+   @Override
+   public String getName() {
+      return "data";
+   }
+
+   @Override
+   public void build(LiteralArgumentBuilder<FabricClientCommandSource> builder) {
+      builder.then(ClientCommands.literal("clear").executes(this::clear));
+      builder.then(ClientCommands.literal("bits").executes(this::printBits));
+      builder.then(ClientCommands.literal("restore").executes(this::restoreData));
+   }
+
+   public int clear(CommandContext<FabricClientCommandSource> context) {
+      SeedCracker.get().reset();
+      sendFeedback(Language.getInstance().getOrDefault("data.clearData"), ChatFormatting.GREEN);
+      return 0;
+   }
+
+   private int printBits(CommandContext<FabricClientCommandSource> context) {
+      DataStorage s = SeedCracker.get().getDataStorage();
+      String message = Language.getInstance().getOrDefault("data.collectedBits").formatted((int)s.getBaseBits(), (int)s.getWantedBits());
+      String message2 = Language.getInstance().getOrDefault("data.collectedLiftingBits").formatted((int)s.getLiftingBits(), 40);
+      sendFeedback(message, ChatFormatting.GREEN);
+      sendFeedback(message2, ChatFormatting.GREEN);
+      return 0;
+   }
+
+   private int restoreData(CommandContext<FabricClientCommandSource> context) {
+      List<Data<?>> preloaded = StructureSave.loadStructures();
+      if (!preloaded.isEmpty()) {
+         for (Data<?> data : preloaded) {
+            SeedCracker.get().getDataStorage().addBaseData(data, DataAddedEvent.POKE_LIFTING);
+         }
+
+         Log.warn("data.restoreStructures", preloaded.size());
+      } else {
+         Log.warn("data.restoreFailed");
+      }
+
+      return 0;
+   }
+}

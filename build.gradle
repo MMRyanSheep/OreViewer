@@ -1,0 +1,68 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.19.3'
+    id 'java'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    // Domestic mirror first: it proxies Maven Central and the Gradle plugin portal.
+    maven { name = 'AliyunPublic'; url = 'https://maven.aliyun.com/repository/public' }
+    maven { name = 'AliyunGradlePlugins'; url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+    maven { name = 'Fabric'; url = 'https://maven.fabricmc.net' }
+    mavenCentral()
+}
+
+loom {
+    // Keep the access widener so RenderType.create / RenderPipelines members stay visible.
+    accessWidenerPath = file('src/main/resources/seedcrackerx.aw')
+}
+
+dependencies {
+    // Minecraft 26.1+ ships unobfuscated with parameter names: no mappings needed.
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // Jars that were embedded in META-INF/jars of the original mod (cloth-config,
+    // latticg, seedfinding libraries) plus Baritone for BaritoneBridge.
+    // Compile-time only: at runtime the embedded copies are loaded by
+    // fabric.mod.json's "jars" entry, and Baritone is a separately installed mod.
+    compileOnly fileTree(dir: 'libs', include: ['*.jar'])
+
+    compileOnly 'org.jetbrains:annotations:26.0.2'
+}
+
+java {
+    // Also publish build/libs/*-sources.jar with the reconstructed sources.
+    withSourcesJar()
+
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 25
+    options.compilerArgs += ['-Xlint:none']
+}
+
+processResources {
+    inputs.property 'version', project.version
+    // Keep fabric.mod.json byte-for-byte (its "depends" strings contain \u003e escapes).
+}
+
+tasks.named('sourcesJar') {
+    // The source archive should contain Java sources only, not the 10 embedded
+    // runtime libraries that live in src/main/resources/META-INF/jars.
+    exclude 'META-INF/jars/**'
+}
