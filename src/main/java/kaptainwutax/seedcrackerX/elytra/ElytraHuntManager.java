@@ -36,6 +36,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -95,6 +96,14 @@ public final class ElytraHuntManager {
    private static final int MAX_SWEEPS = 3;
    private static final long SCAN_INTERVAL_MS = 1000L;
    private static final long INFO_INTERVAL_MS = 3000L;
+   // A client-side Entity instance is discarded (isRemoved() == true) whenever
+   // the server stops tracking it and later re-adds a fresh instance. The frame
+   // is still in the world - only the old Java reference is stale. Re-resolve
+   // by the recorded anchor instead of jumping to the next candidate.
+   private static final long TARGET_REBIND_GRACE_MS = 5000L;
+   private static final long POPPED_PICKUP_GRACE_MS = 8000L;
+   private static final double REBIND_RADIUS = 8.0;
+   private static final double DROP_RADIUS = 48.0;
    private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
    // Approach points around the ship: stay outside the hull but well inside
    // entity tracking range. A new angle is used for every re-scan attempt.
@@ -112,6 +121,14 @@ public final class ElytraHuntManager {
       TAKING,
       DONE,
       ABORTED
+   }
+
+   /** Result of re-resolving the live target on the current client tick. */
+   private enum TargetStatus {
+      FRAME,  // a live item frame still holding an elytra
+      DROP,   // the elytra is on the ground, go pick it up
+      WAIT,   // stale or empty target, give the server time to re-sync
+      LOST    // nothing usable after the grace period
    }
 
    private record LocateResult(long generation, boolean failed, List<CityCandidate> cities) {
@@ -171,6 +188,12 @@ public final class ElytraHuntManager {
    private long lastAttackMs;
    private boolean pickupOnly;
    private boolean itemPopped;
+   /** World-space anchor of the target frame; survives client entity re-syncs. */
+   private BlockPos targetFramePos;
+   private long targetMissingSinceMs;
+   private long poppedSinceMs;
+   private int rebindCount;
+   private String targetIssue;
 
    private ElytraHuntManager() {
    }
@@ -182,6 +205,19 @@ public final class ElytraHuntManager {
    public boolean isRunning() {
       Phase p = this.phase;
       return p != Phase.IDLE && p != Phase.DONE && p != Phase.ABORTED;
+   }
+
+   /** Drop every per-target reference, including the positional anchor. */
+   private void clearTarget() {
+      this.targetFrame = null;
+      this.droppedItem = null;
+      this.targetFramePos = null;
+      this.targetMissingSinceMs = 0L;
+      this.poppedSinceMs = 0L;
+      this.rebindCount = 0;
+      this.targetIssue = null;
+      this.pickupOnly = false;
+      this.itemPopped = false;
    }
 
    // ------------------------------------------------------------------ start / stop
@@ -239,8 +275,7 @@ public final class ElytraHuntManager {
       this.attempts = 0;
       this.rescanRound = 0;
       this.lastReason = null;
-      this.targetFrame = null;
-      this.droppedItem = null;
+      this.clearTarget();
       this.lastScan = null;
       this.flight.resetForNewTarget();
       this.globalStartMs = System.currentTimeMillis();
@@ -296,10 +331,7 @@ public final class ElytraHuntManager {
       this.queue.clear();
       this.rescanRound++;
       this.lastOrigin = pushedOrigin(player, this.rescanRound);
-      this.targetFrame = null;
-      this.droppedItem = null;
-      this.pickupOnly = false;
-      this.itemPopped = false;
+      this.clearTarget();
       this.phase = Phase.LOCATING;
       this.phaseStartMs = System.currentTimeMillis();
       this.info("已清空候选缓存，外推 origin 至 (" + this.lastOrigin.getX() + ", " + this.lastOrigin.getZ() + ") 重新定位", ChatFormatting.GREEN);
@@ -342,6 +374,15 @@ public final class ElytraHuntManager {
             + " 现有鞘翅=" + (player == null ? -1 : countElytra(player))
             + " 攻击次数=" + this.attackAttempts
             + " 目标实体=" + (this.targetFrame == null ? (this.droppedItem == null ? "无" : "掉落物") : "展示框"),
+         ChatFormatting.AQUA
+      );
+      this.info(
+         "目标锚点=" + (this.targetFramePos == null ? "无" : format(this.targetFramePos))
+            + " 框id=" + (this.targetFrame == null ? "无" : this.targetFrame.getId())
+            + " 框已移除=" + (this.targetFrame != null && this.targetFrame.isRemoved())
+            + " 重绑=" + this.rebindCount
+            + " 掉落物id=" + (this.droppedItem == null ? "无" : this.droppedItem.getId())
+            + " 目标问题=" + (this.targetIssue == null ? "无" : this.targetIssue),
          ChatFormatting.AQUA
       );
       ScanResult s = this.lastScan;
@@ -497,8 +538,7 @@ public final class ElytraHuntManager {
       VanillaStructureLocator.clearCityCache();
       this.queue.clear();
       this.current = null;
-      this.targetFrame = null;
-      this.droppedItem = null;
+      this.clearTarget();
       this.sweepTarget = null;
       this.verifyPoint = null;
       this.verifyScans = 0;
@@ -550,10 +590,7 @@ public final class ElytraHuntManager {
       this.current = this.queue.poll();
       this.attempts++;
       this.flight.resetForNewTarget();
-      this.targetFrame = null;
-      this.droppedItem = null;
-      this.pickupOnly = false;
-      this.itemPopped = false;
+      this.clearTarget();
       this.sweepTarget = null;
       this.sweepCount = 0;
       this.lastScan = null;
@@ -706,17 +743,18 @@ public final class ElytraHuntManager {
       }
 
       if (scan.elytraFrame != null) {
+         this.clearTarget();
          this.targetFrame = scan.elytraFrame;
-         this.droppedItem = null;
-         this.pickupOnly = false;
+         this.targetFramePos = scan.elytraFrame.blockPosition();
          this.phaseStartMs = now;
          this.phase = Phase.APPROACHING;
          this.info("找到带鞘翅的展示框，开始贴身接近…", ChatFormatting.GREEN);
          return;
       }
       if (scan.dropped != null) {
-         this.targetFrame = null;
+         this.clearTarget();
          this.droppedItem = scan.dropped;
+         this.targetFramePos = scan.dropped.blockPosition();
          this.pickupOnly = true;
          this.phaseStartMs = now;
          this.phase = Phase.APPROACHING;
@@ -903,27 +941,176 @@ public final class ElytraHuntManager {
       }
    }
 
+   // ------------------------------------------------------------------ live target resolution
+
+   /**
+    * Client-side entity instances are disposable: the server drops an entity
+    * from the tracking range when the player crosses a chunk / view-distance
+    * boundary and re-sends a brand-new instance a moment later. The old Java
+    * reference stays {@code isRemoved() == true} forever while the frame is
+    * still hanging on the wall. Never treat that as "the frame disappeared".
+    */
+   private TargetStatus refreshTarget(ClientLevel level, LocalPlayer player, long now) {
+      Entity drop = this.findDroppedElytra(level, player);
+      if (drop != null) {
+         if (this.droppedItem != drop) {
+            LOGGER.info("[elytra] 锁定掉落鞘翅 id={} at {}", drop.getId(), drop.blockPosition());
+         }
+         this.droppedItem = drop;
+         this.pickupOnly = true;
+         if (this.poppedSinceMs == 0L) {
+            this.poppedSinceMs = now;
+         }
+         this.targetMissingSinceMs = 0L;
+         this.targetIssue = null;
+         return TargetStatus.DROP;
+      }
+
+      Entity frame = this.targetFrame;
+      boolean stale = frame == null || frame.isRemoved() || !frame.isAlive() || !(frame instanceof ItemFrame);
+      if (stale) {
+         Entity replacement = this.findFrameNearAnchor(level);
+         if (replacement != null) {
+            LOGGER.info(
+               "[elytra] 展示框实体重新同步：旧={} 新 id={} at {}（第 {} 次重绑）",
+               frame == null ? "null" : "removed(id=" + frame.getId() + ")",
+               replacement.getId(), replacement.blockPosition(), ++this.rebindCount
+            );
+            frame = replacement;
+            this.targetFrame = frame;
+            this.targetFramePos = frame.blockPosition();
+         } else {
+            frame = null;
+            this.targetFrame = null;
+         }
+      }
+
+      if (frame != null) {
+         ItemStack stack = frameItem(frame);
+         if (!stack.isEmpty() && stack.getItem() == Items.ELYTRA) {
+            this.pickupOnly = false;
+            this.itemPopped = false;
+            this.poppedSinceMs = 0L;
+            this.targetMissingSinceMs = 0L;
+            this.targetIssue = null;
+            return TargetStatus.FRAME;
+         }
+         // The frame is still there but the elytra was popped (by the mining
+         // key, by another player, ...). Give the drop packet time to arrive.
+         this.targetIssue = "展示框仍在，鞘翅已弹出";
+      } else {
+         this.targetIssue = "目标实体客户端实例已失效";
+      }
+
+      if (this.targetMissingSinceMs == 0L) {
+         this.targetMissingSinceMs = now;
+         LOGGER.info(
+            "[elytra] 目标暂不可用：{}，锚点={}",
+            this.targetIssue, this.targetFramePos == null ? "无" : format(this.targetFramePos)
+         );
+      }
+      return now - this.targetMissingSinceMs < TARGET_REBIND_GRACE_MS
+         ? TargetStatus.WAIT
+         : TargetStatus.LOST;
+   }
+
+   /** Find a live ItemFrame instance at the recorded anchor (possibly a replacement instance). */
+   private Entity findFrameNearAnchor(ClientLevel level) {
+      if (this.targetFramePos == null) {
+         return null;
+      }
+      Vec3 anchor = Vec3.atCenterOf(this.targetFramePos);
+      double radiusSq = REBIND_RADIUS * REBIND_RADIUS;
+      Entity best = null;
+      double bestDistance = Double.MAX_VALUE;
+      for (Entity entity : level.entitiesForRendering()) {
+         if (!(entity instanceof ItemFrame) || entity.isRemoved() || !entity.isAlive()) {
+            continue;
+         }
+         double distance = entity.position().distanceToSqr(anchor);
+         if (distance <= radiusSq && distance < bestDistance) {
+            best = entity;
+            bestDistance = distance;
+         }
+      }
+      return best;
+   }
+
+   /** Limit drops to the anchor so somebody else's elytra far away cannot hijack the state machine. */
+   private Entity findDroppedElytra(ClientLevel level, LocalPlayer player) {
+      Vec3 anchor = this.targetFramePos == null ? player.position() : Vec3.atCenterOf(this.targetFramePos);
+      double radiusSq = DROP_RADIUS * DROP_RADIUS;
+      Entity best = null;
+      double bestDistance = Double.MAX_VALUE;
+      for (Entity entity : level.entitiesForRendering()) {
+         if (!(entity instanceof ItemEntity item) || entity.isRemoved() || !entity.isAlive()) {
+            continue;
+         }
+         if (item.getItem().getItem() != Items.ELYTRA) {
+            continue;
+         }
+         double distance = item.position().distanceToSqr(anchor);
+         if (distance <= radiusSq && distance < bestDistance) {
+            best = item;
+            bestDistance = distance;
+         }
+      }
+      return best;
+   }
+
+   private static boolean crosshairOn(Minecraft mc, Entity target) {
+      return mc != null && mc.hitResult instanceof EntityHitResult hit && hit.getEntity() == target;
+   }
+
+   /**
+    * Hovering outside the entity tracking range would never bring the frame
+    * back. While waiting for a re-sync, fly back towards the recorded anchor.
+    *
+    * @return true when navigation was started (caller should just return).
+    */
+   private boolean flyBackToAnchor(Minecraft mc, ClientLevel level, LocalPlayer player, long now) {
+      if (this.targetFramePos == null) {
+         return false;
+      }
+      Vec3 anchor = Vec3.atCenterOf(this.targetFramePos);
+      if (player.position().distanceTo(anchor) <= 12.0) {
+         return false;
+      }
+      this.flight.navigate(mc, level, player, anchor, true, true);
+      this.throttledInfo("目标实体暂未同步，正在靠近展示框位置触发重新同步…", now);
+      return true;
+   }
+
    // ------------------------------------------------------------------ APPROACHING
 
    private void tickApproaching(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
-      Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
-      if (target == null || target.isRemoved() || !target.isAlive()) {
-         // Breaking the block behind an item frame pops the frame and drops the
-         // elytra; that is still a win, so chase the drop instead of giving up.
-         Entity drop = this.findDroppedElytra(level);
-         if (drop != null) {
-            this.targetFrame = null;
-            this.droppedItem = drop;
-            this.pickupOnly = true;
-            this.phaseStartMs = now;
-            this.info("展示框已脱落，改为吸取掉落的鞘翅…", ChatFormatting.AQUA);
-            return;
-         }
-         this.nextCandidateWithReason(player, now, "目标实体已消失");
+      TargetStatus status = this.refreshTarget(level, player, now);
+      if (status == TargetStatus.LOST) {
+         this.nextCandidateWithReason(
+            player, now,
+            (this.targetIssue == null ? "目标实体已消失" : this.targetIssue)
+               + "（等待重新同步 " + (TARGET_REBIND_GRACE_MS / 1000L) + " 秒，重绑 "
+               + this.rebindCount + " 次）"
+         );
          return;
       }
-      if (now - this.phaseStartMs > APPROACH_TIMEOUT_MS) {
+      if (status == TargetStatus.WAIT) {
+         if (!this.flyBackToAnchor(mc, level, player, now)) {
+            this.flight.hover(mc, player, false);
+            this.throttledInfo("目标实体暂未同步 / 鞘翅刚弹出，等待重新出现…", now);
+         }
+         return;
+      }
+      long approachLimit = this.pickupOnly ? VERIFY_APPROACH_TIMEOUT_MS : APPROACH_TIMEOUT_MS;
+      if (now - this.phaseStartMs > approachLimit) {
          this.nextCandidateWithReason(player, now, "贴身接近超时");
+         return;
+      }
+      Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
+      if (target == null || target.isRemoved() || !target.isAlive()) {
+         // refreshTarget just saw a live target; the render thread may swap the
+         // instance in between. Retry next tick rather than giving up on a ship.
+         this.throttledInfo("目标实体正在重新同步…", now);
          return;
       }
       Vec3 hoverPoint = this.pickupOnly
@@ -931,6 +1118,27 @@ public final class ElytraHuntManager {
          : hoverPointFor(target, player, 2.2);
       double distance = player.position().distanceTo(hoverPoint);
       double arrival = this.pickupOnly ? 1.5 : 2.5;
+
+      // Mining holds keyAttack down; if the crosshair lands on the item frame it
+      // pops the elytra (and eventually breaks the frame) before we are in
+      // position. Once the frame is visible and reachable, stop digging and
+      // take it deliberately.
+      if (status == TargetStatus.FRAME
+         && this.flight.navState() == FlyController.NavState.MINING
+         && player.distanceToSqr(target) < 36.0
+         && crosshairOn(mc, target)) {
+         this.flight.hover(mc, player, false);
+         FlyController.aimAt(player, target);
+         this.phaseStartMs = now;
+         this.attackAttempts = 0;
+         this.lastAttackMs = 0L;
+         this.itemPopped = false;
+         this.poppedSinceMs = 0L;
+         this.phase = Phase.TAKING;
+         this.info("准星已对准展示框，停止挖掘并直接取物", ChatFormatting.AQUA);
+         return;
+      }
+
       if (distance > arrival) {
          FlyController.NavState state = this.flight.navigate(mc, level, player, hoverPoint, true, true);
          if (obstacleWork(state)) {
@@ -953,6 +1161,7 @@ public final class ElytraHuntManager {
       this.attackAttempts = 0;
       this.lastAttackMs = 0L;
       this.itemPopped = false;
+      this.poppedSinceMs = 0L;
       this.phase = Phase.TAKING;
       this.info("已就位（朝向误差 0°），开始左键取物", ChatFormatting.AQUA);
    }
@@ -985,48 +1194,54 @@ public final class ElytraHuntManager {
    // ------------------------------------------------------------------ TAKING
 
    private void tickTaking(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
+      TargetStatus status = this.refreshTarget(level, player, now);
+      if (status == TargetStatus.LOST) {
+         this.nextCandidateWithReason(
+            player, now,
+            (this.targetIssue == null ? "展示框被移除" : this.targetIssue) + "，且未找到掉落鞘翅"
+         );
+         return;
+      }
+      if (status == TargetStatus.WAIT) {
+         if (!this.flyBackToAnchor(mc, level, player, now)) {
+            this.flight.hover(mc, player, false);
+            this.throttledInfo("等待展示框 / 掉落鞘翅重新同步…", now);
+         }
+         return;
+      }
+      if (status == TargetStatus.DROP) {
+         this.itemPopped = true;
+         if (this.poppedSinceMs == 0L) {
+            this.poppedSinceMs = now;
+         }
+         Entity drop = this.droppedItem;
+         if (now - this.poppedSinceMs > POPPED_PICKUP_GRACE_MS) {
+            this.nextCandidateWithReason(
+               player, now,
+               drop == null ? "鞘翅已弹出但未拾取到" : "鞘翅已掉落但无法吸取"
+            );
+            return;
+         }
+         if (drop != null && !drop.isRemoved() && player.distanceToSqr(drop) > 2.25) {
+            this.flight.navigate(mc, level, player, drop.position().add(0.0, 0.3, 0.0), true, true);
+            this.throttledInfo("正在吸取掉落的鞘翅…", now);
+         } else {
+            this.flight.hover(mc, player, false);
+         }
+         return;
+      }
+
+      // FRAME: the elytra is still inside a live item frame.
+      this.itemPopped = false;
       if (now - this.phaseStartMs > TAKE_TIMEOUT_MS) {
          this.nextCandidateWithReason(player, now, "取物超时");
          return;
       }
       Entity frame = this.targetFrame;
-      boolean frameGone = frame == null || frame.isRemoved() || !frame.isAlive();
-      if (frameGone) {
-         // Mining the support block pops the item frame; the elytra is now a drop.
-         Entity popped = this.findDroppedElytra(level);
-         if (popped == null) {
-            this.nextCandidateWithReason(player, now, "展示框被移除");
-            return;
-         }
-         this.itemPopped = true;
-         this.droppedItem = popped;
-      }
-
-      // Once the frame is empty - or the item entity is already visible - the
-      // item has been popped: stop attacking and just fly into the drop.
-      if (!frameGone && this.attackAttempts > 0
-         && (frameItem(frame).isEmpty() || this.findDroppedElytra(level) != null)) {
-         this.itemPopped = true;
-      }
-      if (this.itemPopped) {
-         Entity drop = this.findDroppedElytra(level);
-         if (drop != null) {
-            if (player.distanceToSqr(drop) > 2.25) {
-               this.flight.navigate(mc, level, player, drop.position().add(0.0, 0.3, 0.0), true, true);
-               this.throttledInfo("正在吸取掉落的鞘翅…", now);
-            } else {
-               this.flight.hover(mc, player, false);
-            }
-            return;
-         }
-         if (now - this.lastAttackMs > 3000L) {
-            this.nextCandidateWithReason(player, now, "鞘翅已弹出但未拾取到");
-            return;
-         }
-         this.flight.hover(mc, player, false);
+      if (frame == null) {
+         this.throttledInfo("等待展示框实体同步…", now);
          return;
       }
-
       if (!player.hasLineOfSight(frame)) {
          FlyController.NavState state = this.flight.navigate(
             mc, level, player, hoverPointFor(frame, player, 2.2), true, true
@@ -1059,18 +1274,6 @@ public final class ElytraHuntManager {
          this.lastAttackMs = now;
          LOGGER.info("[elytra] 左键攻击展示框 #{} at {}", this.attackAttempts, frame.blockPosition());
       }
-   }
-
-   private Entity findDroppedElytra(ClientLevel level) {
-      for (Entity entity : level.entitiesForRendering()) {
-         if (entity instanceof ItemEntity item
-            && !item.isRemoved()
-            && item.isAlive()
-            && item.getItem().getItem() == Items.ELYTRA) {
-            return entity;
-         }
-      }
-      return null;
    }
 
    // ------------------------------------------------------------------ collection / finish
@@ -1113,12 +1316,9 @@ public final class ElytraHuntManager {
    /** Reset per-candidate state and immediately pick the next ship. */
    private void continueHunting(LocalPlayer player, long now) {
       this.current = null;
-      this.targetFrame = null;
-      this.droppedItem = null;
+      this.clearTarget();
       this.sweepTarget = null;
       this.sweepCount = 0;
-      this.pickupOnly = false;
-      this.itemPopped = false;
       this.lastScan = null;
       this.lastScanMs = 0L;
       this.lastAttackMs = 0L;
