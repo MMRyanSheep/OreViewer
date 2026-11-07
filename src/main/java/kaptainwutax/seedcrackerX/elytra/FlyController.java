@@ -1,5 +1,8 @@
 package kaptainwutax.seedcrackerX.elytra;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -8,6 +11,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.monster.Shulker;
 import net.minecraft.world.entity.player.Abilities;
@@ -17,49 +21,44 @@ import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.ShulkerBoxBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 /**
- * Key-simulated creative flight for the elytra hunt, including obstacle handling.
+ * Intelligent 3D flight pathfinder, full-AABB obstacle resolver, and block miner
+ * for the automatic elytra hunt.
  *
- * <p>Movement deliberately goes through the vanilla input pipeline (no
- * {@code setDeltaMovement}, no Baritone goal), so the server only ever sees
- * legal {@code MovePlayerPacket}s. In 26.3 {@code Entity.moveRelative} uses
- * {@code getYRot()} only - pitch does NOT make creative flight climb - so
- * vertical travel is driven by the jump / sneak keys, while pitch is still set
- * for aiming. Every call also re-asserts the flying ability, which makes this
- * independent of {@code FlyManager} / {@code BaritoneBridge.hasGoalOrPath()}.</p>
- *
- * <p>{@link #navigate} adds the missing "blocked path" behaviour: it ray-traces
- * towards the requested point, first tries to fly around the obstruction via a
- * side / over-the-top waypoint, and when there is no way around (e.g. the hull
- * of an end ship) it breaks the front-most blocking block with the vanilla
- * {@code MultiPlayerGameMode} start/continue destroy pipeline.</p>
+ * <p>Key improvements over the legacy single-ray controller:</p>
+ * <ul>
+ *   <li><b>3D Voxel A* Pathfinding</b>: routes around towers, chorus trees, and
+ *       ship hulls when an open-air path exists, and plans minimal-cost tunnels
+ *       through soft blocks (Purpur / Stained Glass) while avoiding Obsidian
+ *       and Shulkers when the target is enclosed.</li>
+ *   <li><b>Full-Body Swept AABB Collision &amp; Mining</b>: sweeps the player's
+ *       entire {@code 0.6 x 1.8} bounding box (with safety margin) along the
+ *       movement vector so blocks at feet, knees, head, or shoulders are never
+ *       missed by a thin eye-level ray, and 1x1 holes are always expanded to a
+ *       full passable tunnel.</li>
+ *   <li><b>Occlusion-Aware Nearest-First Mining</b>: always mines the closest
+ *       visible blocking block within reach and synchronizes with vanilla's
+ *       {@code MultiPlayerGameMode} without double-ticking {@code destroyProgress}.</li>
+ *   <li><b>Velocity-Damped Precision Steering</b>: actively cancels lateral
+ *       creative-flight drift via counter-strafing and avoids 180-degree yaw
+ *       oscillation during vertical climbs/descents.</li>
+ * </ul>
  */
 public final class FlyController {
-   public static final int CRUISE_Y = 140;
+   public static final int CRUISE_Y = 165;
 
-   // ------------------------------------------------------------------ held-item selection
-   //
-   // The hunt both digs through ship hulls and fights shulkers. Breaking speed
-   // and attack damage are calculated on the SERVER from the item in the
-   // selected hotbar slot, so changing Inventory.selected alone is not enough:
-   // the client must also tell the server which slot is active. Vanilla does
-   // that from MultiPlayerGameMode.tick() -> ensureHasSentCarriedItem(), but our
-   // code runs on END_CLIENT_TICK (after Minecraft.tick()), so we send the
-   // packet ourselves as well. Vanilla will repeat the same idempotent packet
-   // on the next tick.
-   //
-   // IMPORTANT: MultiPlayerGameMode.sameDestroyTarget() compares the held stack
-   // with the one recorded when the break started. Changing the held item in
-   // the middle of a dig resets the server-side break progress, which is the
-   // "progress keeps resetting" symptom. The mining session therefore equips
-   // its pickaxe exactly once, BEFORE startDestroyBlock(), and never swaps
-   // again until the block is gone.
    private enum ToolIntent { MINE, ATTACK }
 
    private static final Map<Item, Integer> PICKAXE_RANK = Map.ofEntries(
@@ -89,8 +88,8 @@ public final class FlyController {
       Map.entry(Items.WOODEN_SWORD, 25),
       Map.entry(Items.WOODEN_AXE, 22)
    );
-   private static final long TOOL_MOVE_COOLDOWN_MS = 1200L;
-   private static final int MAX_TOOL_MOVES = 6;
+   private static final long TOOL_MOVE_COOLDOWN_MS = 800L;
+   private static final int MAX_TOOL_MOVES = 24;
 
    private static long lastToolMoveMs;
    private static int toolMoves;
@@ -102,7 +101,7 @@ public final class FlyController {
       FlyController.lastToolAction = "未切换";
    }
 
-   /** Equip the fastest pickaxe for {@code state}. Safe to call every tick (no-op when unchanged). */
+   /** Equip the fastest tool for {@code state}. Safe to call every tick. */
    public static boolean equipForMining(LocalPlayer player, BlockState state) {
       return equip(player, state, ToolIntent.MINE);
    }
@@ -127,18 +126,30 @@ public final class FlyController {
          return false;
       }
       Inventory inventory = player.getInventory();
-      int slot = bestHotbarSlot(inventory, state, intent);
-      if (slot < 0) {
-         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "快捷栏无镐" : "快捷栏无武器") + "，尝试从背包搬出";
-         return moveToolFromInventory(player, state, intent);
+      int hotbarSlot = bestHotbarSlot(inventory, state, intent);
+      double hotbarScore = hotbarSlot >= 0 ? toolScore(inventory.getItem(hotbarSlot), state, intent) : -1.0;
+
+      // Check if main inventory has a strictly better tool when hotbar has none (or only a weak non-pickaxe).
+      if (hotbarSlot < 0 || (intent == ToolIntent.MINE && hotbarScore < 100.0)) {
+         int invSlot = bestInventorySlot(inventory, state, intent);
+         if (invSlot >= 0 && toolScore(inventory.getItem(invSlot), state, intent) > hotbarScore + 10.0) {
+            if (moveToolFromInventory(player, invSlot, intent)) {
+               hotbarSlot = bestHotbarSlot(inventory, state, intent);
+            }
+         }
       }
-      if (slot != inventory.getSelectedSlot()) {
-         selectSlot(player, slot);
-         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘切镐" : "攻击切武器")
-            + " → 槽" + (slot + 1) + " " + itemName(inventory.getItem(slot));
+
+      if (hotbarSlot < 0) {
+         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "无可用挖掘工具" : "无可用武器");
+         return false;
+      }
+      if (hotbarSlot != inventory.getSelectedSlot()) {
+         selectSlot(player, hotbarSlot);
+         FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘切工具" : "攻击切武器")
+            + " → 槽" + (hotbarSlot + 1) + " " + itemName(inventory.getItem(hotbarSlot));
       } else {
          FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘" : "攻击")
-            + "沿用 " + itemName(inventory.getItem(slot));
+            + "沿用 " + itemName(inventory.getItem(hotbarSlot));
       }
       return true;
    }
@@ -150,7 +161,6 @@ public final class FlyController {
             player.connection.send(new ServerboundSetCarriedItemPacket(slot));
          }
       } catch (Throwable ignored) {
-         // Vanilla's ensureHasSentCarriedItem() still syncs the slot next tick.
       }
    }
 
@@ -167,8 +177,6 @@ public final class FlyController {
       if (best < 0) {
          return -1;
       }
-      // Already holding an equally good tool: do not switch (a switch would
-      // reset an in-progress block break).
       int current = inventory.getSelectedSlot();
       if (toolScore(inventory.getItem(current), state, intent) >= bestScore) {
          return current;
@@ -176,69 +184,7 @@ public final class FlyController {
       return best;
    }
 
-   private static double toolScore(ItemStack stack, BlockState state, ToolIntent intent) {
-      if (stack == null || stack.isEmpty()) {
-         return -1.0;
-      }
-      Item item = stack.getItem();
-      double base;
-      if (intent == ToolIntent.MINE) {
-         Integer rank = PICKAXE_RANK.get(item);
-         if (rank == null) {
-            return -1.0;
-         }
-         base = 100.0 + rank * 10.0;
-         if (state != null) {
-            try {
-               base += stack.getDestroySpeed(state);
-            } catch (Throwable ignored) {
-            }
-         }
-      } else {
-         Integer score = WEAPON_SCORE.get(item);
-         if (score == null) {
-            return -1.0;
-         }
-         base = score;
-      }
-      try {
-         if (stack.isEnchanted()) {
-            base += 3.0;
-         }
-         if (stack.getMaxDamage() > 0) {
-            base += Math.min(2.0, (stack.getMaxDamage() - stack.getDamageValue()) / 500.0);
-         }
-      } catch (Throwable ignored) {
-      }
-      return base;
-   }
-
-   /** QUICK_MOVE a tool from the main inventory into a free hotbar slot. */
-   private static boolean moveToolFromInventory(LocalPlayer player, BlockState state, ToolIntent intent) {
-      Minecraft mc = Minecraft.getInstance();
-      if (mc == null || mc.gameMode == null || !(player.containerMenu instanceof InventoryMenu)) {
-         return false;
-      }
-      if (FlyController.toolMoves >= MAX_TOOL_MOVES) {
-         FlyController.lastToolAction += "（搬运次数已用尽）";
-         return false;
-      }
-      long now = System.currentTimeMillis();
-      if (now - FlyController.lastToolMoveMs < TOOL_MOVE_COOLDOWN_MS) {
-         return false;
-      }
-      Inventory inventory = player.getInventory();
-      boolean freeSlot = false;
-      for (int i = 0; i < Inventory.getSelectionSize(); i++) {
-         if (inventory.getItem(i).isEmpty()) {
-            freeSlot = true;
-            break;
-         }
-      }
-      if (!freeSlot) {
-         FlyController.lastToolAction += "（快捷栏已满，无法搬入）";
-         return false;
-      }
+   private static int bestInventorySlot(Inventory inventory, BlockState state, ToolIntent intent) {
       int best = -1;
       double bestScore = 0.0;
       for (int i = Inventory.getSelectionSize(); i < 36; i++) {
@@ -248,17 +194,101 @@ public final class FlyController {
             best = i;
          }
       }
-      if (best < 0) {
-         FlyController.lastToolAction += "（背包中也没有，保持当前手持）";
-         return false;
+      return best;
+   }
+
+   private static double toolScore(ItemStack stack, BlockState state, ToolIntent intent) {
+      if (stack == null || stack.isEmpty()) {
+         return -1.0;
+      }
+      if (stack.getMaxDamage() > 0 && stack.getMaxDamage() - stack.getDamageValue() <= 3) {
+         return -1.0;
+      }
+      Item item = stack.getItem();
+      double base = -1.0;
+      if (intent == ToolIntent.MINE) {
+         Integer rank = PICKAXE_RANK.get(item);
+         float destroySpeed = 1.0F;
+         if (state != null) {
+            try {
+               destroySpeed = stack.getDestroySpeed(state);
+            } catch (Throwable ignored) {
+            }
+         }
+         if (rank != null) {
+            base = 100.0 + rank * 10.0 + destroySpeed * 2.0;
+         } else if (destroySpeed > 1.0F) {
+            base = 50.0 + destroySpeed * 2.0;
+         } else {
+            return -1.0;
+         }
+      } else {
+         Integer score = WEAPON_SCORE.get(item);
+         if (score == null) {
+            Integer pickRank = PICKAXE_RANK.get(item);
+            if (pickRank != null) {
+               base = 10.0 + pickRank;
+            } else {
+               return -1.0;
+            }
+         } else {
+            base = score;
+         }
       }
       try {
-         // InventoryMenu maps slots 9..35 straight to inventory slots 9..35.
-         mc.gameMode.handleContainerInput(0, best, 0, ContainerInput.QUICK_MOVE, player);
+         if (stack.isEnchanted()) {
+            base += 5.0;
+         }
+         if (stack.getMaxDamage() > 0) {
+            base += Math.min(2.0, (stack.getMaxDamage() - stack.getDamageValue()) / 500.0);
+         }
+      } catch (Throwable ignored) {
+      }
+      return base;
+   }
+
+   /** Move or SWAP a tool from main inventory (slots 9..35) into the hotbar, even if hotbar is full. */
+   private static boolean moveToolFromInventory(LocalPlayer player, int invSlot, ToolIntent intent) {
+      Minecraft mc = Minecraft.getInstance();
+      if (mc == null || mc.gameMode == null || !(player.containerMenu instanceof InventoryMenu)) {
+         return false;
+      }
+      if (FlyController.toolMoves >= MAX_TOOL_MOVES) {
+         return false;
+      }
+      long now = System.currentTimeMillis();
+      if (now - FlyController.lastToolMoveMs < TOOL_MOVE_COOLDOWN_MS) {
+         return false;
+      }
+      Inventory inventory = player.getInventory();
+      int targetHotbar = -1;
+      for (int i = 0; i < Inventory.getSelectionSize(); i++) {
+         if (inventory.getItem(i).isEmpty()) {
+            targetHotbar = i;
+            break;
+         }
+      }
+      if (targetHotbar < 0) {
+         // Hotbar is full: pick a expendable hotbar slot (not pickaxe, not weapon, not elytra).
+         for (int i = Inventory.getSelectionSize() - 1; i >= 0; i--) {
+            ItemStack s = inventory.getItem(i);
+            Item item = s.getItem();
+            if (!PICKAXE_RANK.containsKey(item) && !WEAPON_SCORE.containsKey(item) && item != Items.ELYTRA) {
+               targetHotbar = i;
+               break;
+            }
+         }
+         if (targetHotbar < 0) {
+            targetHotbar = inventory.getSelectedSlot();
+         }
+      }
+      try {
+         mc.gameMode.handleContainerInput(0, invSlot, targetHotbar, ContainerInput.SWAP, player);
+         selectSlot(player, targetHotbar);
          FlyController.lastToolMoveMs = now;
          FlyController.toolMoves++;
          FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘" : "攻击")
-            + "：从背包槽 " + best + " 搬出工具";
+            + "：从背包槽 " + invSlot + " 换入快捷栏槽 " + (targetHotbar + 1);
          return true;
       } catch (Throwable ignored) {
          return false;
@@ -278,37 +308,41 @@ public final class FlyController {
 
    /** What {@link #navigate} decided to do on the last tick. */
    public enum NavState {
-      CLEAR,          // straight line is free, flying to the target
-      DETOUR,         // flying to a waypoint that goes around an obstacle
-      APPROACH_MINE,  // flying towards the blocking block to get within reach
-      MINING,         // breaking the blocking block
-      ENTITY,         // a hostile entity blocks the path and no detour was found
-      BLOCKED,        // no detour and mining is not allowed / not possible
-      DONE,           // internal: the mined block is gone
-      FAILED          // internal: mining timed out / could not start
+      CLEAR,          // straight swept-AABB path is free, flying to the target
+      DETOUR,         // following a 3D A* path around obstacles
+      APPROACH_MINE,  // moving within reach of a blocking block to mine it
+      MINING,         // breaking a blocking block
+      ENTITY,         // a hostile entity blocks the path and must be cleared
+      BLOCKED,        // no route available under current constraints
+      DONE,           // internal: mined block is broken
+      FAILED          // internal: mining timed out or failed
    }
 
-   private static final float PITCH_LIMIT = 35.0F;
-   private static final double VERTICAL_DEADZONE = 2.0;
-   private static final int STUCK_TICKS = 100;
-   private static final double STUCK_MOVE_THRESHOLD = 1.0;
-   private static final int MAX_LIFT_RETRIES = 3;
-   private static final int LIFT_STEP = 20;
+   private static final float PITCH_LIMIT = 45.0F;
+   private static final double CRUISE_VERTICAL_DEADZONE = 0.85;
+   private static final double LOCAL_VERTICAL_DEADZONE = 0.22;
+   private static final int STUCK_TICKS = 70;
+   private static final double STUCK_MOVE_THRESHOLD = 0.9;
+   private static final int MAX_LIFT_RETRIES = 4;
+   private static final int LIFT_STEP = 18;
 
-   // Obstacle navigation. The probe is capped so a 1000-block flight never
-   // turns into a 1000-block ray trace on the render thread.
-   private static final double PROBE_DISTANCE = 48.0;
-   private static final double DETOUR_ARRIVE = 3.0;
-   private static final long DETOUR_TIMEOUT_MS = 8000L;
-   private static final int MAX_DETOUR_FAILURES = 2;
-   private static final double MINE_REACH = 3.2;
-   private static final int MAX_OFF_AIM_TICKS = 40;
+   // Swept AABB & A* parameters
+   private static final double PROBE_DISTANCE = 40.0;
+   private static final double PLAYER_HALF_WIDTH = 0.34;
+   private static final double PLAYER_HEIGHT = 1.84;
+   private static final double NODE_FEET_OFFSET_Y = 0.08;
+   private static final double WAYPOINT_ARRIVE_XZ = 0.68;
+   private static final double WAYPOINT_ARRIVE_Y = 0.85;
+   private static final long PATH_RECOMPUTE_MS = 2200L;
+   private static final int MAX_ASTAR_NODES = 2000;
+   private static final double ASTAR_SUBGOAL_DIST = 28.0;
+
+   // Mining parameters
+   private static final double MINE_REACH = 4.25;
+   private static final double MINE_APPROACH_DIST = 2.1;
    private static final long MINE_TIMEOUT_MS = 12000L;
-   private static final double MINING_PREFER_DISTANCE = 8.0;
-   private static final double THREAT_PROBE_DISTANCE = 32.0;
+   private static final double THREAT_PROBE_DISTANCE = 28.0;
    private static final double THREAT_PADDING = 0.35;
-   private static final double[] SIDE_OFFSETS = {6.0, 12.0, 20.0};
-   private static final double[] SIDE_LIFTS = {0.0, 4.0, 8.0};
 
    private int cruiseY = CRUISE_Y;
    private int liftRetries;
@@ -318,12 +352,19 @@ public final class FlyController {
    private double lastZ;
    private boolean hasLastPos;
 
-   private Vec3 detourTarget;
-   private long detourStartMs;
-   private int detourFailures;
+   // 3D A* path state
+   private List<BlockPos> currentPath;
+   private int pathIndex;
+   private Vec3 lastPathGoal;
+   private boolean lastPathAllowMine;
+   private long lastPathTimeMs;
+
+   // Mining state
    private BlockPos miningPos;
    private Direction miningDir;
+   private Vec3 miningAimPoint;
    private boolean miningStarted;
+   private boolean miningFootBlocker;
    private long miningStartMs;
    private int offAimTicks;
    private long ignoreThreatUntilMs;
@@ -331,6 +372,12 @@ public final class FlyController {
 
    public int cruiseY() {
       return this.cruiseY;
+   }
+
+   public void setMinCruiseY(int minCruiseY) {
+      if (minCruiseY > this.cruiseY) {
+         this.cruiseY = minCruiseY;
+      }
    }
 
    public int liftRetries() {
@@ -349,14 +396,19 @@ public final class FlyController {
       this.stopMining(Minecraft.getInstance());
       this.cruiseY = CRUISE_Y;
       this.liftRetries = 0;
-      this.detourTarget = null;
-      this.detourFailures = 0;
+      this.clearPath();
       this.ignoreThreatUntilMs = 0L;
       this.setNav(NavState.CLEAR);
       this.resetStuck();
    }
 
-   /** Temporarily stop treating guards as obstacles (combat timed out; go for the frame directly). */
+   private void clearPath() {
+      this.currentPath = null;
+      this.pathIndex = 0;
+      this.lastPathGoal = null;
+      this.lastPathTimeMs = 0L;
+   }
+
    public void ignoreThreatsFor(long millis) {
       this.ignoreThreatUntilMs = System.currentTimeMillis() + millis;
    }
@@ -365,13 +417,13 @@ public final class FlyController {
       return System.currentTimeMillis() < this.ignoreThreatUntilMs;
    }
 
-   /** @return false when the maximum number of altitude lifts has been used. */
    public boolean lift() {
       if (this.liftRetries >= MAX_LIFT_RETRIES) {
          return false;
       }
       this.liftRetries++;
       this.cruiseY += LIFT_STEP;
+      this.clearPath();
       this.resetStuck();
       return true;
    }
@@ -381,133 +433,149 @@ public final class FlyController {
       this.hasLastPos = false;
    }
 
-   // ------------------------------------------------------------------ navigation
+   // ------------------------------------------------------------------ main navigation entry
 
    /**
-    * Fly towards {@code target}, dealing with solid blocks in the way.
-    *
-    * <p>Strategy: ray trace -> sidestep / climb over the obstruction -> if no
-    * route exists (or the target is enclosed), dig through the blocking layer.
-    * {@code allowMine} is false for long-distance cruising, where raising the
-    * cruise altitude is preferable to tunnelling through every tower.</p>
+    * Navigate towards {@code target} using full-AABB sweep checks, 3D A* pathfinding,
+    * and automatic 2-block-tall tunnel mining when needed.
     */
    public NavState navigate(Minecraft mc, ClientLevel level, LocalPlayer player, Vec3 target, boolean slow, boolean allowMine) {
-      if (level == null || mc == null || mc.gameMode == null) {
+      if (level == null || mc == null || mc.gameMode == null || player == null || target == null) {
          this.steer(mc, player, target, slow);
          return this.setNav(NavState.CLEAR);
       }
       long now = System.currentTimeMillis();
 
-      // Keep following an active waypoint instead of recomputing one every tick,
-      // which would make the player oscillate in front of the obstacle.
-      if (this.detourTarget != null) {
-         double remaining = player.position().distanceTo(this.detourTarget);
-         boolean waypointBlocked = this.firstBlocker(level, player, this.detourTarget) != null;
-         if (remaining > DETOUR_ARRIVE
-            && now - this.detourStartMs < DETOUR_TIMEOUT_MS
-            && !waypointBlocked) {
-            this.steer(mc, player, this.detourTarget, true);
-            return this.setNav(NavState.DETOUR);
-         }
-         this.detourFailures = remaining > DETOUR_ARRIVE ? this.detourFailures + 1 : 0;
-         this.detourTarget = null;
-      }
-
-      // A shulker is a solid obstacle and also hijacks the crosshair, which
-      // makes vanilla continueAttack() call stopDestroyBlock() instead of
-      // accumulating break progress. Try a detour first (isClear() rejects
-      // paths through hostile entities); if the hull leaves no gap, the manager
-      // clears the guard.
-      boolean nearGoal = player.position().distanceToSqr(target) < 48.0 * 48.0;
-      Entity threat = nearGoal && now > this.ignoreThreatUntilMs
-         ? findThreat(level, player, target)
-         : null;
-      if (threat != null) {
-         Vec3 waypoint = this.findDetour(level, player, target, BlockPos.containing(threat.position()));
-         if (waypoint != null) {
-            this.detourTarget = waypoint;
-            this.detourStartMs = now;
-            this.steer(mc, player, waypoint, true);
-            return this.setNav(NavState.DETOUR);
-         }
-         this.stopMining(mc);
-         return this.setNav(NavState.ENTITY);
-      }
-
-      BlockHitResult hit = this.firstBlocker(level, player, target);
-
-      // A mining session is sticky: keep breaking the same block until it is
-      // gone, otherwise a tiny movement would switch targets every tick.
+      // 1. If we are actively mining a valid nearby block, keep mining it unless it's broken or occluded.
       if (this.miningPos != null) {
-         if (hit == null) {
+         if (isPassableBlock(level, this.miningPos)) {
             this.stopMining(mc);
-            this.steer(mc, player, target, slow);
-            return this.setNav(NavState.CLEAR);
+         } else {
+            BlockPos closerOccluder = this.findOccluderOrCloserBlocker(level, player, this.miningPos);
+            if (closerOccluder != null && !closerOccluder.equals(this.miningPos)) {
+               this.startMiningBlock(player, level, closerOccluder, now);
+            }
+            NavState mineState = this.tickMining(mc, level, player, now);
+            if (mineState == NavState.MINING || mineState == NavState.APPROACH_MINE) {
+               return this.setNav(mineState);
+            }
+            if (mineState == NavState.FAILED) {
+               this.clearPath();
+               return this.blocked(mc, player);
+            }
          }
-         NavState mining = this.tickMining(mc, level, player, now);
-         if (mining == NavState.DONE) {
-            this.steer(mc, player, target, slow);
-            return this.setNav(NavState.CLEAR);
+      }
+
+      // 2. Check if the player's body is currently colliding with or immediately blocked by a block
+      //    right in front of them, or if the direct swept AABB to target is completely clear.
+      boolean checkThreats = now > this.ignoreThreatUntilMs && player.position().distanceToSqr(target) < 48.0 * 48.0;
+      if (this.isBoxSweepClear(level, player, player.position(), target, PROBE_DISTANCE, checkThreats)) {
+         this.clearPath();
+         double vDeadzone = slow || player.position().distanceToSqr(target) < 64.0
+            ? LOCAL_VERTICAL_DEADZONE
+            : CRUISE_VERTICAL_DEADZONE;
+         this.steer(mc, player, target, slow, vDeadzone);
+         return this.setNav(NavState.CLEAR);
+      }
+
+      // 3. Direct path is obstructed. Maintain or compute a 3D A* voxel path.
+      boolean needRecompute = this.currentPath == null
+         || this.pathIndex >= this.currentPath.size()
+         || this.lastPathGoal == null
+         || this.lastPathGoal.distanceToSqr(target) > 4.0
+         || this.lastPathAllowMine != allowMine
+         || now - this.lastPathTimeMs > PATH_RECOMPUTE_MS;
+
+      if (!needRecompute && this.pathIndex < this.currentPath.size()) {
+         Vec3 wpCenter = waypointVec(this.currentPath.get(this.pathIndex));
+         if (player.position().distanceToSqr(wpCenter) > 100.0) {
+            needRecompute = true;
          }
-         if (mining == NavState.FAILED) {
-            this.detourFailures = MAX_DETOUR_FAILURES;
+      }
+
+      if (needRecompute) {
+         List<BlockPos> computed = this.computeAStarPath(level, player, target, allowMine, checkThreats);
+         if (computed != null && !computed.isEmpty()) {
+            this.currentPath = computed;
+            this.pathIndex = 0;
+            this.lastPathGoal = target;
+            this.lastPathAllowMine = allowMine;
+            this.lastPathTimeMs = now;
+         } else {
+            this.clearPath();
+         }
+      }
+
+      // 4. Advance along the A* path and perform dynamic lookahead string-pulling on clear air segments.
+      Vec3 nextWaypoint = target;
+      BlockPos nextNodePos = BlockPos.containing(target);
+      if (this.currentPath != null && !this.currentPath.isEmpty()) {
+         while (this.pathIndex < this.currentPath.size()) {
+            BlockPos wp = this.currentPath.get(this.pathIndex);
+            Vec3 wpVec = waypointVec(wp);
+            double horiz = Math.hypot(wpVec.x - player.getX(), wpVec.z - player.getZ());
+            double dy = Math.abs(wpVec.y - player.getY());
+            if (horiz <= WAYPOINT_ARRIVE_XZ && dy <= WAYPOINT_ARRIVE_Y && isPassableColumn(level, wp.getX(), wp.getY(), wp.getZ())) {
+               this.pathIndex++;
+            } else {
+               break;
+            }
+         }
+         // Dynamic lookahead: skip intermediate waypoints if the swept AABB to a further waypoint is 100% clear.
+         while (this.pathIndex + 1 < this.currentPath.size()) {
+            BlockPos next = this.currentPath.get(this.pathIndex + 1);
+            if (!isPassableColumn(level, next.getX(), next.getY(), next.getZ())) {
+               break;
+            }
+            Vec3 nextVec = waypointVec(next);
+            if (player.position().distanceToSqr(nextVec) <= 64.0
+               && this.isBoxSweepClear(level, player, player.position(), nextVec, 8.5, checkThreats)) {
+               this.pathIndex++;
+            } else {
+               break;
+            }
+         }
+         if (this.pathIndex < this.currentPath.size()) {
+            nextNodePos = this.currentPath.get(this.pathIndex);
+            nextWaypoint = waypointVec(nextNodePos);
+         }
+      }
+
+      // 5. Check if any solid block intersects the swept player AABB towards nextWaypoint (or at nextNodePos).
+      BlockPos blocker = this.findNextBlockToMine(level, player, nextNodePos, nextWaypoint);
+      if (blocker != null) {
+         if (!allowMine || !isMineableBlock(level, player, blocker)) {
+            this.clearPath();
             return this.blocked(mc, player);
          }
-         return this.setNav(mining);
+         this.startMiningBlock(player, level, blocker, now);
+         NavState mineState = this.tickMining(mc, level, player, now);
+         if (mineState == NavState.FAILED) {
+            this.clearPath();
+            return this.blocked(mc, player);
+         }
+         return this.setNav(mineState);
       }
 
-      if (hit == null) {
-         this.detourFailures = 0;
-         this.steer(mc, player, target, slow);
-         return this.setNav(NavState.CLEAR);
-      }
-
-      BlockPos blocker = hit.getBlockPos();
-      boolean mineable;
-      try {
-         BlockState state = level.getBlockState(blocker);
-         mineable = !state.isAir() && state.getDestroyProgress(player, level, blocker) > 0.0F;
-      } catch (Throwable ignored) {
-         // Unbreakable / unknown block state: only a detour can help.
-         mineable = false;
-      }
-      boolean nearTarget = player.position().distanceTo(target) < MINING_PREFER_DISTANCE;
-      boolean preferMine = allowMine && mineable && (nearTarget || this.detourFailures >= MAX_DETOUR_FAILURES);
-
-      if (!preferMine) {
-         Vec3 waypoint = this.findDetour(level, player, target, blocker);
-         if (waypoint != null) {
-            this.detourTarget = waypoint;
-            this.detourStartMs = now;
-            this.steer(mc, player, waypoint, true);
-            return this.setNav(NavState.DETOUR);
+      // 6. Check if a Shulker blocks the immediate segment to nextWaypoint when no detour around it existed.
+      if (checkThreats) {
+         Entity threat = findThreat(level, player, player.getEyePosition(), nextWaypoint.add(0.0, 1.0, 0.0));
+         if (threat != null && player.distanceToSqr(threat) < 36.0) {
+            this.stopMining(mc);
+            return this.setNav(NavState.ENTITY);
          }
       }
-      if (!allowMine || !mineable) {
-         return this.blocked(mc, player);
-      }
 
-      // Select the pickaxe BEFORE the vanilla break session starts. Once
-      // startDestroyBlock() has recorded destroyingItem, changing the held
-      // stack makes sameDestroyTarget() fail and resets the break progress.
-      equipForMining(player, level.getBlockState(blocker));
-      this.miningPos = blocker;
-      this.miningDir = hit.getDirection();
-      this.miningStartMs = now;
-      this.miningStarted = false;
-      NavState mining = this.tickMining(mc, level, player, now);
-      if (mining == NavState.DONE) {
-         this.steer(mc, player, target, slow);
-         return this.setNav(NavState.CLEAR);
-      }
-      if (mining == NavState.FAILED) {
-         this.detourFailures = MAX_DETOUR_FAILURES;
-         return this.blocked(mc, player);
-      }
-      return this.setNav(mining);
+      // 7. Segment to nextWaypoint is clear: steer smoothly with lateral drift cancellation.
+      boolean isFinal = nextWaypoint == target;
+      this.steer(mc, player, nextWaypoint, slow || !isFinal, LOCAL_VERTICAL_DEADZONE);
+      return this.setNav(isFinal ? NavState.CLEAR : NavState.DETOUR);
    }
 
-   /** Stop in place and let the caller raise the cruise altitude / change target. */
+   private static Vec3 waypointVec(BlockPos pos) {
+      return new Vec3(pos.getX() + 0.5, pos.getY() + NODE_FEET_OFFSET_Y, pos.getZ() + 0.5);
+   }
+
    private NavState blocked(Minecraft mc, LocalPlayer player) {
       this.hover(mc, player, true);
       return this.setNav(NavState.BLOCKED);
@@ -518,11 +586,641 @@ public final class FlyController {
       return state;
    }
 
+   // ------------------------------------------------------------------ 3D A* Voxel Pathfinder
+
+   private List<BlockPos> computeAStarPath(
+      ClientLevel level, LocalPlayer player, Vec3 target, boolean allowMine, boolean avoidThreats
+   ) {
+      BlockPos start = player.blockPosition();
+      Vec3 delta = target.subtract(player.position());
+      double dist = delta.length();
+      Vec3 subGoalVec = dist > ASTAR_SUBGOAL_DIST
+         ? player.position().add(delta.scale(ASTAR_SUBGOAL_DIST / dist))
+         : target;
+      BlockPos goal = resolveGoalBlock(level, player, BlockPos.containing(subGoalVec), allowMine);
+
+      if (start.equals(goal)) {
+         return List.of(goal);
+      }
+
+      List<AABB> threatBoxes = avoidThreats ? collectThreatBoxes(level, player) : Collections.emptyList();
+
+      int cap = MAX_ASTAR_NODES + 16;
+      long[] nodePos = new long[cap];
+      double[] gScore = new double[cap];
+      double[] fScore = new double[cap];
+      int[] parent = new int[cap];
+      boolean[] closed = new boolean[cap];
+
+      // Open-addressed hash table mapping BlockPos.asLong() -> node index (1-based; 0 = empty)
+      int tableSize = 4096;
+      int tableMask = tableSize - 1;
+      long[] tableKeys = new long[tableSize];
+      int[] tableVals = new int[tableSize];
+
+      // Binary min-heap of node indices ordered by fScore
+      int[] heap = new int[cap];
+      int heapSize = 0;
+
+      int nodeCount = 1;
+      long startLong = start.asLong();
+      nodePos[0] = startLong;
+      gScore[0] = 0.0;
+      fScore[0] = heuristic(start.getX(), start.getY(), start.getZ(), goal.getX(), goal.getY(), goal.getZ());
+      parent[0] = -1;
+
+      int slot = hashLong(startLong) & tableMask;
+      tableKeys[slot] = startLong;
+      tableVals[slot] = 1; // index 0 + 1
+
+      heap[heapSize++] = 0;
+
+      int bestIdx = 0;
+      double bestH = fScore[0];
+
+      int gx = goal.getX();
+      int gy = goal.getY();
+      int gz = goal.getZ();
+
+      // 6 cardinal + 4 horizontal diagonal offsets
+      final int[] dxArr = {1, -1, 0, 0, 0, 0, 1, 1, -1, -1};
+      final int[] dyArr = {0, 0, 1, -1, 0, 0, 0, 0, 0, 0};
+      final int[] dzArr = {0, 0, 0, 0, 1, -1, 1, -1, 1, -1};
+
+      int expansions = 0;
+      while (heapSize > 0 && expansions < MAX_ASTAR_NODES && nodeCount < cap - 12) {
+         // Pop min from heap
+         int current = heap[0];
+         heapSize--;
+         if (heapSize > 0) {
+            int moved = heap[heapSize];
+            double movedF = fScore[moved];
+            int idx = 0;
+            int half = heapSize >>> 1;
+            while (idx < half) {
+               int left = (idx << 1) + 1;
+               int right = left + 1;
+               int smaller = left;
+               if (right < heapSize && fScore[heap[right]] < fScore[heap[left]]) {
+                  smaller = right;
+               }
+               if (movedF <= fScore[heap[smaller]]) {
+                  break;
+               }
+               heap[idx] = heap[smaller];
+               idx = smaller;
+            }
+            heap[idx] = moved;
+         }
+
+         if (closed[current]) {
+            continue;
+         }
+         closed[current] = true;
+         expansions++;
+
+         long cLong = nodePos[current];
+         int cx = BlockPos.getX(cLong);
+         int cy = BlockPos.getY(cLong);
+         int cz = BlockPos.getZ(cLong);
+
+         if (cx == gx && cy == gy && gz == gz) {
+            bestIdx = current;
+            break;
+         }
+
+         double hNow = heuristic(cx, cy, cz, gx, gy, gz);
+         if (hNow < bestH) {
+            bestH = hNow;
+            bestIdx = current;
+         }
+
+         for (int dir = 0; dir < 10; dir++) {
+            int nx = cx + dxArr[dir];
+            int ny = cy + dyArr[dir];
+            int nz = cz + dzArr[dir];
+            if (ny < 4 || ny > 250) {
+               continue;
+            }
+
+            double stepCost = this.stepTransitionCost(
+               level, player, cx, cy, cz, nx, ny, nz, dir >= 6, allowMine, threatBoxes, gx, gy, gz
+            );
+            if (stepCost < 0.0) {
+               continue;
+            }
+
+            long nLong = BlockPos.asLong(nx, ny, nz);
+            int hSlot = hashLong(nLong) & tableMask;
+            int existing = 0;
+            while (true) {
+               int val = tableVals[hSlot];
+               if (val == 0) {
+                  break;
+               }
+               if (tableKeys[hSlot] == nLong) {
+                  existing = val;
+                  break;
+               }
+               hSlot = (hSlot + 1) & tableMask;
+            }
+
+            double tentativeG = gScore[current] + stepCost;
+            int nIdx;
+            if (existing == 0) {
+               if (nodeCount >= cap) {
+                  continue;
+               }
+               nIdx = nodeCount++;
+               nodePos[nIdx] = nLong;
+               gScore[nIdx] = tentativeG;
+               double nh = heuristic(nx, ny, nz, gx, gy, gz);
+               fScore[nIdx] = tentativeG + nh * 1.15;
+               parent[nIdx] = current;
+               tableKeys[hSlot] = nLong;
+               tableVals[hSlot] = nIdx + 1;
+            } else {
+               nIdx = existing - 1;
+               if (closed[nIdx] || tentativeG >= gScore[nIdx]) {
+                  continue;
+               }
+               gScore[nIdx] = tentativeG;
+               double nh = heuristic(nx, ny, nz, gx, gy, gz);
+               fScore[nIdx] = tentativeG + nh * 1.15;
+               parent[nIdx] = current;
+            }
+
+            // Push onto heap
+            int up = heapSize++;
+            double nf = fScore[nIdx];
+            while (up > 0) {
+               int p = (up - 1) >>> 1;
+               if (nf >= fScore[heap[p]]) {
+                  break;
+               }
+               heap[up] = heap[p];
+               up = p;
+            }
+            heap[up] = nIdx;
+         }
+      }
+
+      if (bestIdx <= 0) {
+         // Fallback if boxed in and allowMine is true: step 1 block towards goal
+         if (allowMine) {
+            BlockPos step = start.offset(
+               Integer.compare(gx, start.getX()),
+               Integer.compare(gy, start.getY()),
+               Integer.compare(gz, start.getZ())
+            );
+            return List.of(step, goal);
+         }
+         return null;
+      }
+
+      List<BlockPos> result = new ArrayList<>();
+      int cur = bestIdx;
+      while (cur > 0) {
+         result.add(BlockPos.of(nodePos[cur]));
+         cur = parent[cur];
+      }
+      Collections.reverse(result);
+      return result;
+   }
+
+   private static int hashLong(long key) {
+      long h = key * 0x9E3779B97F4A7C15L;
+      return (int)(h ^ (h >>> 32));
+   }
+
+   private static double heuristic(int x1, int y1, int z1, int x2, int y2, int z2) {
+      double dx = x1 - x2;
+      double dy = y1 - y2;
+      double dz = z1 - z2;
+      return Math.sqrt(dx * dx + dy * dy + dz * dz);
+   }
+
+   private double stepTransitionCost(
+      ClientLevel level,
+      LocalPlayer player,
+      int cx, int cy, int cz,
+      int nx, int ny, int nz,
+      boolean diagonal,
+      boolean allowMine,
+      List<AABB> threatBoxes,
+      int gx, int gy, int gz
+   ) {
+      if (diagonal) {
+         // Diagonals are only allowed in completely open air (including both adjacent cardinal columns).
+         if (!isPassableColumn(level, nx, ny, nz)
+            || !isPassableColumn(level, cx, cy, nz)
+            || !isPassableColumn(level, nx, cy, cz)) {
+            return -1.0;
+         }
+         return 1.414;
+      }
+
+      double cost = (ny != cy) ? 1.15 : 1.0;
+
+      // Check feet and head at destination (nx, ny, nz) and (nx, ny + 1, nz)
+      double c0 = blockStepCost(level, player, new BlockPos(nx, ny, nz), allowMine);
+      if (c0 < 0.0) {
+         return -1.0;
+      }
+      double c1 = blockStepCost(level, player, new BlockPos(nx, ny + 1, nz), allowMine);
+      if (c1 < 0.0) {
+         return -1.0;
+      }
+      cost += c0 + c1;
+
+      // Vertical step requires head/foot transition clearance
+      if (ny > cy) {
+         double cTop = blockStepCost(level, player, new BlockPos(cx, cy + 2, cz), allowMine);
+         if (cTop < 0.0) {
+            return -1.0;
+         }
+         cost += cTop;
+      } else if (ny < cy) {
+         double cBot = blockStepCost(level, player, new BlockPos(cx, cy - 1, cz), allowMine);
+         if (cBot < 0.0) {
+            return -1.0;
+         }
+         cost += cBot;
+      }
+
+      // Slight clearance preference in open air so paths stay centered in doorways and away from walls
+      if (c0 == 0.0 && c1 == 0.0) {
+         if (!isPassableBlock(level, new BlockPos(nx + 1, ny, nz))
+            || !isPassableBlock(level, new BlockPos(nx - 1, ny, nz))
+            || !isPassableBlock(level, new BlockPos(nx, ny, nz + 1))
+            || !isPassableBlock(level, new BlockPos(nx, ny, nz - 1))) {
+            cost += 0.25;
+         }
+      }
+
+      // Avoid Shulker bounding boxes unless right at the goal
+      if (!threatBoxes.isEmpty() && Math.abs(nx - gx) + Math.abs(ny - gy) + Math.abs(nz - gz) > 2) {
+         AABB col = new AABB(nx + 0.15, ny, nz + 0.15, nx + 0.85, ny + 1.8, nz + 0.85);
+         for (AABB threat : threatBoxes) {
+            if (threat.intersects(col)) {
+               cost += 45.0;
+               break;
+            }
+         }
+      }
+
+      return cost;
+   }
+
+   /** Returns 0 for passable air, positive mining penalty for mineable block, or -1 if impassable. */
+   private static double blockStepCost(ClientLevel level, LocalPlayer player, BlockPos pos, boolean allowMine) {
+      if (isPassableBlock(level, pos)) {
+         return 0.0;
+      }
+      if (!allowMine || !isMineableBlock(level, player, pos)) {
+         return -1.0;
+      }
+      BlockState state = level.getBlockState(pos);
+      if (state.is(Blocks.OBSIDIAN) || state.is(Blocks.CRYING_OBSIDIAN)) {
+         return 160.0;
+      }
+      if (state.is(Blocks.CHEST) || state.is(Blocks.ENDER_CHEST) || state.getBlock() instanceof ShulkerBoxBlock) {
+         return 65.0;
+      }
+      float hardness = 1.5F;
+      try {
+         hardness = Math.max(0.1F, state.getDestroySpeed(level, pos));
+      } catch (Throwable ignored) {
+      }
+      return 4.5 + Math.min(80.0, hardness * 4.0);
+   }
+
+   private static BlockPos resolveGoalBlock(ClientLevel level, LocalPlayer player, BlockPos rawGoal, boolean allowMine) {
+      if (isPassableColumn(level, rawGoal.getX(), rawGoal.getY(), rawGoal.getZ())) {
+         return rawGoal;
+      }
+      if (allowMine
+         && isMineableOrPassable(level, player, rawGoal)
+         && isMineableOrPassable(level, player, rawGoal.above())
+         && !level.getBlockState(rawGoal).is(Blocks.OBSIDIAN)) {
+         return rawGoal;
+      }
+      // Search nearby for a passable 1x2 column
+      for (int r = 1; r <= 3; r++) {
+         for (int dy = -r; dy <= r; dy++) {
+            for (int dx = -r; dx <= r; dx++) {
+               for (int dz = -r; dz <= r; dz++) {
+                  BlockPos cand = rawGoal.offset(dx, dy, dz);
+                  if (isPassableColumn(level, cand.getX(), cand.getY(), cand.getZ())) {
+                     return cand;
+                  }
+               }
+            }
+         }
+      }
+      return rawGoal;
+   }
+
+   private static boolean isMineableOrPassable(ClientLevel level, LocalPlayer player, BlockPos pos) {
+      return isPassableBlock(level, pos) || isMineableBlock(level, player, pos);
+   }
+
+   // ------------------------------------------------------------------ Swept AABB & Blocker Detection
+
    /**
-    * Nearest hostile living entity whose hitbox intersects the ray. In an end
-    * ship these are the shulkers guarding the elytra: they physically block
-    * flight and are pickable, so they also steal the crosshair from the block
-    * that is being mined.
+    * True when the player's full {@code 0.68 x 1.84} bounding box can move in a
+    * straight line from {@code from} to {@code to} (up to {@code maxDist}) without
+    * intersecting any solid block or hostile Shulker.
+    */
+   public boolean isBoxSweepClear(
+      ClientLevel level, LocalPlayer player, Vec3 from, Vec3 to, double maxDist, boolean checkThreats
+   ) {
+      Vec3 delta = to.subtract(from);
+      double length = delta.length();
+      if (length < 0.05) {
+         return true;
+      }
+      double checkLen = Math.min(length, maxDist);
+      Vec3 dir = delta.scale(1.0 / length);
+
+      if (checkThreats) {
+         Vec3 eyeFrom = from.add(0.0, 1.62, 0.0);
+         Vec3 eyeTo = from.add(dir.scale(checkLen)).add(0.0, 1.62, 0.0);
+         if (findThreat(level, player, eyeFrom, eyeTo) != null) {
+            return false;
+         }
+      }
+
+      int steps = Math.max(1, (int)Math.ceil(checkLen / 0.45));
+      for (int i = 1; i <= steps; i++) {
+         double d = Math.min(checkLen, i * (checkLen / steps));
+         Vec3 p = from.add(dir.scale(d));
+         AABB box = playerBoxAt(p);
+         int minX = Mth.floor(box.minX);
+         int maxX = Mth.floor(box.maxX);
+         int minY = Mth.floor(box.minY);
+         int maxY = Mth.floor(box.maxY);
+         int minZ = Mth.floor(box.minZ);
+         int maxZ = Mth.floor(box.maxZ);
+         for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+               for (int z = minZ; z <= maxZ; z++) {
+                  if (boxCollidesWithBlock(level, box, new BlockPos(x, y, z))) {
+                     return false;
+                  }
+               }
+            }
+         }
+      }
+      return true;
+   }
+
+   private static AABB playerBoxAt(Vec3 feet) {
+      return new AABB(
+         feet.x - PLAYER_HALF_WIDTH,
+         feet.y + 0.02,
+         feet.z - PLAYER_HALF_WIDTH,
+         feet.x + PLAYER_HALF_WIDTH,
+         feet.y + PLAYER_HEIGHT,
+         feet.z + PLAYER_HALF_WIDTH
+      );
+   }
+
+   private static boolean boxCollidesWithBlock(ClientLevel level, AABB box, BlockPos pos) {
+      try {
+         if (level.getChunk(pos.getX() >> 4, pos.getZ() >> 4, ChunkStatus.FULL, false) == null) {
+            return false;
+         }
+         BlockState state = level.getBlockState(pos);
+         if (state.isAir()) {
+            return false;
+         }
+         VoxelShape shape = state.getCollisionShape(level, pos);
+         if (shape.isEmpty()) {
+            return false;
+         }
+         return box.intersects(shape.bounds().move(pos));
+      } catch (Throwable ignored) {
+         return false;
+      }
+   }
+
+   public static boolean isPassableColumn(ClientLevel level, int x, int y, int z) {
+      return isPassableBlock(level, new BlockPos(x, y, z))
+         && isPassableBlock(level, new BlockPos(x, y + 1, z));
+   }
+
+   public static boolean isPassableBlock(ClientLevel level, BlockPos pos) {
+      try {
+         if (level.getChunk(pos.getX() >> 4, pos.getZ() >> 4, ChunkStatus.FULL, false) == null) {
+            return true;
+         }
+         BlockState state = level.getBlockState(pos);
+         return state.isAir() || state.getCollisionShape(level, pos).isEmpty();
+      } catch (Throwable ignored) {
+         return true;
+      }
+   }
+
+   public static boolean isMineableBlock(ClientLevel level, LocalPlayer player, BlockPos pos) {
+      try {
+         if (level.getChunk(pos.getX() >> 4, pos.getZ() >> 4, ChunkStatus.FULL, false) == null) {
+            return false;
+         }
+         BlockState state = level.getBlockState(pos);
+         if (state.isAir() || !state.getFluidState().isEmpty()) {
+            return false;
+         }
+         if (state.is(Blocks.BEDROCK)
+            || state.is(Blocks.END_PORTAL_FRAME)
+            || state.is(Blocks.END_PORTAL)
+            || state.is(Blocks.END_GATEWAY)
+            || state.is(Blocks.BARRIER)) {
+            return false;
+         }
+         return state.getDestroySpeed(level, pos) >= 0.0F;
+      } catch (Throwable ignored) {
+         return false;
+      }
+   }
+
+   /**
+    * Find the immediate solid block that must be mined so the player's full
+    * {@code 0.68 x 1.84} AABB can advance from {@code player.position()} to
+    * {@code waypointVec}. Also checks line-of-sight occlusion so if a closer
+    * block is in front of the chosen block, the closer block is mined first.
+    */
+   private BlockPos findNextBlockToMine(
+      ClientLevel level, LocalPlayer player, BlockPos nodePos, Vec3 waypointVec
+   ) {
+      Vec3 from = player.position();
+      Vec3 delta = waypointVec.subtract(from);
+      double dist = delta.length();
+      double sweepDist = Math.min(Math.max(dist, 0.5), 3.6);
+      Vec3 dir = dist > 0.001 ? delta.scale(1.0 / dist) : Vec3.ZERO;
+
+      List<BlockPos> candidates = new ArrayList<>();
+      int steps = Math.max(1, (int)Math.ceil(sweepDist / 0.35));
+      for (int i = 0; i <= steps; i++) {
+         double d = i * (sweepDist / steps);
+         Vec3 p = from.add(dir.scale(d));
+         AABB box = playerBoxAt(p);
+         int minX = Mth.floor(box.minX);
+         int maxX = Mth.floor(box.maxX);
+         int minY = Mth.floor(box.minY);
+         int maxY = Mth.floor(box.maxY);
+         int minZ = Mth.floor(box.minZ);
+         int maxZ = Mth.floor(box.maxZ);
+         for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+               for (int z = minZ; z <= maxZ; z++) {
+                  BlockPos pos = new BlockPos(x, y, z);
+                  if (boxCollidesWithBlock(level, box, pos) && !candidates.contains(pos)) {
+                     candidates.add(pos);
+                  }
+               }
+            }
+         }
+         // Stop at the first frontier of colliding blocks so we don't pick blocks behind the wall
+         if (!candidates.isEmpty() && i > 0) {
+            break;
+         }
+      }
+
+      // Also check the target node's 1x2 column if we are close to it
+      if (candidates.isEmpty() && dist <= 3.8) {
+         if (!isPassableBlock(level, nodePos.above())) {
+            candidates.add(nodePos.above());
+         }
+         if (!isPassableBlock(level, nodePos)) {
+            candidates.add(nodePos);
+         }
+      }
+
+      if (candidates.isEmpty()) {
+         return null;
+      }
+
+      Vec3 eye = player.getEyePosition();
+      BlockPos best = null;
+      double bestScore = Double.MAX_VALUE;
+      int playerFeetY = player.blockPosition().getY();
+
+      for (BlockPos pos : candidates) {
+         if (!isMineableBlock(level, player, pos)) {
+            continue;
+         }
+         double d = eye.distanceTo(Vec3.atCenterOf(pos));
+         // Prefer mining upper/eye-level blocks slightly before floor blocks so line of sight stays open
+         double bias = (pos.getY() >= playerFeetY + 1) ? -0.3 : 0.0;
+         // Strongly avoid breaking chests/obsidian if an adjacent block can be broken first
+         BlockState st = level.getBlockState(pos);
+         if (st.is(Blocks.OBSIDIAN)) {
+            bias += 20.0;
+         } else if (st.is(Blocks.CHEST)) {
+            bias += 10.0;
+         }
+         double score = d + bias;
+         if (score < bestScore) {
+            bestScore = score;
+            best = pos;
+         }
+      }
+
+      if (best == null) {
+         return candidates.get(0);
+      }
+
+      // If another mineable block occludes the ray from eye to `best`, mine the occluder first!
+      BlockPos occluder = this.findOccluder(level, player, best);
+      if (occluder != null) {
+         return occluder;
+      }
+      return best;
+   }
+
+   /**
+    * Check if the ray from {@code player.getEyePosition()} to {@code targetPos}
+    * hits a closer mineable block first.
+    */
+   private BlockPos findOccluder(ClientLevel level, LocalPlayer player, BlockPos targetPos) {
+      Vec3 eye = player.getEyePosition();
+      Vec3 aim = findBestAimPoint(level, player, targetPos);
+      try {
+         BlockHitResult hit = level.clip(
+            new ClipContext(eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player)
+         );
+         if (hit.getType() == HitResult.Type.BLOCK) {
+            BlockPos hitPos = hit.getBlockPos();
+            if (!hitPos.equals(targetPos) && isMineableBlock(level, player, hitPos)) {
+               return hitPos;
+            }
+         }
+      } catch (Throwable ignored) {
+      }
+      return null;
+   }
+
+   private BlockPos findOccluderOrCloserBlocker(ClientLevel level, LocalPlayer player, BlockPos currentMining) {
+      return this.findOccluder(level, player, currentMining);
+   }
+
+   /** Find a point on {@code pos} that has direct unobstructed line of sight from the player's eyes. */
+   private static Vec3 findBestAimPoint(ClientLevel level, LocalPlayer player, BlockPos pos) {
+      Vec3 eye = player.getEyePosition();
+      Vec3 center = Vec3.atCenterOf(pos);
+      try {
+         VoxelShape shape = level.getBlockState(pos).getShape(level, pos);
+         if (!shape.isEmpty()) {
+            center = shape.bounds().move(pos).getCenter();
+         }
+      } catch (Throwable ignored) {
+      }
+
+      // Candidate aim points: center and 6 face insets towards the player
+      double[][] offsets = {
+         {0.0, 0.0, 0.0},
+         {0.0, 0.35, 0.0},
+         {0.0, -0.35, 0.0},
+         {0.35, 0.0, 0.0},
+         {-0.35, 0.0, 0.0},
+         {0.0, 0.0, 0.35},
+         {0.0, 0.0, -0.35}
+      };
+      Vec3 bestFallback = center;
+      double bestDistSq = Double.MAX_VALUE;
+      for (double[] off : offsets) {
+         Vec3 pt = new Vec3(pos.getX() + 0.5 + off[0], pos.getY() + 0.5 + off[1], pos.getZ() + 0.5 + off[2]);
+         double dSq = eye.distanceToSqr(pt);
+         if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            bestFallback = pt;
+         }
+         try {
+            BlockHitResult hit = level.clip(
+               new ClipContext(eye, pt, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player)
+            );
+            if (hit.getType() == HitResult.Type.MISS || hit.getBlockPos().equals(pos)) {
+               return pt;
+            }
+         } catch (Throwable ignored) {
+         }
+      }
+      return bestFallback;
+   }
+
+   private static Direction bestFaceDirection(LocalPlayer player, BlockPos pos) {
+      Vec3 eye = player.getEyePosition();
+      Vec3 delta = eye.subtract(Vec3.atCenterOf(pos));
+      return Direction.getApproximateNearest(delta.x, delta.y, delta.z);
+   }
+
+   // ------------------------------------------------------------------ Hostile Threat Detection
+
+   /**
+    * Nearest Shulker whose hitbox intersects the unobstructed ray from the player's
+    * eyes to {@code point}. Solid walls stop the ray so Shulkers behind closed
+    * walls are never falsely treated as blocking the current segment.
     */
    public static Entity findThreat(ClientLevel level, LocalPlayer player, Vec3 point) {
       if (level == null || player == null || point == null) {
@@ -531,7 +1229,6 @@ public final class FlyController {
       return findThreat(level, player, player.getEyePosition(), point);
    }
 
-   /** Same probe between two arbitrary points, used while choosing a detour. */
    public static Entity findThreat(ClientLevel level, LocalPlayer player, Vec3 from, Vec3 to) {
       if (level == null || player == null || from == null || to == null) {
          return null;
@@ -544,14 +1241,24 @@ public final class FlyController {
       Vec3 end = length > THREAT_PROBE_DISTANCE
          ? from.add(delta.scale(THREAT_PROBE_DISTANCE / length))
          : to;
+
+      // Clip against solid blocks first so we never detect a Shulker through a solid ship wall!
+      try {
+         BlockHitResult blockHit = level.clip(
+            new ClipContext(from, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
+         );
+         if (blockHit.getType() == HitResult.Type.BLOCK) {
+            end = blockHit.getLocation();
+         }
+      } catch (Throwable ignored) {
+      }
+
       Entity best = null;
       double bestDistance = Double.MAX_VALUE;
       for (Entity entity : level.entitiesForRendering()) {
          if (entity == player || entity.isRemoved() || !entity.isAlive()) {
             continue;
          }
-         // Deliberately only shulkers. Matching the Enemy interface would also
-         // catch every enderman on the outer islands and derail the whole hunt.
          if (!(entity instanceof Shulker shulker)) {
             continue;
          }
@@ -568,122 +1275,60 @@ public final class FlyController {
       return best;
    }
 
-   /** Called by the manager once the blocking entity has been cleared. */
-   public void clearEntityState() {
-      this.detourTarget = null;
-      this.setNav(NavState.CLEAR);
-   }
-
-   /** Compact diagnostics for /os qc 调试. */
-   public String miningDiagnostics() {
-      return "挖掘方块=" + (this.miningPos == null ? "无" : this.miningPos)
-         + " 准星偏离=" + this.offAimTicks + " tick";
-   }
-
-   /** First solid block between the player's eyes and {@code target}, or null. */
-   private BlockHitResult firstBlocker(ClientLevel level, LocalPlayer player, Vec3 target) {
-      Vec3 eye = player.getEyePosition();
-      Vec3 delta = target.subtract(eye);
-      double length = delta.length();
-      if (length < 0.5) {
-         return null;
-      }
-      Vec3 end = length > PROBE_DISTANCE ? eye.add(delta.scale(PROBE_DISTANCE / length)) : target;
-      try {
-         BlockHitResult hit = level.clip(
-            new ClipContext(eye, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
-         );
-         return hit.getType() == HitResult.Type.BLOCK ? hit : null;
-      } catch (Throwable ignored) {
-         // Unloaded chunk / clip failure: treat as clear rather than vetoing flight.
-         return null;
-      }
-   }
-
-   /** Try side-step and over-the-top waypoints, and keep the first one with a clear two-leg path. */
-   private Vec3 findDetour(ClientLevel level, LocalPlayer player, Vec3 target, BlockPos blocker) {
-      Vec3 eye = player.getEyePosition();
-      double dx = target.x - player.getX();
-      double dz = target.z - player.getZ();
-      double horizontal = Math.sqrt(dx * dx + dz * dz);
-      if (horizontal < 1.0) {
-         return null;
-      }
-      double ux = dx / horizontal;
-      double uz = dz / horizontal;
-      double px = -uz;
-      double pz = ux;
-      double forward = Math.min(horizontal, 6.0);
-      double baseY = Math.max(player.getY(), blocker.getY() + 3.0);
-
-      for (int side = -1; side <= 1; side += 2) {
-         for (double offset : SIDE_OFFSETS) {
-            for (double lift : SIDE_LIFTS) {
-               Vec3 waypoint = new Vec3(
-                  player.getX() + ux * forward + px * side * offset,
-                  baseY + lift,
-                  player.getZ() + uz * forward + pz * side * offset
-               );
-               if (this.isInsideSolid(level, waypoint)) {
-                  continue;
-               }
-               if (!this.isClear(level, player, eye, waypoint)) {
-                  continue;
-               }
-               if (!this.isClear(level, player, waypoint, target)) {
-                  continue;
-               }
-               return waypoint;
+   private static List<AABB> collectThreatBoxes(ClientLevel level, LocalPlayer player) {
+      List<AABB> boxes = new ArrayList<>();
+      Vec3 pos = player.position();
+      for (Entity entity : level.entitiesForRendering()) {
+         if (entity instanceof Shulker shulker && entity.isAlive() && !entity.isRemoved()) {
+            if (entity.position().distanceToSqr(pos) <= 36.0 * 36.0) {
+               boxes.add(shulker.getBoundingBox().inflate(0.6));
             }
          }
       }
-      Vec3 over = new Vec3(player.getX() + ux * forward, baseY + 12.0, player.getZ() + uz * forward);
-      if (!this.isInsideSolid(level, over)
-         && this.isClear(level, player, eye, over)
-         && this.isClear(level, player, over, target)) {
-         return over;
-      }
-      return null;
+      return boxes;
    }
 
-   private boolean isInsideSolid(ClientLevel level, Vec3 point) {
-      BlockPos pos = BlockPos.containing(point);
-      BlockState state = level.getBlockState(pos);
-      return !state.getCollisionShape(level, pos).isEmpty();
+   public void clearEntityState() {
+      this.clearPath();
+      this.setNav(NavState.CLEAR);
    }
 
-   private boolean isClear(ClientLevel level, LocalPlayer player, Vec3 from, Vec3 to) {
-      Vec3 delta = to.subtract(from);
-      double length = delta.length();
-      if (length < 0.001) {
-         return true;
+   public String miningDiagnostics() {
+      return "挖掘方块=" + (this.miningPos == null ? "无" : this.miningPos)
+         + " 贴身阻挡=" + this.miningFootBlocker
+         + " 路径节点=" + (this.currentPath == null ? 0 : (this.pathIndex + "/" + this.currentPath.size()))
+         + " 准星偏离=" + this.offAimTicks + " tick";
+   }
+
+   // ------------------------------------------------------------------ Mining Execution
+
+   private void startMiningBlock(LocalPlayer player, ClientLevel level, BlockPos blocker, long now) {
+      if (blocker.equals(this.miningPos)) {
+         return;
       }
-      if (findThreat(level, player, from, to) != null) {
-         return false;
-      }
-      Vec3 end = length > PROBE_DISTANCE ? from.add(delta.scale(PROBE_DISTANCE / length)) : to;
-      try {
-         BlockHitResult hit = level.clip(
-            new ClipContext(from, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
-         );
-         return hit.getType() != HitResult.Type.BLOCK;
-      } catch (Throwable ignored) {
-         return true;
-      }
+      BlockState state = level.getBlockState(blocker);
+      equipForMining(player, state);
+      int feetY = player.blockPosition().getY();
+      double dx = blocker.getX() + 0.5 - player.getX();
+      double dz = blocker.getZ() + 0.5 - player.getZ();
+      this.miningFootBlocker = blocker.getY() <= feetY + 1 && Math.hypot(dx, dz) <= 2.5;
+      this.miningPos = blocker;
+      this.miningDir = bestFaceDirection(player, blocker);
+      this.miningAimPoint = findBestAimPoint(level, player, blocker);
+      this.miningStartMs = now;
+      this.miningStarted = false;
+      this.offAimTicks = 0;
    }
 
    /**
-    * Break {@link #miningPos} with the vanilla destroy pipeline. Holding
-    * {@code keyAttack} down is essential: {@code Minecraft.continueAttack(false)}
-    * calls {@code stopDestroyBlock()} every tick otherwise, which resets the
-    * server-side break progress before it can ever finish.
+    * Break {@link #miningPos} cleanly without double-ticking {@code destroyProgress}.
     */
    private NavState tickMining(Minecraft mc, ClientLevel level, LocalPlayer player, long now) {
       BlockPos pos = this.miningPos;
       if (pos == null || mc.gameMode == null) {
          return NavState.FAILED;
       }
-      if (level.getBlockState(pos).isAir()) {
+      if (isPassableBlock(level, pos)) {
          this.stopMining(mc);
          return NavState.DONE;
       }
@@ -691,61 +1336,76 @@ public final class FlyController {
          this.stopMining(mc);
          return NavState.FAILED;
       }
-      Vec3 center = new Vec3(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
-      if (player.getEyePosition().distanceTo(center) > MINE_REACH) {
-         // steerRaw (not steer) so the pending mining session is not cancelled.
+
+      Vec3 aim = findBestAimPoint(level, player, pos);
+      this.miningAimPoint = aim;
+      this.miningDir = bestFaceDirection(player, pos);
+      Vec3 eye = player.getEyePosition();
+      double distToAim = eye.distanceTo(aim);
+
+      if (distToAim > MINE_REACH) {
          this.offAimTicks = 0;
-         this.steerRaw(mc, player, center, true);
+         if (mc.options != null) {
+            mc.options.keyAttack.setDown(false);
+         }
+         Vec3 toEye = eye.subtract(aim);
+         double len = Math.max(0.001, toEye.length());
+         Vec3 standOff = aim.add(toEye.scale(MINE_APPROACH_DIST / len)).subtract(0.0, 1.5, 0.0);
+         this.steerRaw(mc, player, standOff, true, LOCAL_VERTICAL_DEADZONE);
          return NavState.APPROACH_MINE;
       }
 
+      // Within reach: brake movement so the player doesn't slide past or into the block while mining
       this.ensureFlight(player);
-      this.releaseMovementKeys(mc);
-      this.aimAtBlock(player, center);
-      if (mc.options != null) {
-         mc.options.keyAttack.setDown(true);
-         mc.options.keyUse.setDown(false);
-      }
+      this.brakeInPlace(mc, player);
+      aimAtVec(player, aim);
+
       Direction direction = this.miningDir == null ? Direction.UP : this.miningDir;
 
-      // 26.3 Minecraft.continueAttack(true) keeps a break going ONLY when
-      // hitResult is a BLOCK hit on a non-air block. An EntityHitResult (item
-      // frame, projectile, ...) or MISS makes it call stopDestroyBlock(), which
-      // sends ABORT_DESTROY_BLOCK and resets the server-side progress every
-      // single tick - that is the "progress keeps resetting" symptom. Do not
-      // push progress while the crosshair is stolen; re-aim, hold the session,
-      // and fail fast so the manager can detour or clear the obstruction.
-      HitResult crosshair = mc.hitResult;
-      boolean onTarget = crosshair instanceof BlockHitResult blockHit
-         && blockHit.getBlockPos().equals(pos);
-      if (!onTarget) {
-         this.offAimTicks++;
-         // Best effort: hand vanilla a valid BLOCK hit result. A render pick may
-         // overwrite it next frame, but when it does not the break keeps its
-         // progress. Keep an EntityHitResult intact so the manager can detect
-         // that the crosshair is on the elytra frame and switch to taking it.
-         if (crosshair == null || crosshair.getType() != HitResult.Type.ENTITY) {
-            mc.hitResult = new BlockHitResult(center, direction, pos, false);
-         }
-         if (this.offAimTicks > MAX_OFF_AIM_TICKS) {
-            this.stopMining(mc);
-            return NavState.FAILED;
-         }
-         return NavState.MINING;
-      }
-      this.offAimTicks = 0;
-      // A threat attack may have swapped to a sword while the crosshair was
-      // being re-aimed. Re-assert the pickaxe before the FIRST break packet,
-      // never after miningStarted (that would discard accumulated progress).
+      // Equip best tool BEFORE starting the break session (changing slots mid-break resets progress)
       if (!this.miningStarted && !mc.gameMode.isDestroying()) {
          equipForMining(player, level.getBlockState(pos));
       }
+
+      // Ensure mc.hitResult points to the block we are mining so Minecraft.continueAttack(true)
+      // does not call stopDestroyBlock() on the next tick.
+      HitResult crosshair = mc.hitResult;
+      boolean entityOnCrosshair = crosshair != null && crosshair.getType() == HitResult.Type.ENTITY;
+      if (!entityOnCrosshair) {
+         mc.hitResult = new BlockHitResult(aim, direction, pos, false);
+      }
+
+      boolean vanillaHandlesTick = mc.mouseHandler != null
+         && mc.mouseHandler.isMouseGrabbed()
+         && !player.isUsingItem()
+         && !entityOnCrosshair;
+
+      if (mc.options != null) {
+         mc.options.keyAttack.setDown(vanillaHandlesTick);
+         mc.options.keyUse.setDown(false);
+      }
+
       try {
-         if (!mc.gameMode.isDestroying()) {
-            mc.gameMode.startDestroyBlock(pos, direction);
+         if (vanillaHandlesTick) {
+            // When mouse is grabbed and no screen is open, Minecraft.continueAttack(true)
+            // already calls gameMode.continueDestroyBlock() once per tick during handleKeybinds().
+            // Only call startDestroyBlock on the very first tick if not yet destroying.
+            if (!this.miningStarted && !mc.gameMode.isDestroying()) {
+               mc.gameMode.startDestroyBlock(pos, direction);
+               player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+            }
+            this.miningStarted = true;
+         } else {
+            // Screen is open (e.g., chat) or mouse is unfocused or an entity is in the way:
+            // drive the break directly once per tick.
+            if (!mc.gameMode.isDestroying()) {
+               mc.gameMode.startDestroyBlock(pos, direction);
+            } else {
+               mc.gameMode.continueDestroyBlock(pos, direction);
+            }
+            player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+            this.miningStarted = true;
          }
-         mc.gameMode.continueDestroyBlock(pos, direction);
-         this.miningStarted = true;
       } catch (Throwable ignored) {
          this.stopMining(mc);
          return NavState.FAILED;
@@ -768,26 +1428,31 @@ public final class FlyController {
       }
       this.miningPos = null;
       this.miningDir = null;
+      this.miningAimPoint = null;
       this.miningStarted = false;
+      this.miningFootBlocker = false;
       this.miningStartMs = 0L;
       this.offAimTicks = 0;
    }
 
-   private static void aimAtBlock(LocalPlayer player, Vec3 center) {
-      double dx = center.x - player.getX();
-      double dz = center.z - player.getZ();
-      double dy = center.y - player.getEyeY();
+   private static void aimAtVec(LocalPlayer player, Vec3 target) {
+      double dx = target.x - player.getX();
+      double dz = target.z - player.getZ();
+      double dy = target.y - player.getEyeY();
       double horizontal = Math.sqrt(dx * dx + dz * dz);
       player.setYRot((float)(Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
       player.setXRot((float)Mth.clamp(-Math.toDegrees(Math.atan2(dy, Math.max(horizontal, 0.001))), -90.0F, 90.0F));
    }
 
-   // ------------------------------------------------------------------ flight primitives
+   // ------------------------------------------------------------------ Flight Primitives & Damping
 
-   /** Steer towards a world-space point. {@code slow} releases sprint near the target. */
    public void steer(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow) {
+      this.steer(mc, player, target, slow, slow ? LOCAL_VERTICAL_DEADZONE : CRUISE_VERTICAL_DEADZONE);
+   }
+
+   public void steer(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow, double verticalDeadzone) {
       this.stopMining(mc);
-      this.steerRaw(mc, player, target, slow);
+      this.steerRaw(mc, player, target, slow, verticalDeadzone);
    }
 
    public boolean isMining() {
@@ -795,17 +1460,7 @@ public final class FlyController {
    }
 
    /**
-    * Fly straight onto a dropped item so vanilla pickup can collect it.
-    *
-    * <p>Deliberately does NOT run the obstacle ray trace / detour logic here:
-    * item pickup is a pure AABB overlap test on the server and ignores line of
-    * sight. A drop resting against a wall or inside the ship hull is therefore
-    * collectable from just outside that wall. Running {@link #navigate} for the
-    * drop instead made the controller detour, dig or hover a few blocks away
-    * until the (too short) pickup grace expired - the "saw the drop, said it
-    * cannot be picked up, switched target" bug.</p>
-    *
-    * @return true when the player is already close enough to let vanilla pick it up.
+    * Fly onto a dropped item for pickup.
     */
    public boolean approachForPickup(Minecraft mc, LocalPlayer player, Vec3 itemPos) {
       if (player == null || itemPos == null) {
@@ -820,49 +1475,98 @@ public final class FlyController {
          return true;
       }
       this.stopMining(mc);
-      // Aim the feet slightly BELOW the item: the vanilla pickup test inflates
-      // the player AABB by ~1 block horizontally, so aligning foot/item height
-      // matters more than reaching the exact eye-level point.
-      Vec3 target = new Vec3(itemPos.x, itemPos.y - 0.35, itemPos.z);
-      this.steerRaw(mc, player, target, true, 0.35);
+      Vec3 target = new Vec3(itemPos.x, itemPos.y - 0.25, itemPos.z);
+      this.steerRaw(mc, player, target, true, 0.2);
       return false;
    }
 
-   private void steerRaw(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow) {
-      this.steerRaw(mc, player, target, slow, VERTICAL_DEADZONE);
-   }
-
+   /**
+    * Velocity-damped 3D steering:
+    * - Prevents 180° yaw spinning when horizontally aligned and climbing/descending.
+    * - Actively counter-strafes (`keyLeft` / `keyRight`) to cancel lateral drift in creative flight.
+    * - Modulates `keyUp` / `keyDown` to prevent overshooting tight waypoints.
+    */
    private void steerRaw(Minecraft mc, LocalPlayer player, Vec3 target, boolean slow, double verticalDeadzone) {
       this.ensureFlight(player);
       double dx = target.x - player.getX();
       double dz = target.z - player.getZ();
-      double dy = target.y - player.getEyeY();
+      double dyEye = target.y + 1.5 - player.getEyeY();
       double horiz = Math.sqrt(dx * dx + dz * dz);
-      float yaw = (float)(Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
-      double pitch = -Math.toDegrees(Math.atan2(dy, Math.max(horiz, 0.001)));
-      player.setYRot(yaw);
+
+      // Only update yaw when horizontal distance is meaningful so vertical climbs/descents never spin 180°
+      if (horiz > 0.18) {
+         float yaw = (float)(Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+         player.setYRot(yaw);
+      }
+      double pitch = -Math.toDegrees(Math.atan2(dyEye, Math.max(horiz, 0.25)));
       player.setXRot((float)Mth.clamp(pitch, -PITCH_LIMIT, PITCH_LIMIT));
 
       if (mc != null && mc.options != null) {
          mc.options.keyAttack.setDown(false);
          mc.options.keyUse.setDown(false);
-         mc.options.keyUp.setDown(true);
-         mc.options.keyDown.setDown(false);
-         mc.options.keyLeft.setDown(false);
-         mc.options.keyRight.setDown(false);
-         mc.options.keySprint.setDown(!slow);
 
-         double climb = target.y - player.getY();
+         // Decompose current horizontal velocity into player's local yaw frame
+         Vec3 vel = player.getDeltaMovement();
+         double yawRad = Math.toRadians(player.getYRot());
+         double forwardX = -Math.sin(yawRad);
+         double forwardZ = Math.cos(yawRad);
+         double rightX = -forwardZ;
+         double rightZ = forwardX;
+
+         double forwardVel = vel.x * forwardX + vel.z * forwardZ;
+         double rightVel = vel.x * rightX + vel.z * rightZ;
+
+         if (horiz <= 0.35) {
+            // Horizontally at target: brake horizontal momentum while vertical keys adjust Y
+            mc.options.keyUp.setDown(forwardVel < -0.05);
+            mc.options.keyDown.setDown(forwardVel > 0.05);
+            mc.options.keySprint.setDown(false);
+         } else {
+            boolean shouldBrake = slow && horiz < 1.4 && forwardVel > 0.22;
+            mc.options.keyUp.setDown(!shouldBrake);
+            mc.options.keyDown.setDown(shouldBrake);
+            mc.options.keySprint.setDown(!slow && horiz > 6.0 && Math.abs(rightVel) < 0.18);
+         }
+
+         // Counter-strafe to cancel sideways skidding around corners
+         mc.options.keyLeft.setDown(rightVel > 0.045);
+         mc.options.keyRight.setDown(rightVel < -0.045);
+
+         double climb = target.y - player.getY() - vel.y * 1.5;
          mc.options.keyJump.setDown(climb > verticalDeadzone);
          mc.options.keyShift.setDown(climb < -verticalDeadzone);
       }
    }
 
-   /** Stop horizontal movement but stay airborne. Never disables FlyManager. */
+   /** Actively brake horizontal & vertical drift using counter-inputs. */
+   private void brakeInPlace(Minecraft mc, LocalPlayer player) {
+      if (mc == null || mc.options == null) {
+         return;
+      }
+      Vec3 vel = player.getDeltaMovement();
+      double yawRad = Math.toRadians(player.getYRot());
+      double forwardX = -Math.sin(yawRad);
+      double forwardZ = Math.cos(yawRad);
+      double rightX = -forwardZ;
+      double rightZ = forwardX;
+
+      double forwardVel = vel.x * forwardX + vel.z * forwardZ;
+      double rightVel = vel.x * rightX + vel.z * rightZ;
+
+      mc.options.keyUp.setDown(forwardVel < -0.06);
+      mc.options.keyDown.setDown(forwardVel > 0.06);
+      mc.options.keyLeft.setDown(rightVel > 0.06);
+      mc.options.keyRight.setDown(rightVel < -0.06);
+      mc.options.keyJump.setDown(vel.y < -0.08);
+      mc.options.keyShift.setDown(vel.y > 0.08);
+      mc.options.keySprint.setDown(false);
+   }
+
+   /** Stop horizontal movement and stay airborne. */
    public void hover(Minecraft mc, LocalPlayer player, boolean levelPitch) {
       this.stopMining(mc);
       this.ensureFlight(player);
-      this.releaseMovementKeys(mc);
+      this.brakeInPlace(mc, player);
       if (levelPitch) {
          player.setXRot(0.0F);
       }
@@ -876,7 +1580,7 @@ public final class FlyController {
          mc.options.keyAttack.setDown(false);
          mc.options.keyUse.setDown(false);
       }
-      this.detourTarget = null;
+      this.clearPath();
       this.resetStuck();
    }
 
@@ -893,7 +1597,6 @@ public final class FlyController {
       mc.options.keySprint.setDown(false);
    }
 
-   /** The flight ability fallback described in the plan (FlyManager may be off). */
    public void ensureFlight(LocalPlayer player) {
       Abilities abilities = player.getAbilities();
       abilities.mayfly = true;
@@ -903,6 +1606,12 @@ public final class FlyController {
 
    /** Sample the position every {@value #STUCK_TICKS} ticks; true means "stuck". */
    public boolean checkStuck(LocalPlayer player) {
+      if (this.miningPos != null) {
+         // Actively breaking a block is not "stuck".
+         this.record(player);
+         this.stuckTicks = 0;
+         return false;
+      }
       if (!this.hasLastPos) {
          this.record(player);
          this.stuckTicks = 0;
@@ -927,14 +1636,14 @@ public final class FlyController {
       this.hasLastPos = true;
    }
 
-   /** Copy of {@code AutoMineManager.faceEntity} (private in the original class). */
    public static void aimAt(LocalPlayer player, Entity target) {
-      double dx = target.getX() - player.getX();
-      double dz = target.getZ() - player.getZ();
-      double dy = target.getY() + target.getBbHeight() * 0.5 - player.getEyeY();
+      Vec3 center = target.getBoundingBox().getCenter();
+      double dx = center.x - player.getX();
+      double dz = center.z - player.getZ();
+      double dy = center.y - player.getEyeY();
       double horiz = Math.sqrt(dx * dx + dz * dz);
       float yaw = (float)(Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
-      float pitch = (float)(-Math.toDegrees(Math.atan2(dy, horiz)));
+      float pitch = (float)(-Math.toDegrees(Math.atan2(dy, Math.max(horiz, 0.001))));
       player.setYRot(yaw);
       player.setXRot(Mth.clamp(pitch, -90.0F, 90.0F));
    }

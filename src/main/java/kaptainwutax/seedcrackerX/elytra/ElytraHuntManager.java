@@ -32,11 +32,14 @@ import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.SwingAnimation;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -91,6 +94,14 @@ public final class ElytraHuntManager {
    private static final long LOCATE_TIMEOUT_MS = 90000L;
    private static final int ATTACK_RETRIES = 3;
    private static final int ORIGIN_PUSH = 1500;
+   // Exploration bias: the central islands (around 0,0) are already looted.
+   // Re-locate origins along a monotonically growing radius away from (0,0)
+   // instead of following the vector to the last candidate, which frequently
+   // pointed straight back into the centre.
+   private static final int OUTWARD_MIN_RADIUS = 2048;
+   private static final double OUTWARD_ANGLE_SWING = 0.5;
+   private static final int OUTWARD_PICK_WINDOW = 8;
+   private static final int CENTER_HYSTERESIS = 512;
    // Continuous collection keeps pushing outwards as nearby ships get looted.
    private static final int MAX_RESCAN_ROUNDS = 64;
    private static final int MAX_SWEEPS = 3;
@@ -198,6 +209,14 @@ public final class ElytraHuntManager {
    private int candidateCount = DEFAULT_CANDIDATES;
    private int attempts;
    private int rescanRound;
+   /** Fixed bearing away from (0,0) for this run; small swings cover new sectors. */
+   private double outwardAngle;
+   /** Player radius when the run started; the base of the linear outward ramp. */
+   private int outwardBaseRadius;
+   /** Radius of the last pushed origin; guarantees every re-locate moves further out. */
+   private int outwardRadius;
+   /** Candidates closer to (0,0) than this are treated as already explored. */
+   private int minTargetRadius;
    private int attackAttempts;
    private long phaseStartMs;
    private long globalStartMs;
@@ -320,6 +339,10 @@ public final class ElytraHuntManager {
       this.lastScan = null;
       this.flight.resetForNewTarget();
       this.globalStartMs = System.currentTimeMillis();
+      this.outwardAngle = outwardBearing(player);
+      this.outwardBaseRadius = (int)Math.hypot(player.getX(), player.getZ());
+      this.outwardRadius = this.outwardBaseRadius;
+      this.minTargetRadius = 0;
       this.lastOrigin = player.blockPosition();
       VanillaStructureLocator.clearCityCache();
       this.phase = Phase.LOCATING;
@@ -375,7 +398,12 @@ public final class ElytraHuntManager {
       this.clearTarget();
       this.phase = Phase.LOCATING;
       this.phaseStartMs = System.currentTimeMillis();
-      this.info("已清空候选缓存，外推 origin 至 (" + this.lastOrigin.getX() + ", " + this.lastOrigin.getZ() + ") 重新定位", ChatFormatting.GREEN);
+      this.info(
+         "已清空候选缓存，沿远离 (0,0) 的方向外推 origin 至 ("
+            + this.lastOrigin.getX() + ", " + this.lastOrigin.getZ() + ")"
+            + "，半径 " + this.outwardRadius + " 格，中心门槛 " + this.minTargetRadius + " 格",
+         ChatFormatting.GREEN
+      );
       this.submitLocating(this.lastOrigin, Math.min(32, this.candidateCount + this.rescanRound * 4));
    }
 
@@ -403,6 +431,9 @@ public final class ElytraHuntManager {
       this.info(
          "重扫=" + this.verifyScans + "/" + MAX_VERIFY_SCANS
             + " 外推轮次=" + this.rescanRound
+            + " 外推半径=" + this.outwardRadius
+            + " 中心门槛=" + this.minTargetRadius
+            + " 外推方位=" + (int)Math.toDegrees(this.outwardAngle) + "°"
             + " 巡航高度=" + this.flight.cruiseY()
             + " 玩家高度=" + (player == null ? -1 : (int)player.getY())
             + " 抬升次数=" + this.flight.liftRetries()
@@ -571,6 +602,11 @@ public final class ElytraHuntManager {
             if (!this.tried.add(candidate.pos().asLong())) {
                continue;
             }
+            BlockPos target = candidate.target();
+            if (Math.hypot(target.getX(), target.getZ()) + CENTER_HYSTERESIS < this.minTargetRadius) {
+               // Inside the already-explored central ring: never fly back in.
+               continue;
+            }
             if (this.queue.size() >= MAX_QUEUE_SIZE) {
                break;
             }
@@ -602,7 +638,8 @@ public final class ElytraHuntManager {
          return false;
       }
       this.rescanRound++;
-      // Compute the direction first: pushedOrigin() reads the current candidate.
+      // pushedOrigin() no longer depends on the current candidate: always push
+      // the search centre further away from (0,0).
       this.lastOrigin = pushedOrigin(player, this.rescanRound);
       VanillaStructureLocator.clearCityCache();
       this.queue.clear();
@@ -622,31 +659,69 @@ public final class ElytraHuntManager {
       // asynchronously computed result is never consumed (old bug).
       this.phase = Phase.LOCATING;
       this.info(
-         "候选耗尽，沿当前方向外推 " + (ORIGIN_PUSH * this.rescanRound) + " 格重新定位（第 " + this.rescanRound + " 轮）",
+         "候选耗尽，沿远离 (0,0) 的方向外推至半径 " + this.outwardRadius
+            + " 格重新定位（第 " + this.rescanRound + " 轮，中心门槛 " + this.minTargetRadius + " 格）",
          ChatFormatting.YELLOW
       );
       this.submitLocating(this.lastOrigin, Math.min(32, this.candidateCount + this.rescanRound * 4));
       return true;
    }
 
-   private static BlockPos pushedOrigin(LocalPlayer player, int round) {
-      double dx = 0.0;
-      double dz = 0.0;
-      if (INSTANCE.current != null) {
-         dx = INSTANCE.current.target().getX() - player.getX();
-         dz = INSTANCE.current.target().getZ() - player.getZ();
+   /** Bearing away from (0,0); a stable per-seed fallback when standing near the centre. */
+   private static double outwardBearing(LocalPlayer player) {
+      if (Math.hypot(player.getX(), player.getZ()) > 256.0) {
+         return Math.atan2(player.getZ(), player.getX());
       }
-      double length = Math.sqrt(dx * dx + dz * dz);
-      if (length < 1.0) {
-         double angle = round * 1.3;
-         dx = Math.cos(angle);
-         dz = Math.sin(angle);
-         length = 1.0;
-      }
-      double push = ORIGIN_PUSH * (double)round / length;
-      return new BlockPos(
-         (int)(player.getX() + dx * push), player.getBlockY(), (int)(player.getZ() + dz * push)
+      return Math.toRadians(Math.floorMod(OreXrayManager.INSTANCE.getWorldSeed(), 360));
+   }
+
+   /**
+    * Next search centre, strictly further from (0,0) than the previous one.
+    *
+    * <p>The old version normalised the vector towards {@code current.target()}
+    * and pushed along it. A failed candidate on the near side made that vector
+    * point straight back into the looted centre, so each "push outwards"
+    * actually re-scanned the same islands. Here the radius is a linear ramp
+    * away from world spawn and the bearing only swings within about +/- 29
+    * degrees of the outward ray, which spreads sectors without ever turning
+    * back. The radius is also monotonic even if the player flies inwards.</p>
+    */
+   private BlockPos pushedOrigin(LocalPlayer player, int round) {
+      int ramp = Math.max(this.outwardBaseRadius, OUTWARD_MIN_RADIUS) + ORIGIN_PUSH * round;
+      int radius = Math.max(ramp, this.outwardRadius + ORIGIN_PUSH);
+      this.outwardRadius = radius;
+      this.minTargetRadius = Math.max(
+         this.minTargetRadius, Math.max(0, radius - ORIGIN_PUSH - CENTER_HYSTERESIS)
       );
+      double angle = this.outwardAngle + Math.sin(round * 0.8) * OUTWARD_ANGLE_SWING;
+      return new BlockPos(
+         (int)(Math.cos(angle) * radius), player.getBlockY(), (int)(Math.sin(angle) * radius)
+      );
+   }
+
+   /**
+    * Pick the candidate furthest from (0,0) among the nearest few results.
+    * Taking the queue head used to send the hunt straight back into the looted
+    * centre; taking the global maximum would make every flight a maximal trip,
+    * so only a small window of nearby results is scored.
+    */
+   private CityCandidate takeNextCandidate() {
+      List<CityCandidate> all = new ArrayList<>(this.queue);
+      int window = Math.min(all.size(), OUTWARD_PICK_WINDOW);
+      int bestIndex = 0;
+      double bestRadius = -1.0;
+      for (int i = 0; i < window; i++) {
+         BlockPos target = all.get(i).target();
+         double radius = Math.hypot(target.getX(), target.getZ());
+         if (radius > bestRadius) {
+            bestRadius = radius;
+            bestIndex = i;
+         }
+      }
+      CityCandidate chosen = all.remove(bestIndex);
+      this.queue.clear();
+      this.queue.addAll(all);
+      return chosen;
    }
 
    private void nextCandidate(LocalPlayer player, long now) {
@@ -656,7 +731,7 @@ public final class ElytraHuntManager {
          }
          return;
       }
-      this.current = this.queue.poll();
+      this.current = this.takeNextCandidate();
       this.attempts++;
       this.flight.resetForNewTarget();
       this.clearTarget();
@@ -673,8 +748,10 @@ public final class ElytraHuntManager {
       this.phase = Phase.TRAVELLING;
       BlockPos city = this.current.pos();
       BlockPos ship = this.current.target();
+      int shipY = ship.getY() > 0 ? ship.getY() : DEFAULT_SHIP_Y;
+      this.flight.setMinCruiseY(Math.max(FlyController.CRUISE_Y, shipY + 28));
       // Prepare the low-altitude approach point for the VERIFYING phase.
-      this.verifyPoint = this.buildVerifyPoint(ship);
+      this.verifyPoint = this.buildVerifyPoint(Minecraft.getInstance().level, ship);
       LOGGER.info(
          "[elytra] 换点 #{} 城={} 船={} shipKnown={} shipLocated={} 剩余 {}",
          this.attempts, city, this.current.shipPos(), this.current.shipKnown(),
@@ -714,33 +791,60 @@ public final class ElytraHuntManager {
       BlockPos pos = this.current.target();
       Vec3 target = new Vec3(pos.getX() + 0.5, this.flight.cruiseY(), pos.getZ() + 0.5);
       double horiz = Math.hypot(target.x - player.getX(), target.z - player.getZ());
-      if (horiz < ARRIVE_XZ && Math.abs(player.getY() - this.flight.cruiseY()) < 20.0) {
+
+      // Early entity scan when approaching the ship horizontally so we lock on immediately if already synced.
+      if (horiz < 64.0 && now - this.lastScanMs >= 500L) {
+         this.lastScanMs = now;
+         ScanResult earlyScan = this.scan(level, player, pos);
+         this.lastScan = earlyScan;
+         if (earlyScan.structureHint != null) {
+            this.structureHint = earlyScan.structureHint;
+         }
+         if (this.tryLockTargetFromScan(earlyScan, now)) {
+            return;
+         }
+      }
+
+      if (horiz < ARRIVE_XZ && Math.abs(player.getY() - this.flight.cruiseY()) < 24.0) {
          this.flight.hover(mc, player, true);
          this.phaseStartMs = now;
          this.lastScanMs = 0L;
          this.sweepCount = 0;
          this.sweepTarget = null;
          this.lastScan = null;
+         this.verifyPoint = this.buildVerifyPoint(level, pos);
          this.phase = Phase.VERIFYING;
          this.info("已抵达船坐标上空，正在下降到船体高度并校验区块 / 结构 / 展示框…", ChatFormatting.AQUA);
          return;
       }
-      // Long-distance cruising prefers a detour / a higher altitude over digging.
-      FlyController.NavState state = this.flight.navigate(mc, level, player, target, horiz < SLOW_RADIUS, false);
+
+      // If starting low or inside an enclosed structure (e.g. inside the previous End Ship cabin),
+      // climb steeply to cruiseY first and allow mining through any blocking ceiling/tree.
+      boolean climbingToCruise = player.getY() < this.flight.cruiseY() - 14.0 && horiz > 24.0;
+      Vec3 navTarget = target;
+      if (climbingToCruise) {
+         double ux = (target.x - player.getX()) / Math.max(horiz, 1.0);
+         double uz = (target.z - player.getZ()) / Math.max(horiz, 1.0);
+         navTarget = new Vec3(player.getX() + ux * 12.0, this.flight.cruiseY(), player.getZ() + uz * 12.0);
+      }
+
+      boolean allowCruiseMine = climbingToCruise || this.flight.liftRetries() >= 2 || this.flight.isMining();
+      FlyController.NavState state = this.flight.navigate(
+         mc, level, player, navTarget, horiz < SLOW_RADIUS || climbingToCruise, allowCruiseMine
+      );
       if (state == FlyController.NavState.BLOCKED) {
          if (this.flight.lift()) {
             this.info("前方有方块阻挡且无法绕行，抬升巡航高度至 " + this.flight.cruiseY(), ChatFormatting.YELLOW);
-         } else if (this.flight.navigate(mc, level, player, target, true, true) == FlyController.NavState.BLOCKED) {
-            // Altitude lifts exhausted: last resort is to dig through the tower.
+         } else if (this.flight.navigate(mc, level, player, navTarget, true, true) == FlyController.NavState.BLOCKED) {
             this.nextCandidateWithReason(player, now, "多次抬升后仍被方块阻挡且无法挖掘");
          } else {
-            this.throttledInfo("已无法继续抬升，改用绕行 / 挖掘处理阻挡…", now);
+            this.throttledInfo("已无法继续抬升，改用 3D 寻路 / 挖掘处理阻挡…", now);
          }
       }
       if (this.flight.checkStuck(player)) {
          if (this.flight.lift()) {
             this.info("疑似卡住（撞塔 / 撞岛），抬升巡航高度至 " + this.flight.cruiseY(), ChatFormatting.YELLOW);
-         } else {
+         } else if (this.flight.navigate(mc, level, player, navTarget, true, true) == FlyController.NavState.BLOCKED) {
             this.nextCandidateWithReason(player, now, "多次抬升后仍无法前进");
          }
       }
@@ -749,6 +853,29 @@ public final class ElytraHuntManager {
             + "，导航=" + state,
          now
       );
+   }
+
+   private boolean tryLockTargetFromScan(ScanResult scan, long now) {
+      if (scan.elytraFrame != null) {
+         this.clearTarget();
+         this.targetFrame = scan.elytraFrame;
+         this.targetFramePos = scan.elytraFrame.blockPosition();
+         this.phaseStartMs = now;
+         this.phase = Phase.APPROACHING;
+         this.info("找到带鞘翅的展示框，开始 3D 寻路接近…", ChatFormatting.GREEN);
+         return true;
+      }
+      if (scan.dropped != null) {
+         this.clearTarget();
+         this.droppedItem = scan.dropped;
+         this.targetFramePos = scan.dropped.blockPosition();
+         this.pickupOnly = true;
+         this.phaseStartMs = now;
+         this.phase = Phase.APPROACHING;
+         this.info("发现已掉落但未拾取的鞘翅，前往吸取…", ChatFormatting.GREEN);
+         return true;
+      }
+      return false;
    }
 
    // ------------------------------------------------------------------ VERIFYING
@@ -760,23 +887,30 @@ public final class ElytraHuntManager {
       }
       BlockPos ship = this.current.target();
 
-      // Phase 1: descend to the ship. From CRUISE_Y=140 the server never syncs
-      // the ship's ItemFrame entities to the client, so a scan up there always
-      // reports "no elytra" even when the frame is intact.
+      // Continuously scan while descending or sweeping so we lock onto the frame the moment it syncs!
+      if ((this.verifyPoint != null || this.sweepTarget != null) && now - this.lastScanMs >= 500L) {
+         this.lastScanMs = now;
+         ScanResult midScan = this.scan(level, player, ship);
+         this.lastScan = midScan;
+         if (midScan.structureHint != null) {
+            this.structureHint = midScan.structureHint;
+         }
+         if (this.tryLockTargetFromScan(midScan, now)) {
+            return;
+         }
+      }
+
+      // Phase 1: descend to the ship.
       if (this.verifyPoint != null) {
          double d = player.position().distanceTo(this.verifyPoint);
-         if (d > 6.0 && now - this.phaseStartMs < VERIFY_APPROACH_TIMEOUT_MS) {
-            // Towers can stand between the cruise altitude and the ship; digging
-            // through them is allowed here (the approach path is the same one
-            // the user asked to be mined/routed around).
+         if (d > 5.0 && now - this.phaseStartMs < VERIFY_APPROACH_TIMEOUT_MS) {
             FlyController.NavState state = this.flight.navigate(mc, level, player, this.verifyPoint, true, true);
             if (state == FlyController.NavState.BLOCKED) {
                this.verifyOffsetIndex++;
-               this.verifyPoint = this.buildVerifyPoint(ship);
+               this.verifyPoint = this.buildVerifyPoint(level, ship);
                this.phaseStartMs = now;
                this.info("下降路径被阻挡，换一个角度接近船体…", ChatFormatting.YELLOW);
             } else if (obstacleWork(state)) {
-               // A detour must not eat up the descent timeout.
                this.phaseStartMs = now;
             }
             this.throttledInfo("正在下降到船体高度以同步展示框实体（还差 " + (int)d + " 格）…", now);
@@ -811,23 +945,7 @@ public final class ElytraHuntManager {
          this.structureHint = scan.structureHint;
       }
 
-      if (scan.elytraFrame != null) {
-         this.clearTarget();
-         this.targetFrame = scan.elytraFrame;
-         this.targetFramePos = scan.elytraFrame.blockPosition();
-         this.phaseStartMs = now;
-         this.phase = Phase.APPROACHING;
-         this.info("找到带鞘翅的展示框，开始贴身接近…", ChatFormatting.GREEN);
-         return;
-      }
-      if (scan.dropped != null) {
-         this.clearTarget();
-         this.droppedItem = scan.dropped;
-         this.targetFramePos = scan.dropped.blockPosition();
-         this.pickupOnly = true;
-         this.phaseStartMs = now;
-         this.phase = Phase.APPROACHING;
-         this.info("发现已掉落但未拾取的鞘翅，前往吸取…", ChatFormatting.GREEN);
+      if (this.tryLockTargetFromScan(scan, now)) {
          return;
       }
       if (!scan.chunkLoaded) {
@@ -851,7 +969,7 @@ public final class ElytraHuntManager {
       this.verifyScans++;
       if (this.verifyScans < MAX_VERIFY_SCANS) {
          this.verifyOffsetIndex++;
-         this.verifyPoint = this.buildVerifyPoint(ship);
+         this.verifyPoint = this.buildVerifyPoint(level, ship);
          this.phaseStartMs = now;
          this.info(
             "第 " + this.verifyScans + " 次扫描未见鞘翅（客户端实体 " + scan.entities
@@ -885,17 +1003,26 @@ public final class ElytraHuntManager {
       return (offlineTrustworthy ? offline : hint) + (int)SHIP_APPROACH_LIFT;
    }
 
-   private Vec3 buildVerifyPoint(BlockPos ship) {
-      double[] offset = VERIFY_OFFSETS[Math.floorMod(this.verifyOffsetIndex, VERIFY_OFFSETS.length)];
+   private Vec3 buildVerifyPoint(ClientLevel level, BlockPos ship) {
       double cx = ship.getX();
       double cz = ship.getZ();
-      // Offline ship X/Z comes from template placement and is trustworthy.
-      // Only fall back to an on-site hint when no ship piece was resolved.
       if (!this.current.shipLocated() && this.structureHint != null) {
          cx = this.structureHint.getX();
          cz = this.structureHint.getZ();
       }
-      return new Vec3(cx + offset[0], this.verifyY(ship), cz + offset[1]);
+      int vy = this.verifyY(ship);
+      for (int attempt = 0; attempt < VERIFY_OFFSETS.length; attempt++) {
+         int idx = Math.floorMod(this.verifyOffsetIndex + attempt, VERIFY_OFFSETS.length);
+         double[] offset = VERIFY_OFFSETS[idx];
+         int bx = (int)Math.floor(cx + offset[0]);
+         int bz = (int)Math.floor(cz + offset[1]);
+         if (level == null || FlyController.isPassableColumn(level, bx, vy, bz)) {
+            this.verifyOffsetIndex = idx;
+            return new Vec3(bx + 0.5, vy + 0.08, bz + 0.5);
+         }
+      }
+      double[] offset = VERIFY_OFFSETS[Math.floorMod(this.verifyOffsetIndex, VERIFY_OFFSETS.length)];
+      return new Vec3(cx + offset[0], vy, cz + offset[1]);
    }
 
    private static Vec3 spiralPoint(BlockPos center, int index, int y) {
@@ -1041,31 +1168,28 @@ public final class ElytraHuntManager {
     */
    private boolean tickThreat(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
       if (this.flight.isIgnoringThreats()) {
-         // Combat timed out: stop fighting the guard and go straight for the
-         // frame for a while rather than abandoning this ship.
          return false;
       }
-      // A dropped elytra close to the player has priority over a guard. Combat
-      // consumes entire ticks and used to burn the (wall-clock) pickup grace
-      // before the state machine ever got a chance to fly to the item.
+      // Do not interrupt an active block break for a guard unless the guard is right in our face.
+      if (this.flight.isMining()) {
+         return false;
+      }
       if (this.pickupOnly && this.droppedItem != null && !this.droppedItem.isRemoved()
          && player.distanceToSqr(this.droppedItem) < 144.0) {
          return false;
       }
       Vec3 goal = this.threatGoal(player);
       Entity threat = FlyController.findThreat(level, player, goal);
-      if (threat == null) {
+      if (threat == null || player.distanceToSqr(threat) > 64.0) {
          if (this.threatSinceMs != 0L) {
-            LOGGER.info("[elytra] 挡路实体已清除，恢复正常接近");
+            LOGGER.info("[elytra] 挡路实体已清除或超出近距范围，恢复正常接近");
          }
          this.threatSinceMs = 0L;
          this.flight.clearEntityState();
          return false;
       }
-      // During a long cruise, only deal with guards that are actually close;
-      // otherwise every shulker under the flight path would interrupt travel.
-      if (this.phase == Phase.TRAVELLING
-         && player.distanceToSqr(threat) > 16.0 * 16.0) {
+      // Only engage if we actually have unobstructed line of sight to the Shulker.
+      if (!hasUnobstructedSight(level, player, threat.getBoundingBox().getCenter())) {
          this.threatSinceMs = 0L;
          return false;
       }
@@ -1074,24 +1198,18 @@ public final class ElytraHuntManager {
          LOGGER.info("[elytra] 路径被 {} id={} at {} 阻挡，开始清除",
             threat.getClass().getSimpleName(), threat.getId(), threat.blockPosition());
       }
-      // Clearing a guard is not a normal approach step: do not let it consume
-      // the verify / approach / take timeout, nor the drop-chase budget. The
-      // old grace silently expired while the player was still fighting.
       this.phaseStartMs = now;
       if (this.dropChaseSinceMs != 0L) {
          this.dropChaseSinceMs = now;
          this.dropProgressSinceMs = now;
       }
-      double distance = player.position().distanceTo(threat.position());
-      if (distance <= 3.2) {
+      double eyeDist = player.getEyePosition().distanceTo(threat.getBoundingBox().getCenter());
+      if (eyeDist <= 3.25) {
          this.flight.hover(mc, player, false);
          FlyController.aimAt(player, threat);
          if (mc.gameMode != null
             && player.getAttackStrengthScale(0.0F) >= 0.9F
-            && player.distanceToSqr(threat) < THREAT_ATTACK_RANGE_SQ
             && now - this.lastCombatMs >= COMBAT_COOLDOWN_MS) {
-            // Damage is computed server-side from the selected hotbar slot.
-            // Never swap while a block break is still accumulating progress.
             if (!this.flight.isMining()) {
                FlyController.equipForAttack(player);
             }
@@ -1100,20 +1218,45 @@ public final class ElytraHuntManager {
             this.lastCombatMs = now;
          }
       } else {
-         Vec3 stand = threat.position().add(
-            player.position().subtract(threat.position()).normalize().scale(3.0)
-         );
+         Vec3 toPlayer = player.position().subtract(threat.position());
+         double len = Math.max(0.001, toPlayer.length());
+         Vec3 stand = threat.position().add(toPlayer.scale(2.2 / len)).subtract(0.0, 0.5, 0.0);
          this.flight.navigate(mc, level, player, stand, true, true);
       }
-      this.throttledInfo("前方有潜影贝挡路，正在清除 / 绕行…", now);
-      if (now - this.threatSinceMs > THREAT_TIMEOUT_MS) {
+      this.throttledInfo("前方有潜影贝挡路，正在清除…", now);
+      if (now - this.threatSinceMs > 12000L) {
          LOGGER.warn("[elytra] 清除挡路实体超时 {} ms，改为无视守卫直接取物", now - this.threatSinceMs);
          this.threatSinceMs = 0L;
-         this.flight.ignoreThreatsFor(15000L);
+         this.flight.ignoreThreatsFor(18000L);
          this.flight.clearEntityState();
-         this.info("清怪超时，改为直接靠近取物（15 秒）…", ChatFormatting.YELLOW);
+         this.info("清怪超时，改为直接靠近取物（18 秒）…", ChatFormatting.YELLOW);
       }
       return true;
+   }
+
+   private static boolean hasUnobstructedSight(ClientLevel level, LocalPlayer player, Vec3 point) {
+      if (level == null || player == null || point == null) {
+         return false;
+      }
+      try {
+         BlockHitResult hit = level.clip(
+            new ClipContext(player.getEyePosition(), point, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
+         );
+         return hit.getType() == HitResult.Type.MISS;
+      } catch (Throwable ignored) {
+         return true;
+      }
+   }
+
+   private static boolean canAttackEntity(ClientLevel level, LocalPlayer player, Entity entity) {
+      if (level == null || player == null || entity == null || entity.isRemoved()) {
+         return false;
+      }
+      Vec3 center = entity.getBoundingBox().getCenter();
+      if (player.getEyePosition().distanceTo(center) > 3.35) {
+         return false;
+      }
+      return hasUnobstructedSight(level, player, center);
    }
 
    // ------------------------------------------------------------------ live target resolution
@@ -1280,10 +1423,6 @@ public final class ElytraHuntManager {
          return;
       }
       if (status == TargetStatus.DROP) {
-         // The elytra is already on the ground: hand it straight to the TAKING
-         // chase. The old code stayed in APPROACHING, hovered and waited for
-         // the inventory count to change, then hit the approach timeout and
-         // abandoned a perfectly good drop.
          this.itemPopped = true;
          this.attackAttempts = 0;
          this.lastAttackMs = 0L;
@@ -1300,25 +1439,13 @@ public final class ElytraHuntManager {
       }
       Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
       if (target == null || target.isRemoved() || !target.isAlive()) {
-         // refreshTarget just saw a live target; the render thread may swap the
-         // instance in between. Retry next tick rather than giving up on a ship.
          this.throttledInfo("目标实体正在重新同步…", now);
          return;
       }
-      Vec3 hoverPoint = this.pickupOnly
-         ? target.position().add(0.0, 0.3, 0.0)
-         : hoverPointFor(target, player, 2.2);
-      double distance = player.position().distanceTo(hoverPoint);
-      double arrival = this.pickupOnly ? 1.5 : 2.5;
 
-      // Mining holds keyAttack down; if the crosshair lands on the item frame it
-      // pops the elytra (and eventually breaks the frame) before we are in
-      // position. Once the frame is visible and reachable, stop digging and
-      // take it deliberately.
-      if (status == TargetStatus.FRAME
-         && this.flight.navState() == FlyController.NavState.MINING
-         && player.distanceToSqr(target) < 36.0
-         && crosshairOn(mc, target)) {
+      // As soon as the ItemFrame is within true attack range and unobstructed, take it immediately!
+      if (status == TargetStatus.FRAME && canAttackEntity(level, player, target)) {
+         this.obstacleSinceMs = 0L;
          this.flight.hover(mc, player, false);
          FlyController.aimAt(player, target);
          this.phaseStartMs = now;
@@ -1327,9 +1454,15 @@ public final class ElytraHuntManager {
          this.itemPopped = false;
          this.resetDropChase();
          this.phase = Phase.TAKING;
-         this.info("准星已对准展示框，停止挖掘并直接取物", ChatFormatting.AQUA);
+         this.info("已进入展示框有效攻击距离且视线畅通，开始取物", ChatFormatting.AQUA);
          return;
       }
+
+      Vec3 hoverPoint = this.pickupOnly
+         ? target.position().add(0.0, 0.1, 0.0)
+         : hoverPointFor(level, target, player);
+      double distance = player.position().distanceTo(hoverPoint);
+      double arrival = this.pickupOnly ? 1.2 : 1.8;
 
       if (distance > arrival) {
          FlyController.NavState state = this.flight.navigate(mc, level, player, hoverPoint, true, true);
@@ -1341,10 +1474,13 @@ public final class ElytraHuntManager {
                this.nextCandidateWithReason(player, now, "通路持续受阻（绕行 / 挖掘 / 清怪）");
                return;
             }
-            // A detour, a dig or clearing a guard can legitimately take longer
-            // than a plain approach - do not let APPROACH_TIMEOUT fire.
             this.phaseStartMs = now;
-            this.throttledInfo("接近路径被方块阻挡，正在挖开 / 绕行…", now);
+            this.throttledInfo(
+               state == FlyController.NavState.MINING
+                  ? "接近路径有方块阻挡，正在挖掘通道…"
+                  : "正在通过 3D 寻路接近目标…",
+               now
+            );
          } else {
             this.obstacleSinceMs = 0L;
             this.throttledInfo("接近目标中，还差 " + String.format("%.1f", distance) + " 格", now);
@@ -1354,7 +1490,6 @@ public final class ElytraHuntManager {
       this.obstacleSinceMs = 0L;
       this.flight.hover(mc, player, false);
       if (this.pickupOnly) {
-         // Success is judged by the inventory count at the top of the tick.
          this.throttledInfo("正在吸取掉落的鞘翅…", now);
          return;
       }
@@ -1365,10 +1500,21 @@ public final class ElytraHuntManager {
       this.itemPopped = false;
       this.resetDropChase();
       this.phase = Phase.TAKING;
-      this.info("已就位（朝向误差 0°），开始左键取物", ChatFormatting.AQUA);
+      this.info("已就位，开始左键取物", ChatFormatting.AQUA);
    }
 
-   private static Vec3 hoverPointFor(Entity target, LocalPlayer player, double distance) {
+   /**
+    * Compute the optimal player-feet hover point in front of the ItemFrame.
+    *
+    * <p>Note: {@code FlyController} treats {@code target.y} as the player's
+    * <b>feet</b> Y ({@code player.getY()}), while the player's eyes are at
+    * {@code feet + 1.62} and head top is at {@code feet + 1.8}. Setting
+    * {@code y = frame.getY() + 0.5} in the legacy code placed the player's
+    * head inside the End Ship cabin ceiling! Here we place the player's feet
+    * on the cabin floor (~1 block below the frame) and prefer an already-open
+    * 1x2 column with direct line of sight to the frame.</p>
+    */
+   private static Vec3 hoverPointFor(ClientLevel level, Entity target, LocalPlayer player) {
       Direction facing = null;
       if (target instanceof ItemFrame frame) {
          try {
@@ -1376,20 +1522,53 @@ public final class ElytraHuntManager {
          } catch (Throwable ignored) {
          }
       }
-      if (facing == null) {
-         double dx = player.getX() - target.getX();
-         double dz = player.getZ() - target.getZ();
-         double length = Math.max(Math.sqrt(dx * dx + dz * dz), 0.001);
+      Vec3 frameCenter = target.getBoundingBox().getCenter();
+      int frameBlockY = target.blockPosition().getY();
+
+      if (facing != null && level != null) {
+         Direction sideDir = facing.getClockWise();
+         double[] dists = {1.5, 1.2, 1.9, 0.9};
+         int[] dyFeet = {-1, 0, -2};
+         int[] sides = {0, -1, 1};
+
+         for (double d : dists) {
+            for (int dy : dyFeet) {
+               for (int side : sides) {
+                  double cx = target.getX() + facing.getStepX() * d + sideDir.getStepX() * side * 0.7;
+                  double cz = target.getZ() + facing.getStepZ() * d + sideDir.getStepZ() * side * 0.7;
+                  int bx = (int)Math.floor(cx);
+                  int by = frameBlockY + dy;
+                  int bz = (int)Math.floor(cz);
+                  if (!FlyController.isPassableColumn(level, bx, by, bz)) {
+                     continue;
+                  }
+                  Vec3 eyePos = new Vec3(bx + 0.5, by + 1.62, bz + 0.5);
+                  try {
+                     BlockHitResult hit = level.clip(
+                        new ClipContext(eyePos, frameCenter, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
+                     );
+                     if (hit.getType() == HitResult.Type.MISS) {
+                        return new Vec3(bx + 0.5, by + 0.08, bz + 0.5);
+                     }
+                  } catch (Throwable ignored) {
+                  }
+               }
+            }
+         }
          return new Vec3(
-            target.getX() + dx / length * distance,
-            target.getY() + 0.5,
-            target.getZ() + dz / length * distance
+            target.getX() + facing.getStepX() * 1.5,
+            frameBlockY - 1 + 0.08,
+            target.getZ() + facing.getStepZ() * 1.5
          );
       }
+
+      double dx = player.getX() - target.getX();
+      double dz = player.getZ() - target.getZ();
+      double length = Math.max(Math.sqrt(dx * dx + dz * dz), 0.001);
       return new Vec3(
-         target.getX() + facing.getStepX() * distance,
-         target.getY() + 0.5,
-         target.getZ() + facing.getStepZ() * distance
+         target.getX() + dx / length * 1.6,
+         target.getY() - 1.0,
+         target.getZ() + dz / length * 1.6
       );
    }
 
@@ -1428,18 +1607,17 @@ public final class ElytraHuntManager {
          this.throttledInfo("等待展示框实体同步…", now);
          return;
       }
-      if (!player.hasLineOfSight(frame)) {
+      if (!canAttackEntity(level, player, frame)) {
          FlyController.NavState state = this.flight.navigate(
-            mc, level, player, hoverPointFor(frame, player, 2.2), true, true
+            mc, level, player, hoverPointFor(level, frame, player), true, true
          );
          if (obstacleWork(state)) {
-            // Detours / digging through the hull should not consume the take timeout.
             this.phaseStartMs = now;
          }
          this.throttledInfo(
             state == FlyController.NavState.MINING
                ? "展示框被方块遮挡，正在挖开阻挡…"
-               : "展示框被遮挡，正在绕路 / 调整位置…",
+               : "正在贴近展示框至有效攻击距离…",
             now
          );
          return;
@@ -1451,8 +1629,7 @@ public final class ElytraHuntManager {
          return;
       }
       if (player.getAttackStrengthScale(0.0F) >= 0.9F
-         && player.distanceToSqr(frame) < 36.0
-         && now - this.lastAttackMs >= 1000L
+         && now - this.lastAttackMs >= 850L
          && mc.gameMode != null) {
          if (!this.flight.isMining()) {
             FlyController.equipForAttack(player);
@@ -1467,14 +1644,6 @@ public final class ElytraHuntManager {
 
    /**
     * Chase one dropped elytra until the inventory count changes.
-    *
-    * <p>The old implementation used an 8-second wall-clock grace that started
-    * the first time ANY phase noticed the drop. Time spent killing a shulker,
-    * descending or digging through the hull silently consumed it, so the first
-    * TAKING tick immediately reported "cannot pick up" and switched ships. Here
-    * the timer belongs to the chase, is generous, and is only abandoned after a
-    * real lack of progress. A stalled direct approach gets a bounded dig/route
-    * window instead of giving up.</p>
     */
    private void chaseDrop(Minecraft mc, LocalPlayer player, ClientLevel level, Entity drop, long now) {
       if (drop == null || drop.isRemoved()) {
@@ -1495,7 +1664,6 @@ public final class ElytraHuntManager {
             String.format("%.2f", player.position().distanceTo(drop.position()))
          );
       }
-      // The chase owns this phase's timeout; combat / detours must not consume it.
       this.phaseStartMs = now;
       double distance = player.position().distanceTo(drop.position());
       if (distance < this.dropBestDistance - 0.15) {
@@ -1503,14 +1671,17 @@ public final class ElytraHuntManager {
          this.dropProgressSinceMs = now;
       }
 
-      // A dig window must keep full control of the input keys for its whole
-      // duration: approachForPickup() calls stopMining() and would otherwise
-      // reset the server-side break progress every single tick.
-      if (this.dropDigUntilMs != 0L && now < this.dropDigUntilMs) {
+      boolean directClear = this.flight.isBoxSweepClear(
+         level, player, player.position(), drop.position(), distance + 0.4, false
+      );
+
+      // Use 3D A* + block mining whenever a block is between the player and the drop,
+      // or during an active dig window.
+      if ((!directClear && distance > 0.9) || (this.dropDigUntilMs != 0L && now < this.dropDigUntilMs)) {
          FlyController.NavState state = this.flight.navigate(
-            mc, level, player, drop.position().add(0.0, 0.3, 0.0), true, true
+            mc, level, player, drop.position(), true, true
          );
-         this.dropIssue = "挖路中（导航=" + state + "，最近 "
+         this.dropIssue = "寻路/挖路中（导航=" + state + "，最近 "
             + String.format("%.1f", this.dropBestDistance) + " 格）";
          this.throttledInfo("正在挖开 / 绕行接近掉落的鞘翅…", now);
          return;
