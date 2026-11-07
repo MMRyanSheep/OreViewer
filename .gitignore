@@ -1,0 +1,49 @@
+# =============================================================================
+# Minecraft Fabric 模组通用忽略规则
+# 基准：FabricMC/fabric-example-mod 官方 .gitignore，按本项目补充
+#
+# 例外说明：libs/*.jar 不在忽略范围内。
+# build.gradle 使用 compileOnly fileTree(dir: 'libs', include: ['*.jar'])
+# 引用这些无法从 Maven 获取的本地依赖，因此必须随源码一并提交。
+# =============================================================================
+
+# --- Gradle / Fabric Loom ---
+.gradle/
+build/
+out/
+classes/
+remappedSrc/
+.architectury-transformer/
+
+# --- Eclipse ---
+*.launch
+
+# --- IntelliJ IDEA ---
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# --- VS Code ---
+.settings/
+.vscode/
+bin/
+.classpath
+.project
+
+# --- Fabric 开发运行目录（客户端存档、配置、日志、mods 等）---
+run/
+
+# --- 日志 / 崩溃报告 / JVM 与性能转储 ---
+*.log
+*.log.gz
+crash-reports/
+hs_err_*.log
+replay_*.log
+*.hprof
+*.jfr
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+desktop.ini
