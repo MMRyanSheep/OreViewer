@@ -1,7 +1,5 @@
 package kaptainwutax.seedcrackerX.automine;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -18,14 +16,11 @@ import net.minecraft.ChatFormatting;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.DeathScreen;
-import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
-import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
-import net.minecraft.core.NonNullList;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
@@ -39,12 +34,7 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.ContainerInput;
-import net.minecraft.world.inventory.InventoryMenu;
-import net.minecraft.world.inventory.ShulkerBoxMenu;
-import net.minecraft.world.inventory.Slot;
-import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.component.ItemContainerContents;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.ItemEnchantments;
@@ -53,7 +43,6 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.ClipContext.Fluid;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.ShulkerBoxBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.phys.BlockHitResult;
@@ -84,39 +73,6 @@ public class AutoMineManager {
    private static final int STUCK_WATCHDOG_TICKS = 100;
    private static final double STUCK_MOVE_THRESHOLD = 1.0;
    private static final int STUCK_ABORT_TICKS = 200;
-   private static final Set<String> ORE_DROP_ITEMS = Set.of(
-      "diamond",
-      "emerald",
-      "lapis_lazuli",
-      "redstone",
-      "coal",
-      "raw_iron",
-      "raw_gold",
-      "raw_copper",
-      "raw_iron_block",
-      "raw_gold_block",
-      "raw_copper_block",
-      "ancient_debris",
-      "netherite_scrap",
-      "diamond_ore",
-      "deepslate_diamond_ore",
-      "emerald_ore",
-      "deepslate_emerald_ore",
-      "lapis_ore",
-      "deepslate_lapis_ore",
-      "redstone_ore",
-      "deepslate_redstone_ore",
-      "coal_ore",
-      "deepslate_coal_ore",
-      "iron_ore",
-      "deepslate_iron_ore",
-      "gold_ore",
-      "deepslate_gold_ore",
-      "copper_ore",
-      "deepslate_copper_ore",
-      "nether_gold_ore",
-      "nether_quartz_ore"
-   );
    private final Set<AutoMineManager.Task> task = new LinkedHashSet<>();
    private AutoMineManager.Phase phase = AutoMineManager.Phase.WORK;
    private boolean backPending;
@@ -158,13 +114,6 @@ public class AutoMineManager {
    private long lastInfoMs;
    private BlockPos lastStuckCheckPos;
    private int stuckTicks;
-   private AutoMineManager.ShulkerOpenState shulkerState = AutoMineManager.ShulkerOpenState.IDLE;
-   private int shulkerInvSlot = -1;
-   private int shulkerOpenTicks;
-   private int storeTargetInvSlot = -1;
-   private int storePhase;
-   private int distributeBoxSlot = -1;
-   private boolean distributedPlaceholder = false;
 
    public static void setProMode(boolean on) {
       proMode = on;
@@ -207,11 +156,6 @@ public class AutoMineManager {
          this.seedTargetTicks = 0;
          this.seedMineTicks = 0;
          this.seedSettleTicks = 0;
-         this.shulkerState = AutoMineManager.ShulkerOpenState.IDLE;
-         this.shulkerInvSlot = -1;
-         this.shulkerOpenTicks = 0;
-         this.storeTargetInvSlot = -1;
-         this.storePhase = 0;
          this.enableXrayForTasks(newTasks);
 
          try {
@@ -457,7 +401,8 @@ public class AutoMineManager {
                   return;
                }
 
-               if (this.tickShulkerQuickStore(mc, player)) {
+               // 背包满自动存盒由 ShulkerAutoStore 统一驱动，存盒期间自动挖矿让路。
+               if (ShulkerAutoStore.INSTANCE.isBusy()) {
                   return;
                }
 
@@ -475,10 +420,6 @@ public class AutoMineManager {
                if (this.phase == AutoMineManager.Phase.EAT) {
                   this.tickEat(mc, player);
                   return;
-               }
-
-               if (this.inventoryFull(player)) {
-                  this.tickTrash(mc, player);
                }
 
                if (Config.get().autoMineAttackMobs) {
@@ -550,6 +491,19 @@ public class AutoMineManager {
          this.seedMineTicks = 0;
          this.seedSettleTicks = 0;
       }
+   }
+
+   /** 存盒结束后由 ShulkerAutoStore 调用：Baritone 已被取消，矿脉状态需要重新扫描。 */
+   public void onShulkerStoreFinished() {
+      this.resumeMining();
+      this.seedVeinActive = false;
+      this.seedVein = null;
+      this.seedIdleTicks = 0;
+      this.seedStuckTicks = 0;
+      this.seedCollectPos = null;
+      this.seedCollectRepathTicks = 0;
+      this.seedRescanTicks = 0;
+      this.seedEscapeTicks = 0;
    }
 
    private void tickWork(Minecraft mc, LocalPlayer player, Level level) {
@@ -917,10 +871,7 @@ public class AutoMineManager {
    }
 
    private void handleDeath(Minecraft mc) {
-      if (this.shulkerState != AutoMineManager.ShulkerOpenState.IDLE) {
-         this.shulkerAbort("死亡，已中断存盒。");
-      }
-
+      ShulkerAutoStore.INSTANCE.cancel();
       this.safeCancel();
       if (mc.getConnection() != null) {
          mc.getConnection().send(new ServerboundClientCommandPacket(Action.PERFORM_RESPAWN));
@@ -1116,57 +1067,9 @@ public class AutoMineManager {
       return INSTANCE.task.isEmpty() ? true : INSTANCE.isTaskDrop(itemId);
    }
 
-   private void tickTrash(Minecraft mc, LocalPlayer player) {
-      boolean full = this.inventoryFull(player);
-      boolean hasOre = this.hasOreToStore(player);
-      int shulkerSlot = this.findShulkerItemSlot(player);
-      if (Config.get().debug) {
-         LOGGER.info(
-            "[automine] tickTrash: full={}, shulkerSave={}, hasOre={}, shulkerSlot={}, shulkerState={}",
-            new Object[]{full, Config.get().autoMineShulkerSave, hasOre, shulkerSlot, this.shulkerState}
-         );
-      }
 
-      if (full) {
-         ;
-      }
-   }
 
-   private boolean inventoryFull(LocalPlayer player) {
-      Inventory inv = player.getInventory();
 
-      for (int i = 0; i < 36; i++) {
-         if (inv.getItem(i).isEmpty()) {
-            return false;
-         }
-      }
-
-      return true;
-   }
-
-   private boolean canFreeInventory(LocalPlayer player) {
-      return Config.get().autoMineShulkerSave && this.findShulkerItemSlot(player) >= 0;
-   }
-
-   private boolean nearbyTaskDrop(LocalPlayer player, Level level) {
-      if (level instanceof ClientLevel cl) {
-         for (Entity e : cl.entitiesForRendering()) {
-            if (e instanceof ItemEntity ie) {
-               String id = BuiltInRegistries.ITEM.getKey(ie.getItem().getItem()).getPath();
-               if (this.isTaskDrop(id)) {
-                  double d = player.distanceToSqr(ie);
-                  if (!(d < 2.25) && !(d > 16.0)) {
-                     return true;
-                  }
-               }
-            }
-         }
-
-         return false;
-      } else {
-         return false;
-      }
-   }
 
    private boolean isTaskDrop(String itemId) {
       for (AutoMineManager.Task t : this.task) {
@@ -1221,349 +1124,21 @@ public class AutoMineManager {
       return false;
    }
 
-   private boolean isShulkerItem(ItemStack stack) {
-      return stack != null && !stack.isEmpty() ? stack.getItem() instanceof BlockItem bi && bi.getBlock() instanceof ShulkerBoxBlock : false;
-   }
 
-   private int getIntField(Object obj, String fieldName) {
-      Class<?> c = obj.getClass();
 
-      while (c != null) {
-         try {
-            Field f = c.getDeclaredField(fieldName);
-            f.setAccessible(true);
-            return f.getInt(obj);
-         } catch (NoSuchFieldException ignored) {
-            c = c.getSuperclass();
-         } catch (IllegalAccessException e) {
-            return 0;
-         }
-      }
 
-      return 0;
-   }
 
-   private int findShulkerItemSlot(LocalPlayer player) {
-      Inventory inv = player.getInventory();
 
-      for (int i = 0; i < 36; i++) {
-         if (this.isShulkerItem(inv.getItem(i))) {
-            LOGGER.info("[automine] found shulker at slot {}", i);
-            return i;
-         }
-      }
 
-      StringBuilder sb = new StringBuilder("[automine] no shulker, inv: ");
 
-      for (int i = 0; i < 36; i++) {
-         ItemStack s = inv.getItem(i);
-         if (!s.isEmpty()) {
-            sb.append(i).append("=").append(BuiltInRegistries.ITEM.getKey(s.getItem()).getPath()).append(" ");
-         }
-      }
 
-      LOGGER.info(sb.toString());
-      return -1;
-   }
 
-   private boolean hasOreToStore(LocalPlayer player) {
-      Inventory inv = player.getInventory();
 
-      for (int i = 0; i < 36; i++) {
-         ItemStack s = inv.getItem(i);
-         if (!s.isEmpty() && s.getCount() > 1) {
-            String id = BuiltInRegistries.ITEM.getKey(s.getItem()).getPath();
-            if (ORE_DROP_ITEMS.contains(id)) {
-               return true;
-            }
-         }
-      }
 
-      return false;
-   }
 
-   private void triggerShulkerQuickStore(Minecraft mc, LocalPlayer player) {
-      this.shulkerState = AutoMineManager.ShulkerOpenState.OPEN_INV;
-      this.shulkerInvSlot = -1;
-      this.shulkerOpenTicks = 0;
-      this.storeTargetInvSlot = -1;
-      this.storePhase = 0;
-      this.distributeBoxSlot = -1;
-      this.distributedPlaceholder = false;
-      this.safeCancel();
-   }
 
-   private boolean tickShulkerQuickStore(Minecraft mc, LocalPlayer player) {
-      if (this.shulkerState == AutoMineManager.ShulkerOpenState.IDLE) {
-         return false;
-      }
 
-      this.shulkerOpenTicks++;
-      if (this.shulkerOpenTicks > 600) {
-         this.shulkerAbort("存盒超时（30秒），放弃存盒继续挖矿。");
-         return true;
-      }
 
-      switch (this.shulkerState) {
-         case OPEN_INV:
-            mc.setScreenAndShow(new InventoryScreen(player));
-            this.shulkerState = AutoMineManager.ShulkerOpenState.WAIT_INV;
-            break;
-         case WAIT_INV:
-            if (player.containerMenu instanceof InventoryMenu) {
-               this.shulkerInvSlot = this.findNonFullShulkerSlot(player);
-               if (this.shulkerInvSlot < 0) {
-                  this.shulkerAbort("没有可用的潜影盒（全部已满或不存在）。");
-                  return true;
-               }
-
-               this.shulkerState = AutoMineManager.ShulkerOpenState.OPEN_BOX;
-            } else if (this.shulkerOpenTicks > 40) {
-               this.shulkerAbort("背包打开超时，放弃存盒。");
-            }
-            break;
-         case OPEN_BOX:
-            if (!(Compat.screen(mc) instanceof AbstractContainerScreen<?> containerScreen)) {
-               this.shulkerAbort("背包界面未打开，放弃存盒。");
-               return true;
-            }
-
-            int menuSlot = this.menuSlotOfInventoryIndex(this.shulkerInvSlot);
-            if (menuSlot < 0 || menuSlot >= containerScreen.getMenu().slots.size()) {
-               this.shulkerAbort("潜影盒槽位无效，放弃存盒。");
-               return true;
-            }
-
-            Slot slot = containerScreen.getMenu().getSlot(menuSlot);
-            ItemStack shulkerStack = slot.getItem();
-
-            try {
-               Class<?> clientUtil = Class.forName("net.kyrptonaught.quickshulker.client.ClientUtil");
-               Method checkAndSend = clientUtil.getDeclaredMethod("CheckAndSend", ItemStack.class, int.class);
-               boolean opened = (Boolean)checkAndSend.invoke(null, shulkerStack, menuSlot);
-               if (!opened) {
-                  this.shulkerAbort("quickshulker 拒绝打开潜影盒（可能不是可打开物品）。");
-                  return true;
-               }
-            } catch (ClassNotFoundException e) {
-               this.shulkerAbort("未安装 quickshulker 模组，无法快捷打开潜影盒。");
-               return true;
-            } catch (Exception e) {
-               this.shulkerAbort("调用 quickshulker 失败：" + e.getMessage());
-               return true;
-            }
-
-            this.shulkerState = AutoMineManager.ShulkerOpenState.WAIT_BOX;
-            this.shulkerOpenTicks = 0;
-            break;
-         case WAIT_BOX:
-            if (player.containerMenu instanceof ShulkerBoxMenu) {
-               this.shulkerState = AutoMineManager.ShulkerOpenState.STORE;
-               this.storePhase = 0;
-            } else if (this.shulkerOpenTicks > 60) {
-               this.shulkerAbort("潜影盒打开超时，放弃存盒。");
-            }
-            break;
-         case STORE:
-            if (!(player.containerMenu instanceof ShulkerBoxMenu shulkerMenu)) {
-               this.shulkerAbort("潜影盒界面已关闭，放弃存盒。");
-               return true;
-            }
-
-            if (this.isShulkerBoxFull(shulkerMenu)) {
-               int nextShulker = this.findNextNonFullShulker(player);
-               if (nextShulker >= 0 && nextShulker != this.shulkerInvSlot) {
-                  player.closeContainer();
-                  this.shulkerInvSlot = nextShulker;
-                  this.shulkerState = AutoMineManager.ShulkerOpenState.OPEN_INV;
-                  this.shulkerOpenTicks = 0;
-                  return true;
-               }
-
-               player.closeContainer();
-               this.shulkerState = AutoMineManager.ShulkerOpenState.CLOSING;
-               this.shulkerOpenTicks = 0;
-               return true;
-            }
-
-            int oreSlot = this.findNextOreGroup(player);
-            if (oreSlot < 0) {
-               player.closeContainer();
-               this.shulkerState = AutoMineManager.ShulkerOpenState.CLOSING;
-               this.shulkerOpenTicks = 0;
-               return true;
-            }
-
-            int storeMenuSlot = this.menuSlotInShulkerMenu(shulkerMenu, player.getInventory(), oreSlot);
-            if (storeMenuSlot < 0) {
-               return true;
-            }
-
-            ItemStack targetItem = shulkerMenu.getSlot(storeMenuSlot).getItem();
-            String targetId = BuiltInRegistries.ITEM.getKey(targetItem.getItem()).getPath();
-            if (!ORE_DROP_ITEMS.contains(targetId)) {
-               return true;
-            }
-
-            mc.gameMode.handleContainerInput(shulkerMenu.containerId, storeMenuSlot, 0, ContainerInput.QUICK_MOVE, player);
-         case DISTRIBUTE:
-         default:
-            break;
-         case CLOSING:
-            if (!(player.containerMenu instanceof ShulkerBoxMenu)) {
-               this.shulkerState = AutoMineManager.ShulkerOpenState.IDLE;
-               this.shulkerInvSlot = -1;
-               this.storeTargetInvSlot = -1;
-               this.storePhase = 0;
-               this.distributeBoxSlot = -1;
-               this.distributedPlaceholder = false;
-               this.resumeMining();
-            }
-      }
-
-      return true;
-   }
-
-   private void shulkerAbort(String message) {
-      LOGGER.warn("[automine] shulker abort: {}", message);
-      this.shulkerState = AutoMineManager.ShulkerOpenState.IDLE;
-      this.shulkerInvSlot = -1;
-      this.storeTargetInvSlot = -1;
-      this.storePhase = 0;
-      this.distributeBoxSlot = -1;
-      this.distributedPlaceholder = false;
-      Minecraft mc = Minecraft.getInstance();
-      if (mc != null && mc.player != null && mc.player.containerMenu instanceof ShulkerBoxMenu) {
-         mc.player.closeContainer();
-      }
-
-      this.resumeMining();
-   }
-
-   private int findNonFullShulkerSlot(LocalPlayer player) {
-      Inventory inv = player.getInventory();
-
-      for (int i = 0; i < 36; i++) {
-         ItemStack s = inv.getItem(i);
-         if (this.isShulkerItem(s) && !this.isShulkerBoxFull(s)) {
-            return i;
-         }
-      }
-
-      return -1;
-   }
-
-   private boolean isShulkerBoxFull(ItemStack stack) {
-      try {
-         ItemContainerContents container = (ItemContainerContents)stack.get(DataComponents.CONTAINER);
-         if (container == null) {
-            return false;
-         }
-
-         NonNullList<ItemStack> list = NonNullList.withSize(27, ItemStack.EMPTY);
-         container.copyInto(list);
-
-         for (ItemStack s : list) {
-            if (s.isEmpty()) {
-               return false;
-            }
-         }
-
-         return true;
-      } catch (Exception e) {
-         return false;
-      }
-   }
-
-   private int findEmptyInventorySlot(LocalPlayer player) {
-      Inventory inv = player.getInventory();
-
-      for (int i = 0; i < 36; i++) {
-         if (inv.getItem(i).isEmpty()) {
-            return i;
-         }
-      }
-
-      return -1;
-   }
-
-   private int findOreInBox(ShulkerBoxMenu menu) {
-      for (int i = 0; i < 27; i++) {
-         ItemStack s = menu.getSlot(i).getItem();
-         if (!s.isEmpty()) {
-            String id = BuiltInRegistries.ITEM.getKey(s.getItem()).getPath();
-            if (ORE_DROP_ITEMS.contains(id)) {
-               return i;
-            }
-         }
-      }
-
-      return -1;
-   }
-
-   private int findNextOreGroup(LocalPlayer player) {
-      Inventory inv = player.getInventory();
-
-      for (int i = 0; i < 36; i++) {
-         if (i != this.shulkerInvSlot) {
-            ItemStack s = inv.getItem(i);
-            if (!s.isEmpty()) {
-               String id = BuiltInRegistries.ITEM.getKey(s.getItem()).getPath();
-               if (ORE_DROP_ITEMS.contains(id)) {
-                  return i;
-               }
-            }
-         }
-      }
-
-      return -1;
-   }
-
-   private boolean isShulkerBoxFull(ShulkerBoxMenu menu) {
-      for (int i = 0; i < 27; i++) {
-         if (menu.getSlot(i).getItem().isEmpty()) {
-            return false;
-         }
-      }
-
-      return true;
-   }
-
-   private int findNextNonFullShulker(LocalPlayer player) {
-      Inventory inv = player.getInventory();
-
-      for (int i = 0; i < 36; i++) {
-         if (i != this.shulkerInvSlot) {
-            ItemStack s = inv.getItem(i);
-            if (this.isShulkerItem(s) && !this.isShulkerBoxFull(s)) {
-               return i;
-            }
-         }
-      }
-
-      return -1;
-   }
-
-   private int menuSlotInShulkerMenu(ShulkerBoxMenu menu, Inventory inv, int invIndex) {
-      for (int i = 0; i < menu.slots.size(); i++) {
-         Slot s = menu.getSlot(i);
-         if (s.container == inv && s.getContainerSlot() == invIndex) {
-            return i;
-         }
-      }
-
-      return -1;
-   }
-
-   private int findEmptyBoxSlot(ShulkerBoxMenu menu) {
-      for (int i = 0; i < 27; i++) {
-         if (menu.getSlot(i).getItem().isEmpty()) {
-            return i;
-         }
-      }
-
-      return -1;
-   }
 
    private int findFoodHotbarSlot(LocalPlayer player) {
       for (int i = 0; i < 9; i++) {
@@ -1666,16 +1241,6 @@ public class AutoMineManager {
       SHULKER;
    }
 
-   private enum ShulkerOpenState {
-      IDLE,
-      OPEN_INV,
-      WAIT_INV,
-      OPEN_BOX,
-      WAIT_BOX,
-      STORE,
-      DISTRIBUTE,
-      CLOSING;
-   }
 
    public enum Task {
       OFF,

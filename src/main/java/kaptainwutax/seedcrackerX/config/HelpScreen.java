@@ -40,12 +40,20 @@ public class HelpScreen {
       automine.addEntry(eb.startTextDescription(Component.literal("/os zd 停止").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
       automine.addEntry(eb.startTextDescription(Component.literal("  停止自动挖矿。")).build());
       automine.addEntry(eb.startTextDescription(Component.literal("")).build());
+      automine.addEntry(eb.startTextDescription(Component.literal("/os ch [开|关|状态]").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
+      automine.addEntry(
+         eb.startTextDescription(
+            Component.literal("  背包满自动存盒开关。背包全满且背包内有未满的潜影盒时，自动把矿物等物品存入盒子并取回，存完继续挖矿。")
+               .withStyle(s -> s.withColor(ChatFormatting.WHITE))
+         ).build()
+      );
+      automine.addEntry(eb.startTextDescription(Component.literal("")).build());
       automine.addEntry(eb.startTextDescription(Component.literal("注意事项：").withStyle(s -> s.withColor(ChatFormatting.RED))).build());
       automine.addEntry(eb.startTextDescription(Component.literal("  - 必须先设置种子（/os sz）").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build());
       automine.addEntry(eb.startTextDescription(Component.literal("  - 必须安装 Baritone").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build());
       automine.addEntry(eb.startTextDescription(Component.literal("  - 打开 GUI（背包/聊天）会暂停挖矿").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build());
       automine.addEntry(
-         eb.startTextDescription(Component.literal("  - 包满自动存盒功能在 /os xs 中开启，背包需放潜影盒").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build()
+         eb.startTextDescription(Component.literal("  - 包满自动存盒默认开启，可用 /os ch 开关；需提前在背包里放好潜影盒，附近要有空地").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build()
       );
       ConfigCategory xray = builder.getOrCreateCategory(Component.literal("\ud83d\udc8e 矿物透视"));
       xray.addEntry(eb.startTextDescription(Component.literal("通过种子预测矿物位置并高亮显示。")).build());
@@ -58,7 +66,7 @@ public class HelpScreen {
       xray.addEntry(eb.startTextDescription(Component.literal("")).build());
       xray.addEntry(eb.startTextDescription(Component.literal("功能说明：").withStyle(s -> s.withColor(ChatFormatting.AQUA))).build());
       xray.addEntry(eb.startTextDescription(Component.literal("  - 矿物透视开关状态会保存，死亡复活不会重置").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build());
-      xray.addEntry(eb.startTextDescription(Component.literal("  - 包满自动存盒开关（自动挖矿时背包满自动存入潜影盒）").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build());
+      xray.addEntry(eb.startTextDescription(Component.literal("  - 包满自动存盒开关（也可用 /os ch 快速开关）").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build());
       ConfigCategory dx = builder.getOrCreateCategory(Component.literal("\ud83c\udfdb 地形指引"));
       dx.addEntry(eb.startTextDescription(Component.literal("通过种子计算结构位置，用射线指引前往。")).build());
       dx.addEntry(eb.startTextDescription(Component.literal("")).build());

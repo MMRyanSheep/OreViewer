@@ -62,7 +62,7 @@ public class Config {
    public boolean xrayEmerald = false;
    public int xrayRenderDistance = 2;
    public boolean xrayAntiXray = true;
-   public boolean autoMineShulkerSave = false;
+   public boolean autoMineShulkerSave = true;
    public boolean autoMineAttackMobs = true;
    public Map<String, int[]> buffSettings = new HashMap<>();
    public long activeSeed = 0L;

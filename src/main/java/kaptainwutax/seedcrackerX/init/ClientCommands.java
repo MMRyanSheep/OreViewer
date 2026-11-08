@@ -24,6 +24,7 @@ import kaptainwutax.seedcrackerX.command.MdcCommand;
 import kaptainwutax.seedcrackerX.command.ProCommand;
 import kaptainwutax.seedcrackerX.command.RenderCommand;
 import kaptainwutax.seedcrackerX.command.SeedCommand;
+import kaptainwutax.seedcrackerX.command.ShulkerCommand;
 import kaptainwutax.seedcrackerX.command.VersionCommand;
 import kaptainwutax.seedcrackerX.command.XrayCommand;
 import kaptainwutax.seedcrackerX.command.XraySettingsCommand;
@@ -84,5 +85,6 @@ public class ClientCommands {
       COMMANDS.add(new FlyCommand());
       COMMANDS.add(new ElytraCommand());
       COMMANDS.add(new ElytraAliasCommand());
+      COMMANDS.add(new ShulkerCommand());
    }
 }

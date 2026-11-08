@@ -87,7 +87,14 @@ public class OreXrayScreen {
       );
       settings.addEntry(
          eb.startBooleanToggle(Component.literal("包满自动存盒（潜影盒）"), Config.get().autoMineShulkerSave)
-            .setTooltip(Component.literal("开启后：自动挖矿时若背包已满且没有垃圾可丢，会自动放置背包中的潜影盒，把挖到的矿物存入盒内（每格只存 63 个，背包留 1 个占位，防止捡垃圾石头），存完继续挖矿。注意：背包中需要提前放好潜影盒！"))
+            .setTooltip(
+               Component.literal(
+                  "开启后：背包 36 格全满、且背包里有未满的潜影盒时，自动把矿物等可堆叠物品存入盒内腾出格子。\n"
+                     + "走纯原版交互：临时把潜影盒放在身边 → 打开 → 存入 → 挖回 → 捡回，无需安装 QuickShulker，但需要附近有一格空地。\n"
+                     + "工具、食物、装备、潜影盒本身不会被存入；任何一步失败都会尝试把盒子挖回来。\n"
+                     + "自动挖矿期间会暂停挖掘，存完自动继续。也可用 /os ch 快速开关。"
+               )
+            )
             .setSaveConsumer(val -> {
                Config.get().autoMineShulkerSave = val;
                Config.save();

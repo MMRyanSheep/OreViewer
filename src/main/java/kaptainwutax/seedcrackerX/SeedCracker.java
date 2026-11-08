@@ -4,6 +4,7 @@ import com.mojang.logging.LogUtils;
 import java.util.ArrayList;
 import kaptainwutax.seedcrackerX.api.SeedCrackerAPI;
 import kaptainwutax.seedcrackerX.automine.AutoMineManager;
+import kaptainwutax.seedcrackerX.automine.ShulkerAutoStore;
 import kaptainwutax.seedcrackerX.buff.BuffManager;
 import kaptainwutax.seedcrackerX.config.Config;
 import kaptainwutax.seedcrackerX.cracker.storage.DataStorage;
@@ -44,6 +45,8 @@ public class SeedCracker implements ModInitializer {
          .forEach(entrypoint -> entrypoints.add((SeedCrackerAPI)entrypoint.getEntrypoint()));
       FinderQueue.registerEvents();
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> ProgressDisplay.onClientTick());
+      // 背包满自动存盒是全局功能；先注册，自动挖矿在它运行期间会让路。
+      ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> ShulkerAutoStore.INSTANCE.onClientTick());
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> AutoMineManager.INSTANCE.onClientTick());
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> BuffManager.INSTANCE.tick());
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> FlyManager.tick());
