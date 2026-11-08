@@ -67,17 +67,17 @@ public final class ElytraHuntManager {
    private static final Logger LOGGER = LoggerFactory.getLogger("SeedCrackerX-Elytra");
    private static final String TAG = "[自动取翼] ";
 
-   private static final int DEFAULT_CANDIDATES = 12;
-   private static final int MAX_QUEUE_SIZE = 32;
+   private static final int DEFAULT_CANDIDATES = 24;
+   private static final int MAX_QUEUE_SIZE = 64;
+   private static final int REFILL_QUEUE_THRESHOLD = 4;
    private static final int MAX_TARGET_ELYTRA = 64;
    private static final double ARRIVE_XZ = 12.0;
    private static final double SLOW_RADIUS = 32.0;
    private static final double SCAN_RADIUS = 96.0;
-   // An end ship sits around y=70..100 while cruising happens at CRUISE_Y=140.
+   // An end ship cabin sits around box.minY() + 6 while cruising happens at CRUISE_Y=165+.
    // ItemFrame entities are only synced to clients within the server's entity
-   // tracking range, so scanning from the cruise altitude always sees zero
-   // frames. VERIFYING therefore descends to a point beside the ship first.
-   private static final double SHIP_APPROACH_LIFT = 6.0;
+   // tracking range, so VERIFYING descends directly above the ship cabin roof first.
+   private static final double SHIP_APPROACH_LIFT = 8.0;
    // Measured range of ship bounding-box centres is y=95..171 across three
    // seeds; the city placement start is only y=60..66.
    private static final int DEFAULT_SHIP_Y = 120;
@@ -108,31 +108,26 @@ public final class ElytraHuntManager {
    /** Distance improvement that counts as progress and renews the deadline. */
    private static final double TRAVEL_PROGRESS_STEP = 12.0;
    private static final long TAKE_TIMEOUT_MS = 10000L;
-   // Vertical-column approach: locate the item frame, climb directly above its
-   // X/Z column, then dig straight down through the ship hull. After a pickup
-   // the same strictly vertical motion is used to fly back out before cruising.
-   private static final int DESCENT_CLEARANCE = 8;
-   private static final double DESCENT_FLOOR_OFFSET = 2.0;
-   private static final double COLUMN_ALIGN_XZ = 1.0;
+   // Vertical-column approach: locate the item frame, align with the block center
+   // in front of the frame, then dig a 1x1 vertical shaft down through the cabin roof.
+   private static final int DESCENT_CLEARANCE = 7;
+   private static final double DESCENT_FLOOR_OFFSET = 1.0;
+   private static final double COLUMN_ALIGN_XZ = 0.85;
    private static final long VERTICAL_APPROACH_TIMEOUT_MS = 60000L;
    private static final long COLUMN_BLOCKED_TIMEOUT_MS = 3000L;
    private static final int DEPART_CLEARANCE = 24;
    private static final long DEPART_TIMEOUT_MS = 30000L;
-   // Only enforced for a finite target; unlimited collection stops on user input.
+   // Only enforced for a finite target; renewed on every pickup.
    private static final long GLOBAL_TIMEOUT_MS = 1200000L;
    private static final long LOCATE_TIMEOUT_MS = 90000L;
    private static final int ATTACK_RETRIES = 3;
    private static final int ORIGIN_PUSH = 1500;
-   // Exploration bias: the central islands (around 0,0) are already looted.
-   // Re-locate origins along a monotonically growing radius away from (0,0)
-   // instead of following the vector to the last candidate, which frequently
-   // pointed straight back into the centre.
-   private static final int OUTWARD_MIN_RADIUS = 2048;
+   private static final int CENTRAL_ISLAND_EXCLUSION_RADIUS = 1024;
+   private static final int OUTWARD_MIN_RADIUS = 1280;
    private static final double OUTWARD_ANGLE_SWING = 0.5;
-   private static final int OUTWARD_PICK_WINDOW = 8;
    private static final int CENTER_HYSTERESIS = 512;
    // Continuous collection keeps pushing outwards as nearby ships get looted.
-   private static final int MAX_RESCAN_ROUNDS = 64;
+   private static final int MAX_RESCAN_ROUNDS = 256;
    private static final int MAX_SWEEPS = 3;
    private static final long SCAN_INTERVAL_MS = 1000L;
    private static final long INFO_INTERVAL_MS = 3000L;
@@ -142,12 +137,7 @@ public final class ElytraHuntManager {
    // by the recorded anchor instead of jumping to the next candidate.
    private static final long TARGET_REBIND_GRACE_MS = 5000L;
    // A dropped elytra is a real, visible target: chase it with a generous
-   // budget instead of an 8-second wall-clock grace. The old timer started the
-   // moment ANY phase first saw the drop, so time spent clearing a shulker,
-   // descending, or digging through the hull silently consumed it. The first
-   // tick of TAKING then immediately declared "cannot pick up" and switched
-   // ships. All drop timers below are owned by chaseDrop() and are renewed
-   // while the player is still making progress towards the item.
+   // budget instead of an 8-second wall-clock grace.
    private static final long DROP_CHASE_TIMEOUT_MS = 45000L;
    /** No-progress window before switching from a straight approach to a dig/route. */
    private static final long DROP_STALL_MS = 2500L;
@@ -157,32 +147,17 @@ public final class ElytraHuntManager {
    private static final long DROP_DIG_MS = 8000L;
    private static final double REBIND_RADIUS = 8.0;
    private static final double DROP_RADIUS = 48.0;
-   /**
-    * The Shulker guarding the elytra frame is deliberately IGNORED.
-    *
-    * <p>The previous "clear the guard first" behaviour called hover() ->
-    * stopMining() and swapped to a weapon whenever the shaft opened a line
-    * of sight to the Shulker. Every such switch sent ABORT_DESTROY_BLOCK,
-    * so the server-side break progress restarted from zero; back in the
-    * approach phase the shaft opened line of sight again and the hunt
-    * flipped into combat once more. Mine / fight / mine / fight, forever.</p>
-    *
-    * <p>Instead we only knock away the projectiles it fires.
-    * ServerGamePacketListenerImpl.handleAttack (26.3) validates a melee
-    * attack with isWithinAttackRange(mainHand, entityBox, 3.0) and does NOT
-    * check the crosshair, so a plain ServerboundAttackPacket destroys a
-    * ShulkerBullet without turning the player, changing tools or touching
-    * the active block break.</p>
-    */
    private static final double BULLET_SWAT_RANGE_SQ = 3.0 * 3.0;
    /** Rate-limit the packets; a single hit destroys a ShulkerBullet. */
    private static final long BULLET_SWAT_COOLDOWN_MS = 120L;
-   private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
-   // Approach points around the ship: stay outside the hull but well inside
-   // entity tracking range. A new angle is used for every re-scan attempt.
+   private static final double[][] SWEEP_OFFSETS = {{24, 0}, {0, 24}, {-24, 0}, {0, -24}, {32, 32}};
+   // Approach points directly above and closely around the ship cabin so the
+   // ItemFrame is always well within the server's entity tracking range (<16 blocks)
+   // and never clips into adjacent End City towers at +/-20..26.
    private static final double[][] VERIFY_OFFSETS = {
-      {20, 20}, {-20, 20}, {20, -20}, {-20, -20},
-      {26, 0}, {-26, 0}, {0, 26}, {0, -26}
+      {0, 0}, {0, -8}, {0, 8}, {-8, 0}, {8, 0},
+      {10, 10}, {-10, 10}, {10, -10}, {-10, -10},
+      {14, 0}, {-14, 0}, {0, 14}, {0, -14}
    };
 
    public enum Phase {
@@ -445,7 +420,7 @@ public final class ElytraHuntManager {
    }
 
    public void setCandidateCount(int count) {
-      this.candidateCount = Math.max(1, Math.min(32, count));
+      this.candidateCount = Math.max(1, Math.min(MAX_QUEUE_SIZE, count));
       this.info("候选数量已设为 " + this.candidateCount, ChatFormatting.GREEN);
    }
 
@@ -475,17 +450,17 @@ public final class ElytraHuntManager {
       VanillaStructureLocator.clearCityCache();
       this.queue.clear();
       this.rescanRound++;
-      this.lastOrigin = pushedOrigin(player, this.rescanRound);
+      this.lastOrigin = this.searchOriginFor(player, this.rescanRound);
       this.clearTarget();
       this.phase = Phase.LOCATING;
       this.phaseStartMs = System.currentTimeMillis();
       this.info(
-         "已清空候选缓存，沿远离 (0,0) 的方向外推 origin 至 ("
+         "已清空候选缓存，从 ("
             + this.lastOrigin.getX() + ", " + this.lastOrigin.getZ() + ")"
-            + "，半径 " + this.outwardRadius + " 格，中心门槛 " + this.minTargetRadius + " 格",
+            + " 重新定位未访问的带船末地城（已排除 " + (this.tried.size() / 2) + " 处已访问目标）…",
          ChatFormatting.GREEN
       );
-      this.submitLocating(this.lastOrigin, Math.min(32, this.candidateCount + this.rescanRound * 4));
+      this.submitLocating(this.lastOrigin, Math.min(MAX_QUEUE_SIZE, this.candidateCount + this.rescanRound * 4));
    }
 
    public void debug() {
@@ -797,6 +772,7 @@ public final class ElytraHuntManager {
       final long seed = OreXrayManager.INSTANCE.getWorldSeed();
       final BlockPos fixedOrigin = origin;
       final int fixedNeed = need;
+      final Set<Long> excluded = new HashSet<>(this.tried);
       this.pendingResult = null;
       this.scanExecutor.execute(() -> {
          this.scanning.set(true);
@@ -804,10 +780,15 @@ public final class ElytraHuntManager {
          List<CityCandidate> cities = List.of();
          long start = System.currentTimeMillis();
          try {
-            VanillaStructureLocator.CityResult result = VanillaStructureLocator.findEndCitiesWithShip(seed, fixedOrigin, fixedNeed);
+            VanillaStructureLocator.CityResult result = VanillaStructureLocator.findEndCitiesWithShip(
+               seed, fixedOrigin, fixedNeed, excluded
+            );
             failed = !result.available();
             cities = result.available() ? new ArrayList<>(result.cities()) : List.of();
-            LOGGER.info("[elytra] 异步定位耗时 {} ms，返回 {} 个带船候选", System.currentTimeMillis() - start, cities.size());
+            LOGGER.info(
+               "[elytra] 异步定位耗时 {} ms，返回 {} 个带船候选（已排除 {}）",
+               System.currentTimeMillis() - start, cities.size(), excluded.size()
+            );
          } catch (Throwable t) {
             LOGGER.warn("[elytra] 异步定位失败", t);
             failed = true;
@@ -818,6 +799,37 @@ public final class ElytraHuntManager {
             this.scanning.set(false);
          }
       });
+   }
+
+   /** Drain any completed background locate result into {@link #queue}. */
+   private int consumeLocateResult(LocateResult result) {
+      if (result == null || result.cities() == null) {
+         return 0;
+      }
+      int added = 0;
+      for (CityCandidate candidate : result.cities()) {
+         if (candidate == null || candidate.pos() == null || !candidate.shipLocated() || candidate.shipPos() == null) {
+            continue;
+         }
+         BlockPos target = candidate.target();
+         // Never accept a coordinate inside the End central island exclusion zone (1024-block radius).
+         if (Math.hypot(target.getX(), target.getZ()) <= CENTRAL_ISLAND_EXCLUSION_RADIUS) {
+            continue;
+         }
+         long cityKey = candidate.pos().asLong();
+         long shipKey = target.asLong();
+         if (this.tried.contains(cityKey) || this.tried.contains(shipKey)) {
+            continue;
+         }
+         if (this.queue.size() >= MAX_QUEUE_SIZE) {
+            break;
+         }
+         this.tried.add(cityKey);
+         this.tried.add(shipKey);
+         this.queue.add(candidate);
+         added++;
+      }
+      return added;
    }
 
    private void tickLocating(Minecraft mc, LocalPlayer player, long now) {
@@ -832,27 +844,7 @@ public final class ElytraHuntManager {
       }
       this.pendingResult = null;
       List<CityCandidate> cities = result.cities();
-      int added = 0;
-      if (cities != null) {
-         for (CityCandidate candidate : cities) {
-            if (candidate == null || candidate.pos() == null) {
-               continue;
-            }
-            if (!this.tried.add(candidate.pos().asLong())) {
-               continue;
-            }
-            BlockPos target = candidate.target();
-            if (Math.hypot(target.getX(), target.getZ()) + CENTER_HYSTERESIS < this.minTargetRadius) {
-               // Inside the already-explored central ring: never fly back in.
-               continue;
-            }
-            if (this.queue.size() >= MAX_QUEUE_SIZE) {
-               break;
-            }
-            this.queue.add(candidate);
-            added++;
-         }
-      }
+      int added = this.consumeLocateResult(result);
       LOGGER.info(
          "[elytra] 定位完成：耗时 {} ms，返回 {} 个，新增 {} 个，available={}",
          now - this.phaseStartMs, cities == null ? 0 : cities.size(), added, !result.failed()
@@ -867,21 +859,18 @@ public final class ElytraHuntManager {
          }
          return;
       }
-      this.info("定位完成，新增 " + added + " 个候选，剩余 " + this.queue.size(), ChatFormatting.GREEN);
+      this.info("定位完成，新增 " + added + " 个带船候选，剩余 " + this.queue.size(), ChatFormatting.GREEN);
       this.nextCandidate(player, now);
    }
 
-   /** Candidate exhaustion: fly further out, which is the real fix for looted near-by cities. */
+   /** Candidate exhaustion: locate the next batch of untried End Ships around the player (or pushed further out). */
    private boolean pushOriginAndRelocate(LocalPlayer player, long now) {
       if (this.rescanRound >= MAX_RESCAN_ROUNDS) {
          return false;
       }
       this.rescanRound++;
-      // pushedOrigin() no longer depends on the current candidate: always push
-      // the search centre further away from (0,0).
-      this.lastOrigin = pushedOrigin(player, this.rescanRound);
+      this.lastOrigin = this.searchOriginFor(player, this.rescanRound);
       VanillaStructureLocator.clearCityCache();
-      this.queue.clear();
       this.current = null;
       this.clearTarget();
       this.sweepTarget = null;
@@ -891,18 +880,15 @@ public final class ElytraHuntManager {
       this.structureHint = null;
       this.lastScan = null;
       this.flight.hover(Minecraft.getInstance(), player, true);
-      this.attempts = 0;
       this.phaseStartMs = now;
       this.pendingResult = null;
-      // Without this the state machine stays in TRAVELLING/VERIFYING and the
-      // asynchronously computed result is never consumed (old bug).
       this.phase = Phase.LOCATING;
       this.info(
-         "候选耗尽，沿远离 (0,0) 的方向外推至半径 " + this.outwardRadius
-            + " 格重新定位（第 " + this.rescanRound + " 轮，中心门槛 " + this.minTargetRadius + " 格）",
+         "当前批次候选已飞完，正围绕 (" + this.lastOrigin.getX() + ", " + this.lastOrigin.getZ()
+            + ") 自动搜索下一批未访问的带船末地城（第 " + this.rescanRound + " 轮）…",
          ChatFormatting.YELLOW
       );
-      this.submitLocating(this.lastOrigin, Math.min(32, this.candidateCount + this.rescanRound * 4));
+      this.submitLocating(this.lastOrigin, Math.min(MAX_QUEUE_SIZE, this.candidateCount + this.rescanRound * 4));
       return true;
    }
 
@@ -915,45 +901,59 @@ public final class ElytraHuntManager {
    }
 
    /**
-    * Next search centre, strictly further from (0,0) than the previous one.
+    * Computes the search centre for locating untried End Ships.
     *
-    * <p>The old version normalised the vector towards {@code current.target()}
-    * and pushed along it. A failed candidate on the near side made that vector
-    * point straight back into the looted centre, so each "push outwards"
-    * actually re-scanned the same islands. Here the radius is a linear ramp
-    * away from world spawn and the bearing only swings within about +/- 29
-    * degrees of the outward ray, which spreads sectors without ever turning
-    * back. The radius is also monotonic even if the player flies inwards.</p>
+    * <p>Because {@link VanillaStructureLocator#findEndCitiesWithShip} now
+    * receives {@link #tried} directly and skips all already-visited cities while
+    * expanding rings, searching around the player's current position finds the
+    * closest untried ships without flying thousands of blocks away. If a round
+    * around the player's position ever yields zero results, subsequent rounds
+    * step outward along {@link #outwardAngle}.</p>
     */
-   private BlockPos pushedOrigin(LocalPlayer player, int round) {
-      int ramp = Math.max(this.outwardBaseRadius, OUTWARD_MIN_RADIUS) + ORIGIN_PUSH * round;
-      int radius = Math.max(ramp, this.outwardRadius + ORIGIN_PUSH);
+   private BlockPos searchOriginFor(LocalPlayer player, int round) {
+      if (player == null) {
+         return this.lastOrigin != null ? this.lastOrigin : new BlockPos(OUTWARD_MIN_RADIUS, DEFAULT_SHIP_Y, 0);
+      }
+      double px = player.getX();
+      double pz = player.getZ();
+      double playerRadius = Math.hypot(px, pz);
+      if (playerRadius > 256.0) {
+         this.outwardAngle = Math.atan2(pz, px);
+      }
+      if (round <= 1 && playerRadius >= OUTWARD_MIN_RADIUS) {
+         this.outwardRadius = (int)playerRadius;
+         return player.blockPosition();
+      }
+      int baseRadius = Math.max((int)playerRadius, OUTWARD_MIN_RADIUS);
+      int extraPush = Math.max(0, round - 1) * ORIGIN_PUSH;
+      int radius = Math.max(baseRadius + extraPush, this.outwardRadius + (round > 1 ? ORIGIN_PUSH / 2 : 0));
       this.outwardRadius = radius;
-      this.minTargetRadius = Math.max(
-         this.minTargetRadius, Math.max(0, radius - ORIGIN_PUSH - CENTER_HYSTERESIS)
-      );
-      double angle = this.outwardAngle + Math.sin(round * 0.8) * OUTWARD_ANGLE_SWING;
+      double angle = this.outwardAngle + (round > 1 ? Math.sin(round * 0.8) * OUTWARD_ANGLE_SWING : 0.0);
       return new BlockPos(
          (int)(Math.cos(angle) * radius), player.getBlockY(), (int)(Math.sin(angle) * radius)
       );
    }
 
    /**
-    * Pick the candidate furthest from (0,0) among the nearest few results.
-    * Taking the queue head used to send the hunt straight back into the looted
-    * centre; taking the global maximum would make every flight a maximal trip,
-    * so only a small window of nearby results is scored.
+    * Pick the untried candidate closest to the player's current position
+    * (nearest-neighbour routing).
+    *
+    * <p>The old rule picked the candidate with the largest radius from (0,0),
+    * which caused 4000+ block zig-zag flights across opposite quadrants and
+    * trapped the smallest-radius candidate in {@code queue[0]} until it was
+    * always chosen last as candidate #12.</p>
     */
-   private CityCandidate takeNextCandidate() {
+   private CityCandidate takeNextCandidate(LocalPlayer player) {
       List<CityCandidate> all = new ArrayList<>(this.queue);
-      int window = Math.min(all.size(), OUTWARD_PICK_WINDOW);
+      double refX = player != null ? player.getX() : (this.lastOrigin != null ? this.lastOrigin.getX() : 0.0);
+      double refZ = player != null ? player.getZ() : (this.lastOrigin != null ? this.lastOrigin.getZ() : 0.0);
       int bestIndex = 0;
-      double bestRadius = -1.0;
-      for (int i = 0; i < window; i++) {
+      double bestDist = Double.MAX_VALUE;
+      for (int i = 0; i < all.size(); i++) {
          BlockPos target = all.get(i).target();
-         double radius = Math.hypot(target.getX(), target.getZ());
-         if (radius > bestRadius) {
-            bestRadius = radius;
+         double d = Math.hypot(target.getX() + 0.5 - refX, target.getZ() + 0.5 - refZ);
+         if (d < bestDist) {
+            bestDist = d;
             bestIndex = i;
          }
       }
@@ -975,13 +975,29 @@ public final class ElytraHuntManager {
    }
 
    private void nextCandidate(LocalPlayer player, long now) {
+      // Consume any completed background prefetch before checking queue size.
+      LocateResult prefetched = this.pendingResult;
+      if (prefetched != null && prefetched.generation() == this.locateGeneration) {
+         this.pendingResult = null;
+         int added = this.consumeLocateResult(prefetched);
+         if (added > 0) {
+            this.info("后台预加载已补充 " + added + " 个带船候选，当前队列 " + this.queue.size(), ChatFormatting.GREEN);
+         }
+      }
       if (this.queue.isEmpty()) {
          if (!this.pushOriginAndRelocate(player, now)) {
             this.abort("候选已全部耗尽");
          }
          return;
       }
-      this.current = this.takeNextCandidate();
+      this.current = this.takeNextCandidate(player);
+      // Proactively prefetch the next batch in the background when the queue runs low
+      // so continuous hunting never stalls after the initial batch of candidates.
+      if (this.queue.size() <= REFILL_QUEUE_THRESHOLD && !this.scanning.get() && this.pendingResult == null) {
+         BlockPos refillOrigin = this.searchOriginFor(player, 1);
+         this.lastOrigin = refillOrigin;
+         this.submitLocating(refillOrigin, this.candidateCount);
+      }
       this.attempts++;
       this.flight.resetForNewTarget();
       this.clearTarget();
@@ -1004,7 +1020,7 @@ public final class ElytraHuntManager {
       this.travelDeadlineMs = now + travelStartGraceMs(initialHoriz);
       int shipY = ship.getY() > 0 ? ship.getY() : DEFAULT_SHIP_Y;
       this.flight.setMinCruiseY(Math.max(FlyController.CRUISE_Y, shipY + 28));
-      // Prepare the low-altitude approach point for the VERIFYING phase.
+      // Prepare the low-altitude approach point directly above the ship cabin.
       this.verifyPoint = this.buildVerifyPoint(Minecraft.getInstance().level, ship);
       LOGGER.info(
          "[elytra] 换点 #{} 城={} 船={} shipKnown={} shipLocated={} 剩余 {}",
@@ -1013,7 +1029,6 @@ public final class ElytraHuntManager {
       );
       this.info(
          "飞往船坐标 #" + this.attempts + " (" + ship.getX() + ", " + ship.getY() + ", " + ship.getZ() + ")"
-            + (this.current.shipLocated() ? "" : "（离线未解析船坐标，暂用城坐标）")
             + "，距离 " + (int)initialHoriz + " 格（进度制超时，持续靠近不会换点）"
             + "，剩余 " + this.queue.size(),
          ChatFormatting.AQUA
@@ -1038,6 +1053,15 @@ public final class ElytraHuntManager {
          this.nextCandidate(player, now);
          return;
       }
+      // Opportunistically drain any finished background prefetch.
+      LocateResult prefetched = this.pendingResult;
+      if (prefetched != null && prefetched.generation() == this.locateGeneration) {
+         this.pendingResult = null;
+         int added = this.consumeLocateResult(prefetched);
+         if (added > 0) {
+            LOGGER.info("[elytra] 巡航中后台补充 {} 个候选，当前队列 {}", added, this.queue.size());
+         }
+      }
       // Fly to the ship, not to the city's /locate position.
       BlockPos pos = this.current.target();
       Vec3 target = new Vec3(pos.getX() + 0.5, this.flight.cruiseY(), pos.getZ() + 0.5);
@@ -1047,10 +1071,6 @@ public final class ElytraHuntManager {
       // climb steeply to cruiseY first and allow mining through any blocking ceiling/tree.
       boolean climbingToCruise = player.getY() < this.flight.cruiseY() - 14.0 && horiz > 24.0;
 
-      // A distant ship is NOT a timed-out ship. There is no wall-clock flight
-      // limit at all: only a continuous no-progress window retires a candidate.
-      // Every real step towards the ship (plus active digging / climb-out)
-      // renews the deadline, so even a 100000-block target can be reached.
       if (this.travelDeadlineMs == 0L) {
          this.travelBestHoriz = horiz;
          this.travelDeadlineMs = now + travelStartGraceMs(horiz);
@@ -1080,7 +1100,7 @@ public final class ElytraHuntManager {
          }
       }
 
-      if (horiz < ARRIVE_XZ && Math.abs(player.getY() - this.flight.cruiseY()) < 24.0) {
+      if (horiz < ARRIVE_XZ && Math.abs(player.getY() - this.flight.cruiseY()) < 28.0) {
          this.flight.hover(mc, player, true);
          this.phaseStartMs = now;
          this.lastScanMs = 0L;
@@ -1089,7 +1109,7 @@ public final class ElytraHuntManager {
          this.lastScan = null;
          this.verifyPoint = this.buildVerifyPoint(level, pos);
          this.phase = Phase.VERIFYING;
-         this.info("已抵达船坐标上空，正在下降到船体高度并校验区块 / 结构 / 展示框…", ChatFormatting.AQUA);
+         this.info("已抵达船坐标上空，正在下降到船舱顶部并校验区块 / 结构 / 展示框…", ChatFormatting.AQUA);
          return;
       }
 
@@ -1136,7 +1156,7 @@ public final class ElytraHuntManager {
          this.beginColumnApproach(player, scan.elytraFrame, now);
          this.phase = Phase.APPROACHING;
          this.info(
-            "已定位展示框坐标 " + format(this.targetFramePos) + "，先飞到正上方，再沿该列垂直向下挖掘…",
+            "已定位展示框坐标 " + format(this.targetFramePos) + "，对准方块中心垂直列并向下挖掘…",
             ChatFormatting.GREEN
          );
          return true;
@@ -1149,7 +1169,7 @@ public final class ElytraHuntManager {
          this.beginColumnApproach(player, scan.dropped, now);
          this.phase = Phase.APPROACHING;
          this.info(
-            "已定位掉落鞘翅坐标 " + format(this.targetFramePos) + "，先飞到正上方，再沿该列垂直向下挖掘…",
+            "已定位掉落鞘翅坐标 " + format(this.targetFramePos) + "，对准方块中心垂直列并向下挖掘…",
             ChatFormatting.GREEN
          );
          return true;
@@ -1158,17 +1178,42 @@ public final class ElytraHuntManager {
    }
 
    /**
-    * Step 1 of the approach: fix the X/Z column from the located entity and
-    * remember the ceiling point (directly above it) and the floor point (just
-    * below it). Everything afterwards moves inside this one column.
+    * Step 1 of the approach: snap the X/Z column to the <b>centre of the air
+    * block</b> containing the item frame ({@code block.getX() + 0.5, block.getZ() + 0.5}),
+    * NOT the entity's exact wall-flush coordinate ({@code .0625 / .9375}).
+    *
+    * <p>An {@link ItemFrame} hangs 1/16th of a block off the solid cabin wall.
+    * Centering the 0.68-wide player at {@code target.position().x/z} made the
+    * player's bounding box overlap 0.28 blocks into the wall supporting the
+    * frame, forcing a 2-column shaft and breaking the frame's support block.
+    * At {@code (bx + 0.5, bz + 0.5)}, the player's {@code [0.16, 0.84]} footprint
+    * fits 100% inside a single 1x1 column directly in front of the frame.</p>
     */
    private void beginColumnApproach(LocalPlayer player, Entity target, long now) {
-      Vec3 pos = target.position();
-      this.columnX = pos.x;
-      this.columnZ = pos.z;
-      this.columnTopY = Math.max(pos.y + DESCENT_CLEARANCE, player.getY() + 2.0);
-      this.columnFloorY = pos.y - DESCENT_FLOOR_OFFSET;
-      this.columnStage = ColumnStage.ALIGN;
+      BlockPos block = target.blockPosition();
+      this.columnX = block.getX() + 0.5;
+      this.columnZ = block.getZ() + 0.5;
+      ClientLevel level = Minecraft.getInstance().level;
+      int topBlockY = block.getY() + DESCENT_CLEARANCE;
+      if (level != null) {
+         for (int y = block.getY() + 16; y >= block.getY() + 2; y--) {
+            if (!FlyController.isPassableBlock(level, new BlockPos(block.getX(), y, block.getZ()))) {
+               topBlockY = Math.max(block.getY() + 4, y + 2);
+               break;
+            }
+         }
+         while (topBlockY < block.getY() + 22
+            && !FlyController.isPassableColumn(level, block.getX(), topBlockY, block.getZ())) {
+            topBlockY++;
+         }
+      }
+      this.columnTopY = topBlockY + 0.08;
+      this.columnFloorY = block.getY() - DESCENT_FLOOR_OFFSET;
+      double horiz = player == null ? Double.MAX_VALUE
+         : Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ());
+      this.columnStage = (player != null && horiz <= COLUMN_ALIGN_XZ && player.getY() >= block.getY() - 0.5)
+         ? ColumnStage.DESCEND
+         : ColumnStage.ALIGN;
       this.columnSinceMs = now;
       this.columnBlockedSinceMs = 0L;
       this.phaseStartMs = now;
@@ -1184,7 +1229,7 @@ public final class ElytraHuntManager {
       BlockPos ship = this.current.target();
 
       // Continuously scan while descending or sweeping so we lock onto the frame the moment it syncs!
-      if ((this.verifyPoint != null || this.sweepTarget != null) && now - this.lastScanMs >= 500L) {
+      if ((this.verifyPoint != null || this.sweepTarget != null) && now - this.lastScanMs >= 400L) {
          this.lastScanMs = now;
          ScanResult midScan = this.scan(level, player, ship);
          this.lastScan = midScan;
@@ -1196,11 +1241,13 @@ public final class ElytraHuntManager {
          }
       }
 
-      // Phase 1: descend to the ship.
+      // Phase 1: descend directly above / beside the ship cabin.
       if (this.verifyPoint != null) {
          double d = player.position().distanceTo(this.verifyPoint);
-         if (d > 5.0 && now - this.phaseStartMs < VERIFY_APPROACH_TIMEOUT_MS) {
-            FlyController.NavState state = this.flight.navigate(mc, level, player, this.verifyPoint, true, true);
+         if (d > 3.5 && now - this.phaseStartMs < VERIFY_APPROACH_TIMEOUT_MS) {
+            FlyController.NavState state = this.flight.navigate(
+               mc, level, player, this.verifyPoint, d < 12.0, true
+            );
             if (state == FlyController.NavState.BLOCKED) {
                this.verifyOffsetIndex++;
                this.verifyPoint = this.buildVerifyPoint(level, ship);
@@ -1209,7 +1256,7 @@ public final class ElytraHuntManager {
             } else if (obstacleWork(state)) {
                this.phaseStartMs = now;
             }
-            this.throttledInfo("正在下降到船体高度以同步展示框实体（还差 " + (int)d + " 格）…", now);
+            this.throttledInfo("正在下降到船舱顶部以同步展示框实体（还差 " + (int)d + " 格）…", now);
             return;
          }
          this.verifyPoint = null;
@@ -1221,7 +1268,7 @@ public final class ElytraHuntManager {
       if (this.sweepTarget != null) {
          double d = Math.hypot(this.sweepTarget.x - player.getX(), this.sweepTarget.z - player.getZ());
          if (d > ARRIVE_XZ && now - this.phaseStartMs < VERIFY_TIMEOUT_MS) {
-            FlyController.NavState state = this.flight.navigate(mc, level, player, this.sweepTarget, true, true);
+            FlyController.NavState state = this.flight.navigate(mc, level, player, this.sweepTarget, d < 12.0, true);
             if (obstacleWork(state)) {
                this.phaseStartMs = now;
             }
@@ -1291,12 +1338,21 @@ public final class ElytraHuntManager {
       );
    }
 
-   /** Low-altitude point beside the ship; on-site evidence wins when worldgen Y is clearly off. */
+   /**
+    * Low-altitude point directly above the ship cabin.
+    *
+    * <p>When {@code current.shipLocated()} is true, {@code ship.getY()} comes
+    * directly from the generated {@code end_city/ship} template piece and MUST
+    * NOT be overridden by a lower End City tower Shulker (which used to pull
+    * {@code verifyY} 60-80 blocks down into the city towers).</p>
+    */
    private int verifyY(BlockPos ship) {
       int offline = ship.getY() > 0 ? ship.getY() : DEFAULT_SHIP_Y;
+      if (this.current != null && this.current.shipLocated()) {
+         return offline + (int)SHIP_APPROACH_LIFT;
+      }
       int hint = this.structureHint == null ? offline : this.structureHint.getY();
-      boolean offlineTrustworthy = this.current.shipLocated() && Math.abs(hint - offline) <= 24;
-      return (offlineTrustworthy ? offline : hint) + (int)SHIP_APPROACH_LIFT;
+      return hint + (int)SHIP_APPROACH_LIFT;
    }
 
    private Vec3 buildVerifyPoint(ClientLevel level, BlockPos ship) {
@@ -1312,13 +1368,21 @@ public final class ElytraHuntManager {
          double[] offset = VERIFY_OFFSETS[idx];
          int bx = (int)Math.floor(cx + offset[0]);
          int bz = (int)Math.floor(cz + offset[1]);
-         if (level == null || FlyController.isPassableColumn(level, bx, vy, bz)) {
+         if (level == null) {
             this.verifyOffsetIndex = idx;
             return new Vec3(bx + 0.5, vy + 0.08, bz + 0.5);
          }
+         // Search a small vertical window at (bx, bz) so a roof/mast block at vy
+         // is stepped over rather than rejecting the close offset.
+         for (int dy = 0; dy <= 10; dy += 2) {
+            if (FlyController.isPassableColumn(level, bx, vy + dy, bz)) {
+               this.verifyOffsetIndex = idx;
+               return new Vec3(bx + 0.5, vy + dy + 0.08, bz + 0.5);
+            }
+         }
       }
       double[] offset = VERIFY_OFFSETS[Math.floorMod(this.verifyOffsetIndex, VERIFY_OFFSETS.length)];
-      return new Vec3(cx + offset[0], vy, cz + offset[1]);
+      return new Vec3(cx + offset[0] + 0.5, vy + 0.08, cz + offset[1] + 0.5);
    }
 
    private static Vec3 spiralPoint(BlockPos center, int index, int y) {
@@ -1328,10 +1392,11 @@ public final class ElytraHuntManager {
 
    /**
     * Scans around the SHIP position. Entity hits are the strongest signal: they
-    * prove the structure is real and give an exact on-site coordinate used to
-    * correct an imprecise offline ship Y. The old block lattice (step 8 in X/Z,
-    * step 10 in Y, fixed 60..150) was too coarse for a ship hull and covered
-    * the wrong height range; it is now denser and centred on the ship's own Y.
+    * prove the structure is real and give an exact on-site coordinate.
+    *
+    * <p>Shulkers on lower End City towers (dozens of blocks below the ship) are
+    * no longer allowed to overwrite {@code structureHint} when the ship's own
+    * position is already known.</p>
     */
    private ScanResult scan(ClientLevel level, LocalPlayer player, BlockPos center) {
       ScanResult result = new ScanResult();
@@ -1362,16 +1427,15 @@ public final class ElytraHuntManager {
          result.entities++;
          if (entity.getType() == EntityTypes.SHULKER) {
             result.cityPresent = true;
-            if (result.structureHint == null) {
+            if (result.structureHint == null
+               && (center.getY() <= 0 || Math.abs(entity.getY() - center.getY()) <= 16.0)) {
                result.structureHint = entity.blockPosition();
             }
          }
          if (entity instanceof ItemFrame) {
             result.frames++;
             result.cityPresent = true;
-            if (result.structureHint == null) {
-               result.structureHint = entity.blockPosition();
-            }
+            result.structureHint = entity.blockPosition();
             ItemStack stack = frameItem(entity);
             if (stack != null && stack.getItem() == Items.ELYTRA && result.elytraFrame == null) {
                result.elytraFrame = entity;
@@ -1379,27 +1443,27 @@ public final class ElytraHuntManager {
          } else if (entity instanceof ItemEntity item && item.getItem().getItem() == Items.ELYTRA && result.dropped == null) {
             result.dropped = entity;
             result.cityPresent = true;
-            if (result.structureHint == null) {
-               result.structureHint = entity.blockPosition();
-            }
+            result.structureHint = entity.blockPosition();
          }
       }
 
       if (result.elytraFrame == null && !result.cityPresent) {
          int baseY = center.getY() > 0 ? center.getY() : (int)player.getY();
-         int minY = Math.max(40, baseY - 36);
-         int maxY = Math.min(220, baseY + 40);
+         int minY = Math.max(40, baseY - 24);
+         int maxY = Math.min(220, baseY + 24);
          outer:
-         for (int x = center.getX() - 48; x <= center.getX() + 48; x += 6) {
-            for (int z = center.getZ() - 48; z <= center.getZ() + 48; z += 6) {
+         for (int x = center.getX() - 32; x <= center.getX() + 32; x += 4) {
+            for (int z = center.getZ() - 32; z <= center.getZ() + 32; z += 4) {
                if (level.getChunk(x >> 4, z >> 4, ChunkStatus.FULL, false) == null) {
                   continue;
                }
-               for (int y = minY; y <= maxY; y += 6) {
+               for (int y = minY; y <= maxY; y += 4) {
                   BlockPos at = new BlockPos(x, y, z);
                   if (isEndCityBlock(level.getBlockState(at).getBlock())) {
                      result.cityPresent = true;
-                     result.structureHint = at;
+                     if (result.structureHint == null) {
+                        result.structureHint = at;
+                     }
                      break outer;
                   }
                }
@@ -1695,23 +1759,23 @@ public final class ElytraHuntManager {
          this.info("检测到掉落的鞘翅，开始吸取追踪…", ChatFormatting.AQUA);
          return;
       }
-      // FRAME (or a frame-anchored pickup target): strictly vertical column approach.
-      if (this.columnStage == null) {
-         Entity fallback = this.pickupOnly ? this.droppedItem : this.targetFrame;
-         if (fallback == null) {
-            this.throttledInfo("目标实体正在重新同步…", now);
-            return;
-         }
-         this.beginColumnApproach(player, fallback, now);
-         this.columnStage = ColumnStage.DESCEND;
-      }
-      if (now - this.columnSinceMs > VERTICAL_APPROACH_TIMEOUT_MS) {
-         this.nextCandidateWithReason(player, now, "垂直进近超时");
-         return;
-      }
+      // Immediate check: if the frame is already in unobstructed attack reach, take it right away.
       Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
       if (target == null || target.isRemoved() || !target.isAlive()) {
          this.throttledInfo("目标实体正在重新同步…", now);
+         return;
+      }
+      if (!this.pickupOnly && status == TargetStatus.FRAME && canAttackEntity(level, player, target)) {
+         this.enterTaking(mc, player, target, now, "已进入展示框有效攻击距离，开始取物");
+         return;
+      }
+
+      // FRAME (or a frame-anchored pickup target): strictly vertical column approach.
+      if (this.columnStage == null) {
+         this.beginColumnApproach(player, target, now);
+      }
+      if (now - this.columnSinceMs > VERTICAL_APPROACH_TIMEOUT_MS) {
+         this.nextCandidateWithReason(player, now, "垂直进近超时");
          return;
       }
 
@@ -1719,13 +1783,20 @@ public final class ElytraHuntManager {
       if (this.columnStage == ColumnStage.ALIGN) {
          Vec3 overhead = new Vec3(this.columnX, this.columnTopY, this.columnZ);
          double horiz = Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ());
-         if (horiz > COLUMN_ALIGN_XZ || player.getY() < this.columnTopY - 2.0) {
-            FlyController.NavState state = this.flight.navigate(mc, level, player, overhead, true, true);
-            if (state == FlyController.NavState.BLOCKED) {
-               this.flight.lift();
+         boolean aboveTarget = player.getY() >= target.blockPosition().getY() + 1.0;
+         if (horiz > COLUMN_ALIGN_XZ || (!aboveTarget && player.getY() < this.columnTopY - 1.5)) {
+            if (horiz <= 2.2 && Math.abs(player.getY() - this.columnTopY) <= 4.0) {
+               this.flight.travelColumn(mc, level, player, this.columnX, this.columnZ, this.columnTopY, true);
+            } else {
+               FlyController.NavState state = this.flight.navigate(
+                  mc, level, player, overhead, horiz < 10.0, true
+               );
+               if (state == FlyController.NavState.BLOCKED) {
+                  this.flight.lift();
+               }
             }
             this.throttledInfo(
-               "正在飞到展示框正上方（水平还差 " + (int)horiz + " 格，高度还差 "
+               "正在飞到展示框正上方（水平还差 " + String.format("%.1f", horiz) + " 格，高度还差 "
                   + (int)Math.max(0.0, this.columnTopY - player.getY()) + " 格）…", now
             );
             return;
@@ -1735,17 +1806,11 @@ public final class ElytraHuntManager {
          this.columnSinceMs = now;
          this.columnBlockedSinceMs = 0L;
          this.phaseStartMs = now;
-         this.info("已抵达展示框正上方，开始沿同一垂直列向下挖掘…", ChatFormatting.AQUA);
+         this.info("已对准展示框正上方 1x1 垂直列，开始向下挖掘进舱…", ChatFormatting.AQUA);
          return;
       }
 
-      // Step 2b: take a live frame as soon as the vertical shaft gives us a clear hit.
-      if (!this.pickupOnly && status == TargetStatus.FRAME && canAttackEntity(level, player, target)) {
-         this.enterTaking(mc, player, target, now, "已进入展示框有效攻击距离，开始取物");
-         return;
-      }
-
-      // Step 2c: dig straight down inside the located column. No sideways detour.
+      // Step 2b: dig straight down inside the located 1x1 block-centered column.
       FlyController.ColumnState column = this.flight.travelColumn(
          mc, level, player, this.columnX, this.columnZ, this.columnFloorY, true
       );
@@ -1768,7 +1833,7 @@ public final class ElytraHuntManager {
       }
       this.columnBlockedSinceMs = 0L;
       if (column == FlyController.ColumnState.ARRIVED
-         || player.getY() <= this.columnFloorY + 0.5) {
+         || player.getY() <= this.columnFloorY + 0.45) {
          this.enterTaking(mc, player, target, now, "已沿垂直列挖到展示框位置，开始取物");
          return;
       }
@@ -1829,16 +1894,23 @@ public final class ElytraHuntManager {
          return;
       }
       if (!canAttackEntity(level, player, frame)) {
-         // Still inside one vertical shaft: never fall back to a side hover point.
+         // Stay in the 1x1 block-centered column at cabin floor level (never dig down into the obsidian floor).
          if (this.columnStage == null) {
             this.beginColumnApproach(player, frame, now);
             this.columnStage = ColumnStage.DESCEND;
          }
          FlyController.ColumnState column = this.flight.travelColumn(
-            mc, level, player, this.columnX, this.columnZ, this.columnFloorY - 1.0, true
+            mc, level, player, this.columnX, this.columnZ, this.columnFloorY, true
          );
          if (column == FlyController.ColumnState.MINING) {
             this.phaseStartMs = now;
+         } else if (column == FlyController.ColumnState.ARRIVED || column == FlyController.ColumnState.BLOCKED) {
+            FlyController.NavState nav = this.flight.navigate(
+               mc, level, player, new Vec3(this.columnX, this.columnFloorY, this.columnZ), true, true
+            );
+            if (nav == FlyController.NavState.MINING) {
+               this.phaseStartMs = now;
+            }
          }
          this.throttledInfo(
             column == FlyController.ColumnState.MINING
@@ -1901,20 +1973,26 @@ public final class ElytraHuntManager {
          level, player, player.position(), drop.position(), distance + 0.4, false
       );
 
-      // Use 3D A* + block mining whenever a block is between the player and the drop,
-      // or during an active dig window.
+      // Use block-centered vertical shaft or 3D A* mining whenever a block is between the player and the drop.
       if ((!directClear && distance > 0.9) || (this.dropDigUntilMs != 0L && now < this.dropDigUntilMs)) {
-         // Same vertical rule for a dropped elytra: come down the item's own column.
+         BlockPos dropBlock = drop.blockPosition();
+         double dropColX = dropBlock.getX() + 0.5;
+         double dropColZ = dropBlock.getZ() + 0.5;
          FlyController.ColumnState column = this.flight.travelColumn(
-            mc, level, player, drop.getX(), drop.getZ(), drop.getY() - 0.4, true
+            mc, level, player, dropColX, dropColZ, dropBlock.getY(), true
          );
          this.dropIssue = "垂直挖路中（" + column + "，最近 "
             + String.format("%.1f", this.dropBestDistance) + " 格）";
          if (column == FlyController.ColumnState.MOVING || column == FlyController.ColumnState.MINING) {
-            this.throttledInfo("正沿掉落鞘翅的正上方向下挖掘…", now);
+            this.throttledInfo("正沿掉落鞘翅所在方块中心列向下挖掘…", now);
             return;
          }
-         // ARRIVED / BLOCKED: fall through to the exact pickup hover below.
+         if (!directClear) {
+            FlyController.NavState nav = this.flight.navigate(mc, level, player, drop.position(), true, true);
+            if (nav == FlyController.NavState.MINING || nav == FlyController.NavState.DETOUR) {
+               return;
+            }
+         }
       }
       if (this.dropDigUntilMs != 0L) {
          this.dropDigUntilMs = 0L;
@@ -1982,14 +2060,16 @@ public final class ElytraHuntManager {
       this.collected++;
       this.flight.release(mc);
       long seconds = (now - this.globalStartMs) / 1000L;
+      // Renew globalStartMs on every successful pickup so multi-ship runs never time out after ~12 ships.
+      this.globalStartMs = now;
       this.info(
-         "已取得第 " + this.collected + " 个鞘翅（背包共 " + total + " 个，耗时 " + seconds
+         "已取得第 " + this.collected + " 个鞘翅（背包共 " + total + " 个，本个耗时 " + seconds
             + " 秒，已尝试 " + this.attempts + " 个候选）",
          ChatFormatting.GREEN
       );
       LOGGER.info(
-         "[elytra] collected #{} in {} ms after {} candidates",
-         this.collected, now - this.globalStartMs, this.attempts
+         "[elytra] collected #{} in {} s after {} candidates",
+         this.collected, seconds, this.attempts
       );
 
       if (this.targetElytra > 0 && this.collected >= this.targetElytra) {
@@ -2011,17 +2091,22 @@ public final class ElytraHuntManager {
 
    /**
     * Step 3: after a successful pickup, climb straight up out of the ship along
-    * the player's current X/Z before resuming the hunt (or finishing).
+    * the already-cleared 1x1 block-centered shaft before resuming the hunt (or finishing).
     */
    private void beginDeparture(LocalPlayer player, long now, String finishReason) {
-      this.departX = player.getX();
-      this.departZ = player.getZ();
+      if (this.columnX != 0.0 && Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ()) <= 1.2) {
+         this.departX = this.columnX;
+         this.departZ = this.columnZ;
+      } else {
+         this.departX = Math.floor(player.getX()) + 0.5;
+         this.departZ = Math.floor(player.getZ()) + 0.5;
+      }
       this.departY = Math.max(player.getY() + DEPART_CLEARANCE, this.flight.cruiseY());
       this.departSinceMs = now;
       this.departFinishReason = finishReason;
       this.phaseStartMs = now;
       this.phase = Phase.DEPARTING;
-      this.info("已拾取鞘翅，正沿当前垂直列向上飞离船体…", ChatFormatting.AQUA);
+      this.info("已拾取鞘翅，正沿原 1x1 垂直通道向上飞离船体…", ChatFormatting.AQUA);
    }
 
    private void tickDeparting(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {

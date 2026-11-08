@@ -256,24 +256,35 @@ public final class VanillaStructureLocator {
     * 30-110 blocks in Y. Navigation and entity scans must use that point.</p>
     */
    public static CityResult findEndCitiesWithShip(long seed, BlockPos origin, int need) {
+      return findEndCitiesWithShip(seed, origin, need, Set.of());
+   }
+
+   /**
+    * Overload that skips any city or ship coordinate already present in
+    * {@code excludedPos} while expanding placement rings, guaranteeing up to
+    * {@code need} fresh, untried ship-bearing End Cities around {@code origin}.
+    */
+   public static CityResult findEndCitiesWithShip(long seed, BlockPos origin, int need, Set<Long> excludedPos) {
       if (need <= 0) {
          return new CityResult(false, List.of());
       }
+      Set<Long> excluded = excludedPos == null ? Set.of() : excludedPos;
 
       long now = System.currentTimeMillis();
-      // V2: candidates now carry the resolved ship position; never reuse a
-      // pre-V2 cache entry that only had the city's /locate coordinate.
-      String cacheKey = "END_CITY@SHIP@V2@" + seed + "@" + need + "@" + (origin.getX() >> 7) + "," + (origin.getZ() >> 7);
-      CachedCityResult cached = CITY_RESULT_CACHE.get(cacheKey);
-      if (cached != null && now - cached.time() < RESULT_TTL_MS) {
-         return new CityResult(true, cached.cities());
+      String cacheKey = "END_CITY@SHIP@V3@" + seed + "@" + need + "@" + excluded.size()
+         + "@" + (origin.getX() >> 7) + "," + (origin.getZ() >> 7);
+      if (excluded.isEmpty()) {
+         CachedCityResult cached = CITY_RESULT_CACHE.get(cacheKey);
+         if (cached != null && now - cached.time() < RESULT_TTL_MS) {
+            return new CityResult(true, cached.cities());
+         }
       }
 
       // Only about half of the end cities spawn a ship: collect() stops as soon
-      // as `need` ship-bearing hits are available, instead of `need` raw hits.
+      // as `need` untried ship-bearing hits are available, instead of `need` raw hits.
       List<Hit> hits;
       try {
-         hits = collect(GuidanceManager.TargetKind.END_CITY, seed, origin, need, true);
+         hits = collect(GuidanceManager.TargetKind.END_CITY, seed, origin, need, true, excluded);
       } catch (Throwable t) {
          LOGGER.warn("[guidance] end city ship scan failed", t);
          return new CityResult(false, List.of());
@@ -282,7 +293,7 @@ public final class VanillaStructureLocator {
       hits.sort(Comparator.comparingDouble(Hit::distance));
       List<CityCandidate> cities = new ArrayList<>();
       for (Hit hit : hits) {
-         if (hit.hasShip()) {
+         if (hit.hasShip() && hit.shipPos() != null) {
             cities.add(new CityCandidate(hit.pos(), hit.shipKnown(), hit.shipPos()));
             if (cities.size() >= need) {
                break;
@@ -290,17 +301,28 @@ public final class VanillaStructureLocator {
          }
       }
       long located = cities.stream().filter(CityCandidate::shipLocated).count();
-      LOGGER.info("[guidance] ship candidates: {} total, {} with resolved ship position", cities.size(), located);
-      if (CITY_RESULT_CACHE.size() > 32) {
-         CITY_RESULT_CACHE.clear();
+      LOGGER.info(
+         "[guidance] ship candidates: {} total, {} with resolved ship position (excluded={})",
+         cities.size(), located, excluded.size()
+      );
+      if (excluded.isEmpty()) {
+         if (CITY_RESULT_CACHE.size() > 32) {
+            CITY_RESULT_CACHE.clear();
+         }
+         CITY_RESULT_CACHE.put(cacheKey, new CachedCityResult(now, List.copyOf(cities)));
       }
-      CITY_RESULT_CACHE.put(cacheKey, new CachedCityResult(now, List.copyOf(cities)));
       return new CityResult(true, cities);
    }
 
    /** Shared placement enumeration for {@link #find} and {@link #findEndCitiesWithShip}. */
    private static List<Hit> collect(
       GuidanceManager.TargetKind kind, long seed, BlockPos origin, int need, boolean shipOnly
+   ) {
+      return collect(kind, seed, origin, need, shipOnly, Set.of());
+   }
+
+   private static List<Hit> collect(
+      GuidanceManager.TargetKind kind, long seed, BlockPos origin, int need, boolean shipOnly, Set<Long> excludedPos
    ) {
       Spec spec = specFor(kind);
       Ctx ctx = context(spec.dim(), seed);
@@ -317,7 +339,7 @@ public final class VanillaStructureLocator {
          if (placement instanceof ConcentricRingsStructurePlacement rings) {
             collectRingPositions(ctx, spec, rings, origin, hits);
          } else if (placement instanceof RandomSpreadStructurePlacement spread) {
-            collectSpreadPositions(ctx, spec, set, spread, origin, need, hits, budget, deadline, shipOnly);
+            collectSpreadPositions(ctx, spec, set, spread, origin, need, hits, budget, deadline, shipOnly, excludedPos);
          }
       }
       return hits;
@@ -326,7 +348,7 @@ public final class VanillaStructureLocator {
    private static int countShips(List<Hit> hits) {
       int count = 0;
       for (Hit hit : hits) {
-         if (hit.hasShip()) {
+         if (hit.hasShip() && hit.shipPos() != null) {
             count++;
          }
       }
@@ -528,16 +550,24 @@ public final class VanillaStructureLocator {
    }
 
    private static Generated tryGenerate(Ctx ctx, Holder<Structure> holder, ChunkPos chunk) {
-      StructureTemplateManager templateManager = templates();
-      if (templateManager == null) {
-         // Placement + weighted pick only (same fallback as VeinSim). Without
-         // real templates we cannot tell whether a ship exists: do not veto.
-         return new Generated(holder, true, false, null);
-      }
       Structure structure = holder.value();
       boolean endCity = holder.unwrapKey()
          .map(key -> "end_city".equals(key.identifier().getPath()))
          .orElse(false);
+      if (endCity) {
+         long cx = chunk.getMinBlockX() >> 4;
+         long cz = chunk.getMinBlockZ() >> 4;
+         // Vanilla End Cities cannot generate inside the central island exclusion zone (1024-block radius).
+         if (cx * cx + cz * cz <= 4096L) {
+            return null;
+         }
+      }
+      StructureTemplateManager templateManager = templates();
+      if (templateManager == null) {
+         // Placement + weighted pick only (same fallback as VeinSim). For end-ship
+         // hunts we require real template validation so fake coordinates are never produced.
+         return endCity ? null : new Generated(holder, true, false, null);
+      }
       try {
          StructureStart start = structure.generate(
             holder,
@@ -557,18 +587,18 @@ public final class VanillaStructureLocator {
          if (start.isValid()) {
             // Only end cities need the (per-piece) ship inspection; other
             // guidance targets keep the exact old behaviour and cost.
-            // Capture the ship piece's bounding box centre while the generated
+            // Capture the ship piece's cabin coordinate while the generated
             // start is still available - this is the only place where the real
             // ship coordinate (not the city's /locate position) can be read.
-            boolean hasShip = !endCity || hasShipPiece(start);
             BlockPos shipPos = endCity ? shipPosOf(start) : null;
-            return new Generated(holder, hasShip, endCity, shipPos);
+            boolean hasShip = !endCity || (shipPos != null && hasShipPiece(start));
+            return new Generated(holder, hasShip, endCity && shipPos != null, shipPos);
          }
       } catch (Throwable t) {
          if (genFailures++ < 3) {
             LOGGER.warn("[guidance] generation check failed at {}", chunk, t);
          }
-         return new Generated(holder, true, false, null);
+         return endCity ? null : new Generated(holder, true, false, null);
       }
       return null;
    }
@@ -579,13 +609,14 @@ public final class VanillaStructureLocator {
     * {@code "ship"} for the end ship (verified against the vanilla template
     * {@code data/minecraft/structure/end_city/ship.nbt}). Pool-element and
     * loose string checks remain as fallbacks for other versions/datapacks.
-    * Any uncertainty resolves to {@code true} so a real ship is never lost.
     */
    /**
-    * Centre of the real end-ship piece's bounding box, in world coordinates.
+    * Target coordinate of the real end-ship piece in world coordinates.
     * The city's placement start is the tower base; the ship hangs off a tower
     * and is often 20-60 blocks away, so navigation must use this instead.
-    * Uses exactly the same identification rules as {@link #hasShipPiece}.
+    * Uses the lower cabin height ({@code box.minY() + 6}) rather than the tall
+    * mast midpoint so vertical approach and entity tracking target the cabin
+    * where the elytra item frame actually hangs.
     */
    private static BlockPos shipPosOf(StructureStart start) {
       if (start == null) {
@@ -604,8 +635,7 @@ public final class VanillaStructureLocator {
             if (!ship) {
                String s = describePiece(piece).toLowerCase(Locale.ROOT);
                ship = s.contains("end_city/ship") || s.contains("end_city\\ship")
-                  || s.contains("end_ship")
-                  || (s.contains("ship") && !s.contains("shipwreck"));
+                  || s.contains("end_ship");
             }
             if (!ship) {
                continue;
@@ -615,7 +645,8 @@ public final class VanillaStructureLocator {
                return null;
             }
             BlockPos centre = box.getCenter();
-            return new BlockPos(centre.getX(), centre.getY(), centre.getZ());
+            int cabinY = Math.min(centre.getY(), box.minY() + 6);
+            return new BlockPos(centre.getX(), cabinY, centre.getZ());
          }
       } catch (Throwable t) {
          LOGGER.warn("[guidance] ship bounding box unavailable", t);
@@ -625,7 +656,7 @@ public final class VanillaStructureLocator {
 
    private static boolean hasShipPiece(StructureStart start) {
       if (start == null) {
-         return true;
+         return false;
       }
       try {
          for (StructurePiece piece : start.getPieces()) {
@@ -644,12 +675,9 @@ public final class VanillaStructureLocator {
             if (s.contains("end_city/ship") || s.contains("end_city\\ship") || s.contains("end_ship")) {
                return true;
             }
-            if (s.contains("ship") && !s.contains("shipwreck")) {
-               return true;
-            }
          }
       } catch (Throwable t) {
-         return true;
+         return false;
       }
       return false;
    }
@@ -722,7 +750,8 @@ public final class VanillaStructureLocator {
       List<Hit> out,
       int[] budget,
       long deadline,
-      boolean shipOnly
+      boolean shipOnly,
+      Set<Long> excludedPos
    ) {
       int spacing = Math.max(1, spread.spacing());
       int cellX = Math.floorDiv(origin.getX() >> 4, spacing);
@@ -732,11 +761,7 @@ public final class VanillaStructureLocator {
       for (int ring = 0; ring <= MAX_NEAREST_RINGS; ring++) {
          // One extra ring after the first hit is enough to catch closer cells;
          // keep going when fewer results than requested have been found.
-         // For the ship scan "results" means ship-bearing hits, with a hard cap
-         // on raw hits so a ship-less region cannot spin until the deadline.
-         int useful = shipOnly ? countShips(out) : out.size();
-         if (firstHitRing >= 0 && ring > firstHitRing + 1
-            && (useful >= need || out.size() >= need * SHIP_SCAN_FACTOR)) {
+         if (firstHitRing >= 0 && ring > firstHitRing + 1 && out.size() >= need) {
             return;
          }
          if (budget[0] <= 0 || System.currentTimeMillis() > deadline) {
@@ -760,13 +785,22 @@ public final class VanillaStructureLocator {
             if (generated == null || !generated.holder().unwrapKey().map(spec.keys()::contains).orElse(false)) {
                continue;
             }
+            if (shipOnly && (!generated.hasShip() || generated.shipPos() == null)) {
+               continue;
+            }
             BlockPos located = spread.getLocatePos(candidate);
             int y = spec.surface()
                ? ctx.generator().getBaseHeight(located.getX(), located.getZ(), Types.WORLD_SURFACE_WG, ctx.height(), ctx.randomState())
                : spec.fixedY();
             BlockPos pos = new BlockPos(located.getX(), y, located.getZ());
+            if (shipOnly && excludedPos != null && !excludedPos.isEmpty()) {
+               if (excludedPos.contains(pos.asLong()) || excludedPos.contains(generated.shipPos().asLong())) {
+                  continue;
+               }
+            }
+            BlockPos distTarget = shipOnly && generated.shipPos() != null ? generated.shipPos() : pos;
             out.add(new Hit(
-               pos, horizontalDistance(origin, pos),
+               pos, horizontalDistance(origin, distTarget),
                generated.hasShip(), generated.shipKnown(), generated.shipPos()
             ));
             hitThisRing = true;

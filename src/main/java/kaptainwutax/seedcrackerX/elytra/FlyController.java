@@ -673,26 +673,64 @@ public final class FlyController {
       double dz = columnZ - player.getZ();
       double horiz = Math.sqrt(dx * dx + dz * dz);
       double dy = targetFeetY - player.getY();
-      if (horiz <= 0.35 && Math.abs(dy) <= 0.45) {
+      if (horiz <= 0.30 && Math.abs(dy) <= 0.42) {
          this.hover(mc, player, false);
          this.setNav(NavState.CLEAR);
          return ColumnState.ARRIVED;
       }
 
+      int colBlockX = Mth.floor(columnX);
+      int colBlockZ = Mth.floor(columnZ);
+      boolean centeredInColumn = Math.abs(dx) <= 0.15 && Math.abs(dz) <= 0.15;
+
       BlockPos blocker = null;
-      if (horiz > 0.35) {
-         // Still off-column: clear only the blocks on the short horizontal slide.
-         Vec3 alignPoint = new Vec3(columnX, player.getY(), columnZ);
-         blocker = this.findNextBlockToMine(
-            level, player, BlockPos.containing(alignPoint), alignPoint
-         );
+      if (!centeredInColumn && horiz > 0.22) {
+         // Slide onto the exact 1x1 column centre (bx + 0.5, bz + 0.5) before vertical digging
+         // so the player's 0.68-wide AABB never clips adjacent cabin walls.
+         int feetY = Mth.floor(player.getY() + 0.05);
+         BlockPos headTarget = new BlockPos(colBlockX, feetY + 1, colBlockZ);
+         BlockPos feetTarget = new BlockPos(colBlockX, feetY, colBlockZ);
+         if (!isPassableBlock(level, headTarget)) {
+            blocker = headTarget;
+         } else if (!isPassableBlock(level, feetTarget)) {
+            blocker = feetTarget;
+         } else if (horiz > 0.45) {
+            Vec3 alignPoint = new Vec3(columnX, player.getY(), columnZ);
+            blocker = this.findNextBlockToMine(
+               level, player, BlockPos.containing(alignPoint), alignPoint
+            );
+         }
       } else {
-         // On-column: sweep the player's FULL AABB one block up/down the shaft.
-         // A 0.68-wide body usually straddles two X/Z columns, so checking only
-         // the centre block would leave a ledge that silently pins the player.
-         double stepY = player.getY() + (dy < 0.0 ? -1.0 : 1.0);
-         Vec3 step = new Vec3(columnX, stepY, columnZ);
-         blocker = this.findNextBlockToMine(level, player, BlockPos.containing(step), step);
+         // Centered in (colBlockX, colBlockZ): check the 1x1 vertical shaft in the direction of travel.
+         if (dy < 0.0) {
+            int startY = Mth.floor(player.getY() + 0.5);
+            int minTargetY = Mth.floor(targetFeetY + 0.05);
+            int endY = Math.max(minTargetY, Mth.floor(player.getY() - 1.15));
+            for (int y = startY; y >= endY; y--) {
+               BlockPos candidate = new BlockPos(colBlockX, y, colBlockZ);
+               if (!isPassableBlock(level, candidate)) {
+                  blocker = candidate;
+                  break;
+               }
+            }
+         } else {
+            int startY = Mth.floor(player.getY() + 1.0);
+            int maxTargetY = Mth.floor(targetFeetY + PLAYER_HEIGHT);
+            int endY = Math.min(maxTargetY, Mth.floor(player.getY() + PLAYER_HEIGHT + 1.1));
+            for (int y = startY; y <= endY; y++) {
+               BlockPos candidate = new BlockPos(colBlockX, y, colBlockZ);
+               if (!isPassableBlock(level, candidate)) {
+                  blocker = candidate;
+                  break;
+               }
+            }
+         }
+         if (blocker != null) {
+            BlockPos occluder = this.findOccluder(level, player, blocker);
+            if (occluder != null) {
+               blocker = occluder;
+            }
+         }
       }
 
       if (blocker != null) {
@@ -711,13 +749,12 @@ public final class FlyController {
          return ColumnState.MINING;
       }
 
-      // Shaft is clear for the next two blocks: keep X/Z pinned and move only
-      // along the column. steerRaw (not steer) so an ongoing break is not reset.
+      // Shaft is clear: keep X/Z pinned to (columnX, columnZ) and move along the column.
       this.stopMining(mc);
-      Vec3 stepTarget = horiz > 0.35
+      Vec3 stepTarget = (!centeredInColumn && horiz > 0.25)
          ? new Vec3(columnX, player.getY(), columnZ)
          : new Vec3(columnX, targetFeetY, columnZ);
-      this.steerRaw(mc, player, stepTarget, true, 0.15);
+      this.steerRaw(mc, player, stepTarget, Math.abs(dy) < 5.0 || horiz > 0.25, 0.14);
       this.setNav(NavState.CLEAR);
       return ColumnState.MOVING;
    }
