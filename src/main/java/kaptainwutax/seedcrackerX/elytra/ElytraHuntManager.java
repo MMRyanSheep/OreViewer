@@ -26,8 +26,6 @@ import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.decoration.ItemFrame;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
-import net.minecraft.world.inventory.ContainerInput;
-import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.SwingAnimation;
@@ -217,7 +215,6 @@ public final class ElytraHuntManager {
    private int collected;
    /** 0 = keep collecting until {@code /os qc 停止}. */
    private int targetElytra;
-   private boolean equipAttempted;
    private int candidateCount = DEFAULT_CANDIDATES;
    private int attempts;
    private int rescanRound;
@@ -360,7 +357,6 @@ public final class ElytraHuntManager {
          );
       }
       this.collected = 0;
-      this.equipAttempted = false;
 
       this.queue.clear();
       this.tried.clear();
@@ -1786,13 +1782,6 @@ public final class ElytraHuntManager {
          this.collected, now - this.globalStartMs, this.attempts
       );
 
-      if (!this.equipAttempted) {
-         this.equipAttempted = true;
-         this.tryEquip(mc, player);
-         // The container click moves the stack between slots synchronously;
-         // re-reading the baseline keeps the "inventory count increased" test exact.
-         this.baselineElytra = countElytra(player);
-      }
       if (this.targetElytra > 0 && this.collected >= this.targetElytra) {
          this.beginDeparture(player, now, "已达目标数量 " + this.targetElytra + " 个");
          return;
@@ -1857,22 +1846,6 @@ public final class ElytraHuntManager {
       this.nextCandidate(player, now);
    }
 
-   /** Optional and non-blocking: if the container API misbehaves, just tell the player. */
-   private void tryEquip(Minecraft mc, LocalPlayer player) {
-      try {
-         if (player != null && player.containerMenu instanceof InventoryMenu && mc.gameMode != null) {
-            int invSlot = this.findElytraSlot(player);
-            if (invSlot >= 0) {
-               int menuSlot = invSlot < 9 ? invSlot + 36 : invSlot;
-               mc.gameMode.handleContainerInput(0, menuSlot, 0, ContainerInput.QUICK_MOVE, player);
-               this.info("已尝试自动装备一个鞘翅（快捷移动至胸甲槽）", ChatFormatting.GREEN);
-            }
-         }
-      } catch (Throwable t) {
-         this.info("自动装备跳过，请手动装备鞘翅", ChatFormatting.YELLOW);
-      }
-   }
-
    private void finish(Minecraft mc, String reason) {
       this.lastReason = reason;
       this.phase = Phase.DONE;
@@ -1883,17 +1856,6 @@ public final class ElytraHuntManager {
          ChatFormatting.GREEN
       );
       LOGGER.info("[elytra] finished: {} (collected {})", reason, this.collected);
-   }
-
-   private int findElytraSlot(LocalPlayer player) {
-      Inventory inventory = player.getInventory();
-      for (int i = 0; i < 36; i++) {
-         ItemStack stack = inventory.getItem(i);
-         if (stack != null && stack.getItem() == Items.ELYTRA) {
-            return i;
-         }
-      }
-      return -1;
    }
 
    private void abort(String reason) {
