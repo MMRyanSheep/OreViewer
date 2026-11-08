@@ -12,6 +12,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
 import kaptainwutax.seedcrackerX.automine.BaritoneBridge;
+import kaptainwutax.seedcrackerX.automine.ShulkerAutoStore;
 import kaptainwutax.seedcrackerX.command.ClientCommand;
 import kaptainwutax.seedcrackerX.fly.FlyManager;
 import kaptainwutax.seedcrackerX.guidance.VanillaStructureLocator;
@@ -134,9 +135,17 @@ public final class ElytraHuntManager {
    private static final long DROP_DIG_MS = 8000L;
    private static final double REBIND_RADIUS = 8.0;
    private static final double DROP_RADIUS = 48.0;
+   /** Budget for clearing every guard around a located elytra before searching it. */
    private static final long THREAT_TIMEOUT_MS = 25000L;
    private static final long COMBAT_COOLDOWN_MS = 550L;
    private static final double THREAT_ATTACK_RANGE_SQ = 20.25;
+   /**
+    * Once the shaft reaches the elytra, any living Shulker this close can fire
+    * levitation missiles. Levitation overrides our flight steering and wrecks
+    * pathfinding, so all of them must die before the state machine is allowed
+    * to look for / approach / pick up the elytra.
+    */
+   private static final double GUARD_CLEAR_RADIUS_SQ = 24.0 * 24.0;
    private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
    // Approach points around the ship: stay outside the hull but well inside
    // entity tracking range. A new angle is used for every re-scan attempt.
@@ -501,6 +510,7 @@ public final class ElytraHuntManager {
             + " " + this.flight.miningDiagnostics()
             + " 清怪计时=" + (this.threatSinceMs == 0L
                ? 0 : (System.currentTimeMillis() - this.threatSinceMs)) + "ms"
+            + " 守卫优先=" + this.guardClearanceActive()
             + " 准星=" + (mc.hitResult == null ? "null" : mc.hitResult.getType()),
          ChatFormatting.AQUA
       );
@@ -1280,9 +1290,58 @@ public final class ElytraHuntManager {
       return player.position().add(0.0, 0.0, 1.0);
    }
 
+   /** True in the close-quarters stages where levitating guards must be cleared first. */
+   private boolean guardClearanceActive() {
+      return this.phase == Phase.VERIFYING
+         || this.phase == Phase.APPROACHING
+         || this.phase == Phase.TAKING;
+   }
+
+   /**
+    * Nearest living Shulker that can actually see us (and therefore fire
+    * levitation missiles) inside the clearance radius. Unlike
+    * {@link FlyController#findThreat}, this does not require the mob to sit on
+    * the ray to the current waypoint: a guard beside the elytra is just as
+    * dangerous while we are digging the shaft, scanning for the frame or
+    * chasing the dropped item.
+    */
+   private Entity findGuard(ClientLevel level, LocalPlayer player) {
+      if (level == null) {
+         return null;
+      }
+      Entity best = null;
+      double bestDistance = Double.MAX_VALUE;
+      for (Entity entity : level.entitiesForRendering()) {
+         if (entity == null || entity.isRemoved() || !entity.isAlive()
+            || entity.getType() != EntityTypes.SHULKER) {
+            continue;
+         }
+         double distance = player.distanceToSqr(entity);
+         if (distance > GUARD_CLEAR_RADIUS_SQ || distance >= bestDistance) {
+            continue;
+         }
+         if (!hasUnobstructedSight(level, player, entity.getBoundingBox().getCenter())) {
+            continue;
+         }
+         best = entity;
+         bestDistance = distance;
+      }
+      return best;
+   }
+
    /**
     * Clear the shulker that blocks the path. FlyController tries a detour first;
     * this is the fallback for a guard tucked inside the ship hull.
+    *
+    * <p>Once we are beside the elytra (VERIFYING / APPROACHING / TAKING) this
+    * becomes a hard gate: every nearby living Shulker is killed <b>before</b>
+    * the state machine scans for the frame, digs the vertical shaft, attacks
+    * the frame or chases the dropped elytra. A Shulker's levitation effect
+    * overrides the FlyController steering, so pathfinding, mining and pickup
+    * all break if we keep looking for the elytra while the guard is alive.
+    * Combat therefore also takes priority over an active block break and a
+    * close drop chase in these phases. Farther away (long cruise) the original
+    * ray-based "only the mob blocking the path" behaviour is kept.</p>
     *
     * @return true when this tick was consumed by combat (skip the normal phase).
     */
@@ -1290,17 +1349,29 @@ public final class ElytraHuntManager {
       if (this.flight.isIgnoringThreats()) {
          return false;
       }
-      // Do not interrupt an active block break for a guard unless the guard is right in our face.
-      if (this.flight.isMining()) {
-         return false;
+      boolean clearingGuards = this.guardClearanceActive();
+      Entity threat;
+      double maxRangeSq;
+      long timeout;
+      if (clearingGuards) {
+         // Priority gate: kill the guards first, then run "find the elytra".
+         threat = this.findGuard(level, player);
+         maxRangeSq = GUARD_CLEAR_RADIUS_SQ;
+         timeout = THREAT_TIMEOUT_MS;
+      } else {
+         // Do not interrupt an active block break for a guard unless the guard is right in our face.
+         if (this.flight.isMining()) {
+            return false;
+         }
+         if (this.pickupOnly && this.droppedItem != null && !this.droppedItem.isRemoved()
+            && player.distanceToSqr(this.droppedItem) < 144.0) {
+            return false;
+         }
+         threat = FlyController.findThreat(level, player, this.threatGoal(player));
+         maxRangeSq = 64.0;
+         timeout = 12000L;
       }
-      if (this.pickupOnly && this.droppedItem != null && !this.droppedItem.isRemoved()
-         && player.distanceToSqr(this.droppedItem) < 144.0) {
-         return false;
-      }
-      Vec3 goal = this.threatGoal(player);
-      Entity threat = FlyController.findThreat(level, player, goal);
-      if (threat == null || player.distanceToSqr(threat) > 64.0) {
+      if (threat == null || player.distanceToSqr(threat) > maxRangeSq) {
          if (this.threatSinceMs != 0L) {
             LOGGER.info("[elytra] 挡路实体已清除或超出近距范围，恢复正常接近");
          }
@@ -1315,16 +1386,39 @@ public final class ElytraHuntManager {
       }
       if (this.threatSinceMs == 0L) {
          this.threatSinceMs = now;
-         LOGGER.info("[elytra] 路径被 {} id={} at {} 阻挡，开始清除",
-            threat.getClass().getSimpleName(), threat.getId(), threat.blockPosition());
+         LOGGER.info("[elytra] {}潜影贝 id={} at {}，{}",
+            clearingGuards ? "鞘翅附近有" : "路径被",
+            threat.getId(), threat.blockPosition(),
+            clearingGuards ? "先清怪再寻找鞘翅" : "开始清除挡路实体");
       }
+      // Clearing a guard is not a normal approach step: do not let it consume
+      // the verify / column / take / drop-chase timeouts.
       this.phaseStartMs = now;
+      if (this.columnSinceMs != 0L) {
+         this.columnSinceMs = now;
+         this.columnBlockedSinceMs = 0L;
+      }
       if (this.dropChaseSinceMs != 0L) {
          this.dropChaseSinceMs = now;
          this.dropProgressSinceMs = now;
       }
+      if (clearingGuards) {
+         // A paused pickup must not be judged as "hovered 6 s and still nothing".
+         this.dropCloseSinceMs = 0L;
+         this.dropDigUntilMs = 0L;
+         if (this.flight.isMining()) {
+            // End the shaft break before engaging: navigate() step 1 would
+            // otherwise resume tickMining() on the old block and never fly to
+            // the guard. hover() -> stopMining() also makes the weapon swap
+            // safe (no tool change during an active destroy progress).
+            this.flight.hover(mc, player, false);
+         }
+      }
       double eyeDist = player.getEyePosition().distanceTo(threat.getBoundingBox().getCenter());
       if (eyeDist <= 3.25) {
+         // hover() calls stopMining(): end the block break BEFORE switching to a
+         // weapon, otherwise the server resets the destroy progress (and the
+         // tool swap would be overwritten by the mining loop anyway).
          this.flight.hover(mc, player, false);
          FlyController.aimAt(player, threat);
          if (mc.gameMode != null
@@ -1343,8 +1437,10 @@ public final class ElytraHuntManager {
          Vec3 stand = threat.position().add(toPlayer.scale(2.2 / len)).subtract(0.0, 0.5, 0.0);
          this.flight.navigate(mc, level, player, stand, true, true);
       }
-      this.throttledInfo("前方有潜影贝挡路，正在清除…", now);
-      if (now - this.threatSinceMs > 12000L) {
+      this.throttledInfo(
+         clearingGuards ? "鞘翅旁有潜影贝，优先击杀后再寻找鞘翅…" : "前方有潜影贝挡路，正在清除…", now
+      );
+      if (now - this.threatSinceMs > timeout) {
          LOGGER.warn("[elytra] 清除挡路实体超时 {} ms，改为无视守卫直接取物", now - this.threatSinceMs);
          this.threatSinceMs = 0L;
          this.flight.ignoreThreatsFor(18000L);
