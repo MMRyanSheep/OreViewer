@@ -117,6 +117,8 @@ public final class ElytraHuntManager {
    private static final long COLUMN_BLOCKED_TIMEOUT_MS = 3000L;
    private static final int DEPART_CLEARANCE = 24;
    private static final long DEPART_TIMEOUT_MS = 30000L;
+   /** Give up climbing (and continue the hunt) after this long without gaining height. */
+   private static final long DEPART_STALL_MS = 8000L;
    // Only enforced for a finite target; renewed on every pickup.
    private static final long GLOBAL_TIMEOUT_MS = 1200000L;
    private static final long LOCATE_TIMEOUT_MS = 90000L;
@@ -126,6 +128,24 @@ public final class ElytraHuntManager {
    private static final int OUTWARD_MIN_RADIUS = 1280;
    private static final double OUTWARD_ANGLE_SWING = 0.5;
    private static final int CENTER_HYSTERESIS = 512;
+   /**
+    * Outward-from-(0,0) preference. The candidate ranking still starts from
+    * nearest-neighbour distance (see {@link #takeNextCandidate}), but a ship
+    * further from the origin gets a discount while a ship back towards the
+    * already-looted centre is charged extra. The discount is capped so a
+    * distant ship can never win purely by having a large radius - that was
+    * the old rule, which produced 4000+ block zig-zag flights.
+    */
+   private static final double OUTWARD_BIAS_FACTOR = 0.5;
+   private static final double OUTWARD_BIAS_CAP = 700.0;
+   /**
+    * Hard ceiling on the extra flight the outward preference may cost: only
+    * ships within this many blocks of the closest untried ship compete. This
+    * is what keeps the 4000+ block cross-quadrant zig-zag from coming back.
+    */
+   private static final double OUTWARD_DETOUR_MAX = 900.0;
+   /** How far the ring-search centre is nudged outwards on a refill/rescan. */
+   private static final int OUTWARD_SEARCH_LEAD = 400;
    // Continuous collection keeps pushing outwards as nearby ships get looted.
    private static final int MAX_RESCAN_ROUNDS = 256;
    private static final int MAX_SWEEPS = 3;
@@ -209,6 +229,8 @@ public final class ElytraHuntManager {
    private final AtomicBoolean scanning = new AtomicBoolean(false);
    private final Deque<CityCandidate> queue = new ArrayDeque<>();
    private final Set<Long> tried = new HashSet<>();
+   /** Inner-ring ships skipped by the outward floor; excluded from later locates so they cannot thrash. */
+   private final Set<Long> inwardSkipped = new HashSet<>();
 
    private volatile Phase phase = Phase.IDLE;
    private volatile LocateResult pendingResult;
@@ -242,6 +264,10 @@ public final class ElytraHuntManager {
    private int outwardRadius;
    /** Candidates closer to (0,0) than this are treated as already explored. */
    private int minTargetRadius;
+   /** Furthest radius from (0,0) reached during this run; never decreases. */
+   private int maxRadiusSeen;
+   /** Radial gain (candidate radius - player radius) of the last chosen ship. */
+   private double lastRadialGain;
    private int attackAttempts;
    private long phaseStartMs;
    /** Absolute deadline for the current cruise; renewed whenever the ship gets closer. */
@@ -284,6 +310,9 @@ public final class ElytraHuntManager {
    private double departZ;
    private double departY;
    private long departSinceMs;
+   /** Highest Y reached during the departure, used for progress-based stall detection. */
+   private double departBestY;
+   private long departProgressMs;
    /** Non-null = finish with this reason once the vertical departure completes. */
    private String departFinishReason;
    /** 0 = not paused; otherwise the wall-clock timestamp of the last paused tick. */
@@ -319,6 +348,8 @@ public final class ElytraHuntManager {
       this.columnSinceMs = 0L;
       this.columnBlockedSinceMs = 0L;
       this.departSinceMs = 0L;
+      this.departBestY = 0.0;
+      this.departProgressMs = 0L;
       this.departFinishReason = null;
    }
 
@@ -388,6 +419,7 @@ public final class ElytraHuntManager {
       this.autoEatPauseMs = 0L;
       this.queue.clear();
       this.tried.clear();
+      this.inwardSkipped.clear();
       this.attempts = 0;
       this.rescanRound = 0;
       this.lastReason = null;
@@ -399,6 +431,9 @@ public final class ElytraHuntManager {
       this.outwardBaseRadius = (int)Math.hypot(player.getX(), player.getZ());
       this.outwardRadius = this.outwardBaseRadius;
       this.minTargetRadius = 0;
+      this.maxRadiusSeen = this.outwardBaseRadius;
+      this.lastRadialGain = 0.0;
+      this.updateOutwardFloor(player);
       this.lastOrigin = player.blockPosition();
       VanillaStructureLocator.clearCityCache();
       this.phase = Phase.LOCATING;
@@ -489,6 +524,9 @@ public final class ElytraHuntManager {
             + " 外推轮次=" + this.rescanRound
             + " 外推半径=" + this.outwardRadius
             + " 中心门槛=" + this.minTargetRadius
+            + " 最远半径=" + this.maxRadiusSeen
+            + " 内侧跳过=" + (this.inwardSkipped.size() / 2)
+            + " 本次径向=" + (int)this.lastRadialGain
             + " 外推方位=" + (int)Math.toDegrees(this.outwardAngle) + "°"
             + " 巡航高度=" + this.flight.cruiseY()
             + " 玩家高度=" + (player == null ? -1 : (int)player.getY())
@@ -521,9 +559,12 @@ public final class ElytraHuntManager {
             + " 垂直列=(" + String.format("%.1f", this.columnX) + ", " + String.format("%.1f", this.columnZ) + ")"
             + " 列顶=" + (int)this.columnTopY
             + " 列底=" + (int)this.columnFloorY
+            + " 飞离起点=(" + String.format("%.1f", this.departX) + ", " + String.format("%.1f", this.departZ) + ")"
             + " 飞离目标Y=" + (int)this.departY
+            + " 飞离最高Y=" + (int)this.departBestY
             + " 飞离计时=" + (this.departSinceMs == 0L
-               ? 0 : (System.currentTimeMillis() - this.departSinceMs)) + "ms",
+               ? 0 : (System.currentTimeMillis() - this.departSinceMs)) + "ms"
+            + " " + this.flight.verticalDiagnostics(),
          ChatFormatting.AQUA
       );
       this.info(
@@ -606,6 +647,7 @@ public final class ElytraHuntManager {
       }
       if (this.departSinceMs != 0L) {
          this.departSinceMs = now;
+         this.departProgressMs = now;
       }
       if (this.dropChaseSinceMs != 0L) {
          this.dropChaseSinceMs = now;
@@ -674,6 +716,7 @@ public final class ElytraHuntManager {
       this.columnSinceMs = shiftTime(this.columnSinceMs, delta);
       this.columnBlockedSinceMs = shiftTime(this.columnBlockedSinceMs, delta);
       this.departSinceMs = shiftTime(this.departSinceMs, delta);
+      this.departProgressMs = shiftTime(this.departProgressMs, delta);
    }
 
    private static long shiftTime(long value, long delta) {
@@ -714,6 +757,9 @@ public final class ElytraHuntManager {
          this.abort("玩家不可用 / 已死亡 / 离开末地");
          return;
       }
+      // Monotone record of how far out we have already been. Flying back towards
+      // (0,0) afterwards must never drag the "already explored" floor back in.
+      this.updateOutwardFloor(player);
       if (this.targetElytra > 0 && now - this.globalStartMs > GLOBAL_TIMEOUT_MS) {
          this.abort("单次运行总时限已到（已收集 " + this.collected + " 个）");
          return;
@@ -737,6 +783,7 @@ public final class ElytraHuntManager {
          }
          if (this.departSinceMs != 0L) {
             this.departSinceMs = now;
+            this.departProgressMs = now;
          }
          if (this.dropChaseSinceMs != 0L) {
             this.dropChaseSinceMs = now;
@@ -773,6 +820,7 @@ public final class ElytraHuntManager {
       final BlockPos fixedOrigin = origin;
       final int fixedNeed = need;
       final Set<Long> excluded = new HashSet<>(this.tried);
+      excluded.addAll(this.inwardSkipped);
       this.pendingResult = null;
       this.scanExecutor.execute(() -> {
          this.scanning.set(true);
@@ -812,12 +860,23 @@ public final class ElytraHuntManager {
             continue;
          }
          BlockPos target = candidate.target();
-         // Never accept a coordinate inside the End central island exclusion zone (1024-block radius).
-         if (Math.hypot(target.getX(), target.getZ()) <= CENTRAL_ISLAND_EXCLUSION_RADIUS) {
-            continue;
-         }
          long cityKey = candidate.pos().asLong();
          long shipKey = target.asLong();
+         double radius = Math.hypot(target.getX(), target.getZ());
+         // Never accept a coordinate inside the End central island exclusion zone (1024-block radius).
+         if (radius <= CENTRAL_ISLAND_EXCLUSION_RADIUS) {
+            continue;
+         }
+         // Outward drift: rings we already left behind are treated as explored.
+         // Hysteresis keeps ships only slightly inward still eligible, so the
+         // nearest-neighbour router is not starved of candidates. Skipped ships
+         // are excluded from later locate calls (but NOT marked visited) so the
+         // ring scan looks further out instead of returning the same inner ones.
+         if (radius + CENTER_HYSTERESIS < this.minTargetRadius) {
+            this.inwardSkipped.add(cityKey);
+            this.inwardSkipped.add(shipKey);
+            continue;
+         }
          if (this.tried.contains(cityKey) || this.tried.contains(shipKey)) {
             continue;
          }
@@ -884,8 +943,9 @@ public final class ElytraHuntManager {
       this.pendingResult = null;
       this.phase = Phase.LOCATING;
       this.info(
-         "当前批次候选已飞完，正围绕 (" + this.lastOrigin.getX() + ", " + this.lastOrigin.getZ()
-            + ") 自动搜索下一批未访问的带船末地城（第 " + this.rescanRound + " 轮）…",
+         "当前批次候选已飞完，沿远离 (0,0) 方向外推至 (" + this.lastOrigin.getX() + ", " + this.lastOrigin.getZ()
+            + ") 重新定位（第 " + this.rescanRound + " 轮，半径 " + this.outwardRadius
+            + " 格，内侧门槛 " + this.minTargetRadius + " 格）…",
          ChatFormatting.YELLOW
       );
       this.submitLocating(this.lastOrigin, Math.min(MAX_QUEUE_SIZE, this.candidateCount + this.rescanRound * 4));
@@ -901,6 +961,20 @@ public final class ElytraHuntManager {
    }
 
    /**
+    * Raises the "already explored" radius floor monotonically. {@link #maxRadiusSeen}
+    * records the furthest point reached in this run and {@link #outwardRadius} the
+    * furthest search origin, so flying back towards (0,0) can never lower the
+    * floor again. The hysteresis band keeps a ship only slightly inward eligible.
+    */
+   private void updateOutwardFloor(LocalPlayer player) {
+      if (player != null) {
+         this.maxRadiusSeen = Math.max(this.maxRadiusSeen, (int)Math.hypot(player.getX(), player.getZ()));
+      }
+      int reached = Math.max(this.outwardBaseRadius, Math.max(this.maxRadiusSeen, this.outwardRadius));
+      this.minTargetRadius = Math.max(this.minTargetRadius, reached - CENTER_HYSTERESIS);
+   }
+
+   /**
     * Computes the search centre for locating untried End Ships.
     *
     * <p>Because {@link VanillaStructureLocator#findEndCitiesWithShip} now
@@ -909,9 +983,14 @@ public final class ElytraHuntManager {
     * closest untried ships without flying thousands of blocks away. If a round
     * around the player's position ever yields zero results, subsequent rounds
     * step outward along {@link #outwardAngle}.</p>
+    *
+    * <p>Every refill/rescan also nudges the centre a little further out along
+    * that bearing, so the ring expansion itself leans away from (0,0) instead
+    * of drifting back into the already-looted centre.</p>
     */
    private BlockPos searchOriginFor(LocalPlayer player, int round) {
       if (player == null) {
+         this.updateOutwardFloor(null);
          return this.lastOrigin != null ? this.lastOrigin : new BlockPos(OUTWARD_MIN_RADIUS, DEFAULT_SHIP_Y, 0);
       }
       double px = player.getX();
@@ -922,41 +1001,76 @@ public final class ElytraHuntManager {
       }
       if (round <= 1 && playerRadius >= OUTWARD_MIN_RADIUS) {
          this.outwardRadius = (int)playerRadius;
-         return player.blockPosition();
+         double lead = round >= 1 ? OUTWARD_SEARCH_LEAD : 0.0;
+         BlockPos origin = lead > 0.0
+            ? new BlockPos(
+               (int)(px + Math.cos(this.outwardAngle) * lead), player.getBlockY(),
+               (int)(pz + Math.sin(this.outwardAngle) * lead)
+            )
+            : player.blockPosition();
+         this.updateOutwardFloor(player);
+         return origin;
       }
       int baseRadius = Math.max((int)playerRadius, OUTWARD_MIN_RADIUS);
       int extraPush = Math.max(0, round - 1) * ORIGIN_PUSH;
       int radius = Math.max(baseRadius + extraPush, this.outwardRadius + (round > 1 ? ORIGIN_PUSH / 2 : 0));
       this.outwardRadius = radius;
       double angle = this.outwardAngle + (round > 1 ? Math.sin(round * 0.8) * OUTWARD_ANGLE_SWING : 0.0);
-      return new BlockPos(
+      BlockPos origin = new BlockPos(
          (int)(Math.cos(angle) * radius), player.getBlockY(), (int)(Math.sin(angle) * radius)
       );
+      this.updateOutwardFloor(player);
+      return origin;
    }
 
    /**
-    * Pick the untried candidate closest to the player's current position
-    * (nearest-neighbour routing).
+    * Nearest-neighbour routing with a bounded outward-from-(0,0) bias.
     *
-    * <p>The old rule picked the candidate with the largest radius from (0,0),
-    * which caused 4000+ block zig-zag flights across opposite quadrants and
-    * trapped the smallest-radius candidate in {@code queue[0]} until it was
-    * always chosen last as candidate #12.</p>
+    * <p>The plain farthest-radius rule was removed by the routing optimisation
+    * because it caused 4000+ block zig-zag flights across opposite quadrants.
+    * We keep nearest-neighbour as the dominant term and only let ships within
+    * {@link #OUTWARD_DETOUR_MAX} blocks of the closest one compete. Inside that
+    * bounded set a ship continuing outwards is discounted and one heading back
+    * inwards is surcharged, by at most {@link #OUTWARD_BIAS_CAP}. Combined with
+    * the monotone floor in {@link #consumeLocateResult} and the outward-shifted
+    * search centre this restores the "keep moving away from 0,0" tendency
+    * without bringing the zig-zag back.</p>
     */
    private CityCandidate takeNextCandidate(LocalPlayer player) {
       List<CityCandidate> all = new ArrayList<>(this.queue);
       double refX = player != null ? player.getX() : (this.lastOrigin != null ? this.lastOrigin.getX() : 0.0);
       double refZ = player != null ? player.getZ() : (this.lastOrigin != null ? this.lastOrigin.getZ() : 0.0);
-      int bestIndex = 0;
-      double bestDist = Double.MAX_VALUE;
-      for (int i = 0; i < all.size(); i++) {
+      double refRadius = Math.hypot(refX, refZ);
+      int size = all.size();
+      double[] dist = new double[size];
+      double[] gain = new double[size];
+      double nearest = Double.MAX_VALUE;
+      for (int i = 0; i < size; i++) {
          BlockPos target = all.get(i).target();
-         double d = Math.hypot(target.getX() + 0.5 - refX, target.getZ() + 0.5 - refZ);
-         if (d < bestDist) {
-            bestDist = d;
+         double tx = target.getX() + 0.5;
+         double tz = target.getZ() + 0.5;
+         dist[i] = Math.hypot(tx - refX, tz - refZ);
+         gain[i] = Math.hypot(tx, tz) - refRadius;
+         nearest = Math.min(nearest, dist[i]);
+      }
+      double limit = nearest + OUTWARD_DETOUR_MAX;
+      int bestIndex = 0;
+      double bestScore = Double.MAX_VALUE;
+      double bestGain = 0.0;
+      for (int i = 0; i < size; i++) {
+         if (dist[i] > limit) {
+            continue;
+         }
+         double bias = Math.max(-OUTWARD_BIAS_CAP,
+            Math.min(OUTWARD_BIAS_CAP, gain[i] * OUTWARD_BIAS_FACTOR));
+         double score = dist[i] - bias;
+         if (score < bestScore) {
+            bestScore = score;
+            bestGain = gain[i];
             bestIndex = i;
          }
       }
+      this.lastRadialGain = bestGain;
       CityCandidate chosen = all.remove(bestIndex);
       this.queue.clear();
       this.queue.addAll(all);
@@ -2090,19 +2204,23 @@ public final class ElytraHuntManager {
    }
 
    /**
-    * Step 3: after a successful pickup, climb straight up out of the ship along
-    * the already-cleared 1x1 block-centered shaft before resuming the hunt (or finishing).
+    * Step 3: after a successful pickup, climb straight up out of the ship.
+    *
+    * <p>Uses {@link FlyController#climbOut} instead of {@code travelColumn}:
+    * Tweakeroo's fly-speed tweak makes one tick move several blocks, so the old
+    * fixed 0.42-block ARRIVED window and the 1x1 column alignment step could
+    * never complete, and the fixed-thrust controller ended up alternating
+    * jump / sneak (crouch / stand) forever at a single altitude.</p>
     */
    private void beginDeparture(LocalPlayer player, long now, String finishReason) {
-      if (this.columnX != 0.0 && Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ()) <= 1.2) {
-         this.departX = this.columnX;
-         this.departZ = this.columnZ;
-      } else {
-         this.departX = Math.floor(player.getX()) + 0.5;
-         this.departZ = Math.floor(player.getZ()) + 0.5;
-      }
+      // climbOut climbs from the CURRENT position - no block-centre alignment
+      // is needed because the shaft was already dug on the way down.
+      this.departX = player.getX();
+      this.departZ = player.getZ();
       this.departY = Math.max(player.getY() + DEPART_CLEARANCE, this.flight.cruiseY());
       this.departSinceMs = now;
+      this.departBestY = player.getY();
+      this.departProgressMs = now;
       this.departFinishReason = finishReason;
       this.phaseStartMs = now;
       this.phase = Phase.DEPARTING;
@@ -2117,23 +2235,33 @@ public final class ElytraHuntManager {
          && ShulkerAutoStore.INSTANCE.canStoreInventory(player)) {
          if (ShulkerAutoStore.INSTANCE.tryTriggerImmediate()) {
             this.flight.hover(mc, player, true);
+            this.departProgressMs = now;
             return;
          }
       }
 
-      FlyController.ColumnState column = this.flight.travelColumn(
-         mc, level, player, this.departX, this.departZ, this.departY, true
-      );
-      if (column != FlyController.ColumnState.ARRIVED
-         && now - this.departSinceMs <= DEPART_TIMEOUT_MS) {
+      boolean arrived = this.flight.climbOut(mc, level, player, this.departY);
+      // Mining a ceiling block is progress too; only a genuine height stall
+      // (unbreakable roof, missing chunk, anti-cheat) should end the departure.
+      if (this.flight.isMining() || player.getY() > this.departBestY + 0.25) {
+         this.departBestY = Math.max(this.departBestY, player.getY());
+         this.departProgressMs = now;
+      }
+      boolean stalled = now - this.departProgressMs > DEPART_STALL_MS;
+      boolean timedOut = now - this.departSinceMs > DEPART_TIMEOUT_MS;
+      if (!arrived && !stalled && !timedOut) {
          this.throttledInfo(
             "正在垂直向上飞离（还差 " + (int)Math.max(0.0, this.departY - player.getY()) + " 格）…", now
          );
          return;
       }
+      if (stalled && !arrived) {
+         this.info("垂直飞离受阻，已跳过剩余爬升…", ChatFormatting.YELLOW);
+      }
       String reason = this.departFinishReason;
       this.departFinishReason = null;
       this.departSinceMs = 0L;
+      this.departProgressMs = 0L;
       this.flight.hover(mc, player, true);
       if (reason == null && player.getInventory().getFreeSlot() < 0 && !ShulkerAutoStore.INSTANCE.canStoreInventory(player)) {
          reason = "背包已满（且无可用潜影盒可存入），无法继续拾取";

@@ -454,6 +454,31 @@ public final class FlyController {
    private static final int MAX_LIFT_RETRIES = 4;
    private static final int LIFT_STEP = 18;
 
+   /**
+    * Vertical creative-flight physics in MC 26.3 (decompiled from
+    * {@code LocalPlayer.aiStep()} and {@code Player.travel()}):
+    * <ul>
+    *   <li>holding jump / sneak adds {@code 3 * flyingSpeed} to vy for that tick;</li>
+    *   <li>after moving, {@code Player.travel()} keeps only 60% of that vy;</li>
+    *   <li>with no vertical input vy decays by 0.6 per tick, so the remaining
+    *       coast distance is {@code v * (1 + .6 + .36 + ...) = 2.5 * v}.</li>
+    * </ul>
+    * Tweakeroo's fly-speed tweak scales the impulse but NOT the 0.6 drag.
+    * The old controller predicted the coast with {@code 1.5 * vy} and used a
+    * fixed 0.08 brake threshold, which at high fly speeds converges to a stable
+    * jump/sneak 2-cycle: the player crouches and stands forever at one height.
+    */
+   private static final double FLY_VERTICAL_KEEP = 0.6;
+   private static final double FLY_COAST_FACTOR = 1.0 / (1.0 - FLY_VERTICAL_KEEP); // 2.5
+   private static final double DEFAULT_VERTICAL_IMPULSE = 0.15;                   // 3 * 0.05 (vanilla)
+   private static final double MIN_VERTICAL_BAND = 0.42;
+   /** Cap for the departure arrival band, even at absurd fly speeds. */
+   private static final double MAX_DEPART_BAND = 8.0;
+   /** Keep holding sneak until the feet are this close to the descent target. */
+   private static final double DESCENT_HOLD_Y = 0.20;
+   /** Horizontal tolerance for declaring the column reached. */
+   private static final double COLUMN_ARRIVE_XZ = 0.75;
+
    // Swept AABB & A* parameters
    private static final double PROBE_DISTANCE = 40.0;
    private static final double PLAYER_HALF_WIDTH = 0.34;
@@ -479,6 +504,23 @@ public final class FlyController {
    private double lastY;
    private double lastZ;
    private boolean hasLastPos;
+
+   // Adaptive vertical-flight model (Tweakeroo may change the fly speed at any time).
+   /** Decaying peak of |vy|; steady-state climb speed is ~1.5 * verticalImpulse. */
+   private double verticalSpeedPeak;
+   /** Impulse measured from the velocity change across consecutive ticks. */
+   private double observedImpulse;
+   /** Estimated per-tick vertical impulse (3 * effective flyingSpeed). */
+   private double verticalImpulse = DEFAULT_VERTICAL_IMPULSE;
+   /** -1 / 0 / +1: latched vertical input, prevents per-tick jump/sneak flipping. */
+   private int verticalDirLatch;
+   private double lastVerticalVy;
+   private int lastVerticalDir;
+   private long verticalSampleMs;
+
+   /** Last blocking block found below the player, for the /ov qc debug line. */
+   private BlockPos lastColumnBlocker;
+   private double lastColumnOffset;
 
    // 3D A* path state
    private List<BlockPos> currentPath;
@@ -528,6 +570,7 @@ public final class FlyController {
       this.ignoreThreatUntilMs = 0L;
       this.setNav(NavState.CLEAR);
       this.resetStuck();
+      this.resetVerticalModel();
    }
 
    private void clearPath() {
@@ -559,6 +602,194 @@ public final class FlyController {
    private void resetStuck() {
       this.stuckTicks = 0;
       this.hasLastPos = false;
+   }
+
+   // ------------------------------------------------------------------ adaptive vertical flight model
+
+   /**
+    * Refresh the estimate of the per-tick vertical impulse. Tweakeroo can change
+    * the fly speed either through {@code Abilities.getFlyingSpeed()} or by
+    * injecting into {@code LocalPlayer.aiStep()}, so we look at BOTH the
+    * configured value and the velocity we actually observe. In steady flight
+    * {@code |vy| = 1.5 * impulse}, hence {@code impulse = |vy| / 1.5}.
+    */
+   private void sampleVerticalSpeed(LocalPlayer player) {
+      if (player == null) {
+         return;
+      }
+      long now = System.currentTimeMillis();
+      long previousSampleMs = this.verticalSampleMs;
+      // Several controller methods can run in the same client tick; only the
+      // first one samples, otherwise the "previous velocity" would be stale.
+      if (now - previousSampleMs < 20L) {
+         return;
+      }
+      this.verticalSampleMs = now;
+
+      double vy = player.getDeltaMovement().y;
+      // v(n) = 0.6 * (v(n-1) + impulse * dir). Invert it to measure the real
+      // per-tick impulse, which also covers mods that inject into aiStep()
+      // without touching Abilities.getFlyingSpeed().
+      if (this.lastVerticalDir != 0 && previousSampleMs != 0L && now - previousSampleMs <= 120L) {
+         double observed = Math.abs(vy / FLY_VERTICAL_KEEP - this.lastVerticalVy);
+         if (observed > 0.03 && observed < 24.0) {
+            this.observedImpulse = Math.max(observed * 0.9, this.observedImpulse * 0.97);
+         }
+      }
+      this.lastVerticalVy = vy;
+
+      double configured = 3.0 * Math.max(0.02F, player.getAbilities().getFlyingSpeed());
+      if (player.getAbilities().flying) {
+         this.verticalSpeedPeak = Math.max(Math.abs(vy), this.verticalSpeedPeak * 0.97);
+      }
+      this.verticalImpulse = Mth.clamp(
+         Math.max(configured, Math.max(this.observedImpulse, this.verticalSpeedPeak / 1.5)),
+         0.05, 24.0
+      );
+   }
+
+   /** Remember which vertical input was actually applied, for the next sample. */
+   private void recordVerticalInput(int dir) {
+      this.lastVerticalDir = dir;
+   }
+
+   /** Effective per-tick vertical impulse (3 * flyingSpeed), Tweakeroo-safe. */
+   public double verticalImpulse() {
+      return this.verticalImpulse;
+   }
+
+   /**
+    * Vertical tolerance that grows with the fly speed: one input tick plus the
+    * following coast already moves the player by roughly {@code 2.5 * impulse},
+    * so a fixed 0.42-block arrival window can never be hit at high speeds.
+    */
+   public double verticalArrivalBand() {
+      return Math.max(MIN_VERTICAL_BAND, 2.8 * this.verticalImpulse);
+   }
+
+   public String verticalDiagnostics() {
+      return "飞行脉冲=" + String.format("%.2f", this.verticalImpulse)
+         + " 垂直容差=" + String.format("%.2f", this.verticalArrivalBand());
+   }
+
+   private void resetVerticalModel() {
+      this.verticalImpulse = DEFAULT_VERTICAL_IMPULSE;
+      this.verticalSpeedPeak = 0.0;
+      this.observedImpulse = 0.0;
+      this.verticalDirLatch = 0;
+      this.lastVerticalVy = 0.0;
+      this.lastVerticalDir = 0;
+      this.verticalSampleMs = 0L;
+      this.lastColumnBlocker = null;
+      this.lastColumnOffset = 0.0;
+   }
+
+   /**
+    * Drive keyJump / keyShift so the player coasts to {@code targetFeetY}.
+    * Uses the exact coast distance, an impulse-scaled dead band and a latched
+    * direction, so a high fly speed can no longer produce an endless
+    * jump/sneak (crouch/stand) limit cycle near the target.
+    */
+   private void driveVertical(Minecraft mc, LocalPlayer player, double targetFeetY, double deadzone) {
+      if (mc == null || mc.options == null) {
+         return;
+      }
+      this.sampleVerticalSpeed(player);
+      double vy = player.getDeltaMovement().y;
+      double dy = targetFeetY - player.getY();
+      double band = Math.max(this.verticalArrivalBand(), deadzone + 0.12);
+      // Where the player would end up relative to the target if ALL vertical
+      // keys were released right now.
+      double residual = dy - FLY_COAST_FACTOR * vy;
+
+      int dir = this.verticalDirLatch;
+      if (dir > 0) {
+         if (residual <= band * 0.35) {
+            dir = 0;
+         }
+      } else if (dir < 0) {
+         if (residual >= -band * 0.35) {
+            dir = 0;
+         }
+      } else if (residual > band) {
+         dir = 1;
+      } else if (residual < -band && dy < 0.0) {
+         dir = -1;
+      }
+      // keyShift is both "descend" and the crouch key. Reverse-thrusting an
+      // ascent is exactly what made the player bob up and down at one height,
+      // so while the goal is above us we only ever coast, never sneak.
+      if (dir < 0 && dy > 0.0) {
+         dir = 0;
+      }
+      mc.options.keyJump.setDown(dir > 0);
+      mc.options.keyShift.setDown(dir < 0);
+      this.verticalDirLatch = dir;
+      this.recordVerticalInput(dir);
+   }
+
+   // ------------------------------------------------------------------ coast-aware column descent servo
+
+   /**
+    * Descend by HOLDING sneak until the feet reach the target.
+    *
+    * <p>The generic arrival servo ({@link #driveVertical}) uses a coast-derived
+    * dead band of {@code 2.8 * impulse} to avoid a jump/sneak limit cycle in
+    * free flight. That band is far too wide for a descent: the shaft floor
+    * clamps {@code vy} to zero, so the servo would release sneak 1-2 blocks
+    * early and leave the player hovering above the shaft. Here we only use a
+    * single jump pulse to brake a genuine free fall that would overshoot the
+    * target, and never alternate jump/sneak near the target. Simulated against
+    * 26.3 physics this converges to the target with 0-2 direction changes for
+    * impulses 0.15..3.0 (i.e. up to 20x vanilla fly speed).</p>
+    */
+   private void driveDescentVertical(Minecraft mc, LocalPlayer player, double targetFeetY) {
+      if (mc == null || mc.options == null) {
+         return;
+      }
+      this.sampleVerticalSpeed(player);
+      double vy = player.getDeltaMovement().y;
+      double predicted = player.getY() + FLY_COAST_FACTOR * vy;
+      double brakeBand = Math.max(1.0, 2.5 * this.verticalImpulse);
+      int dir;
+      if (predicted < targetFeetY - brakeBand) {
+         dir = 1;   // free-falling too fast: one braking pulse
+      } else if (player.getY() > targetFeetY + DESCENT_HOLD_Y) {
+         dir = -1;  // keep descending
+      } else {
+         dir = 0;   // arrived / coast
+      }
+      mc.options.keyJump.setDown(dir > 0);
+      mc.options.keyShift.setDown(dir < 0);
+      this.verticalDirLatch = 0;
+      this.recordVerticalInput(dir);
+   }
+
+   /**
+    * Descend a shaft WITHOUT first demanding block-centre alignment.
+    *
+    * <p>Creative flight keeps 91% of its HORIZONTAL velocity each tick
+    * ({@code LivingEntity.travelInAir}), so at a raised fly speed one input
+    * pulse coasts ~11x its velocity: a position-based "slide onto the exact
+    * centre" controller can never converge on a 0.15-block tolerance. Chasing
+    * the centre is what made the old code stall while refusing to look at the
+    * floor. Here we only damp horizontal drift (the shaft walls clamp it), and
+    * let the full-AABB blocker scan in {@link #travelColumn} dig whatever is
+    * actually under the player's feet, in whichever column it happens to be.</p>
+    */
+   private void driveColumnDescent(Minecraft mc, LocalPlayer player, double targetFeetY) {
+      if (mc == null || mc.options == null) {
+         return;
+      }
+      this.brakeHorizontal(mc, player);
+      // Hold sneak until the feet actually reach the target instead of
+      // stopping a couple of blocks short at a high fly speed.
+      this.driveDescentVertical(mc, player, targetFeetY);
+      mc.options.keySprint.setDown(false);
+      mc.options.keyAttack.setDown(false);
+      if (!useKeyInUse(mc)) {
+         mc.options.keyUse.setDown(false);
+      }
    }
 
    // ------------------------------------------------------------------ main navigation entry
@@ -701,13 +932,17 @@ public final class FlyController {
    }
 
    /**
-    * Strictly vertical approach / departure inside one fixed X/Z column.
+    * Vertical approach inside one X/Z column.
     *
-    * <p>Unlike {@link #navigate}, this never plans a detour and never leaves the
-    * column: it first slides horizontally onto {@code (columnX, columnZ)} at the
-    * current altitude, then moves the player's feet towards {@code targetFeetY}
-    * while breaking the blocks of the 1x2 shaft in the direction of travel.
-    * Mining reuses {@link #startMiningBlock} / {@link #tickMining}, so tool
+    * <p>Unlike {@link #navigate}, this never plans a detour. It moves the
+    * player's feet towards {@code targetFeetY} while breaking the blocks in the
+    * direction of travel. Blocking blocks are found by scanning the FULL player
+    * AABB footprint ({@link #findVerticalBlocker}), so a fraction-of-a-block
+    * horizontal offset - common when a mod raises the creative fly speed - can
+    * no longer hide the floor block under the player's feet. Descending no
+    * longer waits for an exact 1x1 column centre alignment.</p>
+    *
+    * <p>Mining reuses {@link #startMiningBlock} / {@link #tickMining}, so tool
     * switching and vanilla {@code destroyProgress} stay consistent with the
     * normal 3D navigation path.</p>
     *
@@ -723,6 +958,7 @@ public final class FlyController {
       }
       long now = System.currentTimeMillis();
       this.ensureFlight(player);
+      this.sampleVerticalSpeed(player);
 
       // Never interrupt an active break session: changing the target mid-break
       // resets the server-side destroy progress in 1.21+/26.x.
@@ -747,65 +983,35 @@ public final class FlyController {
       double dz = columnZ - player.getZ();
       double horiz = Math.sqrt(dx * dx + dz * dz);
       double dy = targetFeetY - player.getY();
-      if (horiz <= 0.30 && Math.abs(dy) <= 0.42) {
+      this.lastColumnOffset = horiz;
+
+      // Crossing detection with a TIGHT band. The wide band of the departure
+      // servo would report "arrived" several blocks too early at a high fly
+      // speed; a descent is paced by block breaking, so a small band is safe.
+      double arrivalY = Mth.clamp(0.5 * this.verticalImpulse, MIN_VERTICAL_BAND, 0.6);
+      boolean reachedY = dy < 0.0
+         ? player.getY() <= targetFeetY + arrivalY
+         : Math.abs(dy) <= arrivalY;
+      if (horiz <= COLUMN_ARRIVE_XZ && reachedY) {
          this.hover(mc, player, false);
          this.setNav(NavState.CLEAR);
          return ColumnState.ARRIVED;
       }
 
-      int colBlockX = Mth.floor(columnX);
-      int colBlockZ = Mth.floor(columnZ);
-      boolean centeredInColumn = Math.abs(dx) <= 0.15 && Math.abs(dz) <= 0.15;
-
-      BlockPos blocker = null;
-      if (!centeredInColumn && horiz > 0.22) {
-         // Slide onto the exact 1x1 column centre (bx + 0.5, bz + 0.5) before vertical digging
-         // so the player's 0.68-wide AABB never clips adjacent cabin walls.
-         int feetY = Mth.floor(player.getY() + 0.05);
-         BlockPos headTarget = new BlockPos(colBlockX, feetY + 1, colBlockZ);
-         BlockPos feetTarget = new BlockPos(colBlockX, feetY, colBlockZ);
-         if (!isPassableBlock(level, headTarget)) {
-            blocker = headTarget;
-         } else if (!isPassableBlock(level, feetTarget)) {
-            blocker = feetTarget;
-         } else if (horiz > 0.45) {
-            Vec3 alignPoint = new Vec3(columnX, player.getY(), columnZ);
-            blocker = this.findNextBlockToMine(
-               level, player, BlockPos.containing(alignPoint), alignPoint
-            );
-         }
+      boolean descending = dy < -0.35;
+      boolean ascending = dy > 0.35;
+      BlockPos blocker;
+      if (descending || ascending) {
+         // Scan EVERY block column touched by the real player AABB. A 0.68-wide
+         // player only 0.2 blocks off centre already straddles two columns, so
+         // the floor block that actually stops the descent can be in the
+         // neighbouring column - which the old 1x1 scan never examined.
+         blocker = this.findVerticalBlocker(level, player, targetFeetY, descending, columnX, columnZ);
       } else {
-         // Centered in (colBlockX, colBlockZ): check the 1x1 vertical shaft in the direction of travel.
-         if (dy < 0.0) {
-            int startY = Mth.floor(player.getY() + 0.5);
-            int minTargetY = Mth.floor(targetFeetY + 0.05);
-            int endY = Math.max(minTargetY, Mth.floor(player.getY() - 1.15));
-            for (int y = startY; y >= endY; y--) {
-               BlockPos candidate = new BlockPos(colBlockX, y, colBlockZ);
-               if (!isPassableBlock(level, candidate)) {
-                  blocker = candidate;
-                  break;
-               }
-            }
-         } else {
-            int startY = Mth.floor(player.getY() + 1.0);
-            int maxTargetY = Mth.floor(targetFeetY + PLAYER_HEIGHT);
-            int endY = Math.min(maxTargetY, Mth.floor(player.getY() + PLAYER_HEIGHT + 1.1));
-            for (int y = startY; y <= endY; y++) {
-               BlockPos candidate = new BlockPos(colBlockX, y, colBlockZ);
-               if (!isPassableBlock(level, candidate)) {
-                  blocker = candidate;
-                  break;
-               }
-            }
-         }
-         if (blocker != null) {
-            BlockPos occluder = this.findOccluder(level, player, blocker);
-            if (occluder != null) {
-               blocker = occluder;
-            }
-         }
+         Vec3 alignPoint = new Vec3(columnX, player.getY(), columnZ);
+         blocker = this.findNextBlockToMine(level, player, BlockPos.containing(alignPoint), alignPoint);
       }
+      this.lastColumnBlocker = blocker;
 
       if (blocker != null) {
          if (!allowMine || !isMineableBlock(level, player, blocker)) {
@@ -823,14 +1029,228 @@ public final class FlyController {
          return ColumnState.MINING;
       }
 
-      // Shaft is clear: keep X/Z pinned to (columnX, columnZ) and move along the column.
       this.stopMining(mc);
-      Vec3 stepTarget = (!centeredInColumn && horiz > 0.25)
-         ? new Vec3(columnX, player.getY(), columnZ)
-         : new Vec3(columnX, targetFeetY, columnZ);
-      this.steerRaw(mc, player, stepTarget, Math.abs(dy) < 5.0 || horiz > 0.25, 0.14);
+      if (descending) {
+         // Do NOT gate the descent on reaching the exact block centre. At a
+         // raised fly speed that alignment never converges, so the old code
+         // only "tried to descend" while never digging the floor underfoot.
+         this.driveColumnDescent(mc, player, targetFeetY);
+      } else {
+         this.steerRaw(mc, player, new Vec3(columnX, targetFeetY, columnZ), true, 0.14);
+      }
       this.setNav(NavState.CLEAR);
       return ColumnState.MOVING;
+   }
+
+   /**
+    * First solid layer in the direction of travel, scanned across the FULL
+    * player AABB footprint (not a single 1x1 column).
+    *
+    * <p>This is the fix for the "keeps trying to descend but never mines the
+    * block under its feet" stall: the old code only inspected the ideal shaft
+    * column, and only when {@code |dx| <= 0.15 && |dz| <= 0.15}. With a raised
+    * fly speed that tolerance is never met, the alignment branch checks only
+    * head/feet blocks at the CURRENT altitude, and the floor one block lower
+    * is never mined.</p>
+    */
+   private BlockPos findVerticalBlocker(
+      ClientLevel level, LocalPlayer player, double targetFeetY,
+      boolean descending, double columnX, double columnZ
+   ) {
+      AABB box = player.getBoundingBox();
+      int minX = Mth.floor(box.minX + 0.001);
+      int maxX = Mth.floor(box.maxX - 0.001);
+      int minZ = Mth.floor(box.minZ + 0.001);
+      int maxZ = Mth.floor(box.maxZ - 0.001);
+      int colBlockX = Mth.floor(columnX);
+      int colBlockZ = Mth.floor(columnZ);
+      double lookAhead = 1.2 + Math.min(2.0, this.verticalImpulse);
+      int startY, endY, stepY;
+      if (descending) {
+         // Include the head/body layer: the 1.84-tall AABB also collides with
+         // blocks one level above the feet, and those can be in a neighbouring
+         // column when the player is off centre.
+         startY = Mth.floor(player.getY() + 1.0);
+         endY = Math.max(Mth.floor(targetFeetY + 0.05), Mth.floor(player.getY() - lookAhead));
+         stepY = -1;
+      } else {
+         startY = Mth.floor(player.getY() + 1.0);
+         endY = Math.min(
+            Mth.floor(targetFeetY + PLAYER_HEIGHT + 0.05),
+            Mth.floor(player.getY() + PLAYER_HEIGHT + lookAhead)
+         );
+         stepY = 1;
+      }
+
+      BlockPos best = null;
+      BlockPos unbreakable = null;
+      double bestScore = Double.MAX_VALUE;
+      for (int y = startY; stepY > 0 ? y <= endY : y >= endY; y += stepY) {
+         boolean layerFound = false;
+         for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+               BlockPos pos = new BlockPos(x, y, z);
+               if (isPassableBlock(level, pos)) {
+                  continue;
+               }
+               layerFound = true;
+               double score = Math.abs(y + 0.5 - player.getY()) * 10.0
+                  + Math.abs(x + 0.5 - player.getX())
+                  + Math.abs(z + 0.5 - player.getZ());
+               // Prefer the intended shaft column so a small offset does not
+               // widen the hole more than strictly necessary.
+               if (x != colBlockX || z != colBlockZ) {
+                  score += 0.6;
+               }
+               if (!isMineableBlock(level, player, pos)) {
+                  if (unbreakable == null) {
+                     unbreakable = pos;
+                  }
+                  continue;
+               }
+               if (score < bestScore) {
+                  bestScore = score;
+                  best = pos;
+               }
+            }
+         }
+         if (layerFound) {
+            break; // first obstructed layer in the direction of travel
+         }
+      }
+      if (best == null) {
+         best = unbreakable;
+      }
+      if (best != null) {
+         BlockPos occluder = this.findOccluder(level, player, best);
+         if (occluder != null) {
+            best = occluder;
+         }
+      }
+      return best;
+   }
+
+   /**
+    * Pure vertical ascent used after a successful elytra pickup.
+    *
+    * <p>{@link #travelColumn} first slides the player onto the exact centre of
+    * a 1x1 block column. That alignment step is driven by {@link #steerRaw},
+    * which at short horizontal distances only brakes momentum; with a raised
+    * fly speed the player overshoots, never reaches the 0.15-block centre
+    * tolerance, and stalls at one altitude while the vertical controller
+    * alternates jump / sneak (the visible "crouching" loop). The departure does
+    * not need block-centre precision at all - the shaft was already dug on the
+    * way down - so this method climbs straight up from wherever the player is,
+    * scans the FULL player AABB for a ceiling block, and NEVER presses the
+    * sneak key.</p>
+    *
+    * @return true once the player has reached (or crossed) {@code targetFeetY}
+    */
+   public boolean climbOut(Minecraft mc, ClientLevel level, LocalPlayer player, double targetFeetY) {
+      if (mc == null || level == null || player == null) {
+         return true;
+      }
+      this.ensureFlight(player);
+      this.sampleVerticalSpeed(player);
+      long now = System.currentTimeMillis();
+      // Crossing detection, not a fixed 0.42-block window: one tick at a high
+      // fly speed already moves several blocks, so the old ARRIVED check could
+      // never be satisfied.
+      double band = Math.min(this.verticalArrivalBand(), MAX_DEPART_BAND);
+      if (player.getY() >= targetFeetY - band) {
+         this.hover(mc, player, true);
+         this.setNav(NavState.CLEAR);
+         return true;
+      }
+
+      // Never interrupt an active break session; changing the target resets the
+      // server-side destroy progress.
+      if (this.miningPos != null) {
+         if (isPassableBlock(level, this.miningPos)) {
+            this.stopMining(mc);
+         } else {
+            NavState mineState = this.tickMining(mc, level, player, now);
+            if (mineState == NavState.MINING || mineState == NavState.APPROACH_MINE) {
+               this.setNav(mineState);
+               return false;
+            }
+            this.stopMining(mc);
+            if (mineState == NavState.FAILED) {
+               this.setNav(NavState.BLOCKED);
+               return false;
+            }
+         }
+      }
+
+      BlockPos blocker = this.findUpwardBlocker(level, player);
+      if (blocker != null) {
+         if (!isMineableBlock(level, player, blocker)) {
+            this.hover(mc, player, true);
+            this.setNav(NavState.BLOCKED);
+            return false;
+         }
+         this.startMiningBlock(player, level, blocker, now);
+         NavState mineState = this.tickMining(mc, level, player, now);
+         if (mineState == NavState.FAILED) {
+            this.stopMining(mc);
+         }
+         this.setNav(mineState);
+         return false;
+      }
+
+      this.stopMining(mc);
+      if (mc.options != null) {
+         this.brakeHorizontal(mc, player);
+         // Hold jump only. keyShift is the sneak key AND the descend key; using
+         // it as a reverse thruster is what produced the endless crouch loop.
+         mc.options.keyJump.setDown(true);
+         mc.options.keyShift.setDown(false);
+         this.recordVerticalInput(1);
+      }
+      this.verticalDirLatch = 0;
+      this.setNav(NavState.CLEAR);
+      return false;
+   }
+
+   /** Nearest solid block just above the player's FULL 0.68-wide AABB footprint. */
+   private BlockPos findUpwardBlocker(ClientLevel level, LocalPlayer player) {
+      AABB box = player.getBoundingBox();
+      int minX = Mth.floor(box.minX + 0.001);
+      int maxX = Mth.floor(box.maxX - 0.001);
+      int minZ = Mth.floor(box.minZ + 0.001);
+      int maxZ = Mth.floor(box.maxZ - 0.001);
+      int startY = Mth.floor(player.getY() + 1.0);
+      // Look a little further ahead when the fly speed is high, so a ceiling
+      // is mined before the player rams into it at several blocks per tick.
+      int endY = Mth.floor(
+         player.getY() + PLAYER_HEIGHT + 1.1 + Math.min(3.0, this.verticalImpulse)
+      );
+      BlockPos best = null;
+      double bestScore = Double.MAX_VALUE;
+      for (int y = startY; y <= endY; y++) {
+         for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+               BlockPos pos = new BlockPos(x, y, z);
+               if (isPassableBlock(level, pos)) {
+                  continue;
+               }
+               double score = (y - player.getY()) * 10.0
+                  + Math.abs(x + 0.5 - player.getX())
+                  + Math.abs(z + 0.5 - player.getZ());
+               if (score < bestScore) {
+                  bestScore = score;
+                  best = pos;
+               }
+            }
+         }
+      }
+      if (best != null) {
+         BlockPos occluder = this.findOccluder(level, player, best);
+         if (occluder != null) {
+            best = occluder;
+         }
+      }
+      return best;
    }
 
    private static Vec3 waypointVec(BlockPos pos) {
@@ -1557,6 +1977,8 @@ public final class FlyController {
    public String miningDiagnostics() {
       return "挖掘方块=" + (this.miningPos == null ? "无" : this.miningPos)
          + " 贴身阻挡=" + this.miningFootBlocker
+         + " 脚下阻挡=" + (this.lastColumnBlocker == null ? "无" : this.lastColumnBlocker)
+         + " 列偏移=" + String.format("%.2f", this.lastColumnOffset)
          + " 路径节点=" + (this.currentPath == null ? 0 : (this.pathIndex + "/" + this.currentPath.size()))
          + " 准星偏离=" + this.offAimTicks + " tick";
    }
@@ -1803,14 +2225,15 @@ public final class FlyController {
          mc.options.keyLeft.setDown(rightVel > 0.045);
          mc.options.keyRight.setDown(rightVel < -0.045);
 
-         double climb = target.y - player.getY() - vel.y * 1.5;
-         mc.options.keyJump.setDown(climb > verticalDeadzone);
-         mc.options.keyShift.setDown(climb < -verticalDeadzone);
+         // Speed-adaptive vertical servo (see driveVertical). The old
+         // "dy - 1.5 * vy" bang-bang controller assumed vanilla fly speed and
+         // alternated jump/sneak forever once Tweakeroo multiplied it.
+         this.driveVertical(mc, player, target.y, verticalDeadzone);
       }
    }
 
-   /** Actively brake horizontal & vertical drift using counter-inputs. */
-   private void brakeInPlace(Minecraft mc, LocalPlayer player) {
+   /** Counter horizontal drift only; vertical keys are left to the caller. */
+   private void brakeHorizontal(Minecraft mc, LocalPlayer player) {
       if (mc == null || mc.options == null) {
          return;
       }
@@ -1828,9 +2251,28 @@ public final class FlyController {
       mc.options.keyDown.setDown(forwardVel > 0.06);
       mc.options.keyLeft.setDown(rightVel > 0.06);
       mc.options.keyRight.setDown(rightVel < -0.06);
-      mc.options.keyJump.setDown(vel.y < -0.08);
-      mc.options.keyShift.setDown(vel.y > 0.08);
       mc.options.keySprint.setDown(false);
+   }
+
+   /** Actively brake horizontal & vertical drift using counter-inputs. */
+   private void brakeInPlace(Minecraft mc, LocalPlayer player) {
+      if (mc == null || mc.options == null) {
+         return;
+      }
+      this.brakeHorizontal(mc, player);
+      this.sampleVerticalSpeed(player);
+      // ONE reverse pulse plus the natural 0.6 drag settles the vertical drift.
+      // A fixed 0.08 threshold instead produces a stable jump/sneak 2-cycle of
+      // amplitude ~0.56 * impulse whenever a mod raises the fly speed - that is
+      // the "endless crouching at one height" bug. Scale the dead band with the
+      // impulse so we never start that cycle in the first place.
+      double vy = player.getDeltaMovement().y;
+      double threshold = Math.max(0.12, 0.9 * this.verticalImpulse);
+      int brakeDir = vy < -threshold ? 1 : (vy > threshold ? -1 : 0);
+      mc.options.keyJump.setDown(brakeDir > 0);
+      mc.options.keyShift.setDown(brakeDir < 0);
+      this.verticalDirLatch = 0;
+      this.recordVerticalInput(brakeDir);
    }
 
    /** Stop horizontal movement and stay airborne. */
@@ -1855,6 +2297,7 @@ public final class FlyController {
       }
       this.clearPath();
       this.resetStuck();
+      this.resetVerticalModel();
    }
 
    private void releaseMovementKeys(Minecraft mc) {
@@ -1868,6 +2311,9 @@ public final class FlyController {
       mc.options.keyJump.setDown(false);
       mc.options.keyShift.setDown(false);
       mc.options.keySprint.setDown(false);
+      // No vertical input is being applied, so the next velocity sample must
+      // not be attributed to a stale direction.
+      this.lastVerticalDir = 0;
    }
 
    public void ensureFlight(LocalPlayer player) {
