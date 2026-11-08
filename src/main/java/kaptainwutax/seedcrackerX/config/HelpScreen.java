@@ -55,6 +55,20 @@ public class HelpScreen {
       automine.addEntry(
          eb.startTextDescription(Component.literal("  - 包满自动存盒默认开启，可用 /os ch 开关；需提前在背包里放好潜影盒，附近要有空地").withStyle(s -> s.withColor(ChatFormatting.WHITE))).build()
       );
+      ConfigCategory eat = builder.getOrCreateCategory(Component.literal("自动进食"));
+      eat.addEntry(eb.startTextDescription(Component.literal("全局功能：饱食度不足时自动食用背包内食物，无需开启自动挖矿。")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("/os eat [开|关|状态]").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("  开关自动进食 / 查看当前状态。默认开启。")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("/os eat 阈值 <1-19>").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("  设置触发饱食度（默认 18）。饱食度 ≤ 该值时自动进食。")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("说明：").withStyle(s -> s.withColor(ChatFormatting.AQUA))).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("  - 会优先选刚好补满、浪费最少的食物；背包 27 格里的食物会临时换到快捷栏，吃完还原")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("  - 蜘蛛眼/河豚/毒马铃薯/紫颂果/谜之炖菜永不自动食用；金苹果、腐肉等仅在快饿死时考虑")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("  - 打开界面、手动右键/挖掘、自动存盒/自动挖矿/鞘翅收集期间会暂停")).build());
+      eat.addEntry(eb.startTextDescription(Component.literal("  - 矿物透视设置界面里也能开关和调整阈值")).build());
       ConfigCategory xray = builder.getOrCreateCategory(Component.literal("\ud83d\udc8e 矿物透视"));
       xray.addEntry(eb.startTextDescription(Component.literal("通过种子预测矿物位置并高亮显示。")).build());
       xray.addEntry(eb.startTextDescription(Component.literal("")).build());

@@ -3,6 +3,7 @@ package kaptainwutax.seedcrackerX.xray;
 import com.seedfinding.mccore.version.MCVersion;
 import java.util.ArrayList;
 import java.util.List;
+import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
 import kaptainwutax.seedcrackerX.command.SeedCommand;
 import kaptainwutax.seedcrackerX.config.Config;
 import kaptainwutax.seedcrackerX.guidance.GuidanceManager;
@@ -97,6 +98,35 @@ public class OreXrayScreen {
             )
             .setSaveConsumer(val -> {
                Config.get().autoMineShulkerSave = val;
+               Config.save();
+            })
+            .build()
+      );
+      settings.addEntry(
+         eb.startBooleanToggle(Component.literal("饿肚子自动吃食物"), Config.get().autoEatEnabled)
+            .setTooltip(
+               Component.literal(
+                  "开启后：饱食度达到阈值时自动从背包 36 格里挑最合适的食物（优先刚好补满、不浪费），\n"
+                     + "必要时临时把食物换到快捷栏，吃完后把快捷栏还原；走纯原版交互，无需服务端模组。\n"
+                     + "不会自动吃蜘蛛眼、河豚、毒马铃薯、紫颂果、谜之炖菜；金苹果/腐肉等只在快饿死时才考虑。\n"
+                     + "打开界面、玩家正在右键/挖掘、自动存盒/自动挖矿/鞘翅收集运行期间会暂停。也可用 /os eat 开关。"
+               )
+            )
+            .setSaveConsumer(val -> {
+               Config.get().autoEatEnabled = val;
+               if (!val) {
+                  AutoEatManager.INSTANCE.cancel();
+               }
+
+               Config.save();
+            })
+            .build()
+      );
+      settings.addEntry(
+         eb.startIntSlider(Component.literal("自动进食饱食度阈值"), AutoEatManager.threshold(), 1, 19)
+            .setTooltip(Component.literal("饱食度 ≤ 该值时触发自动进食。默认 18（保持自然回血所需饱食度），范围 1..19。"))
+            .setSaveConsumer(val -> {
+               Config.get().autoEatThreshold = val;
                Config.save();
             })
             .build()

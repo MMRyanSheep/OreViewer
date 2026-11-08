@@ -7,6 +7,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
 import kaptainwutax.seedcrackerX.command.ClientCommand;
 import kaptainwutax.seedcrackerX.config.Config;
 import kaptainwutax.seedcrackerX.util.Compat;
@@ -55,7 +56,6 @@ public class AutoMineManager {
    public static final AutoMineManager INSTANCE = new AutoMineManager();
    private static final Logger LOGGER = LoggerFactory.getLogger("SeedCrackerX-AutoMine");
    public static volatile boolean proMode = false;
-   private static final int EAT_AT_FOOD_LEVEL = 14;
    private static final int REISSUE_INTERVAL_TICKS = 100;
    private static final int REPAIR_AT_DURABILITY = 20;
    private static final float REPAIR_RESUME_FRACTION = 0.8F;
@@ -373,6 +373,11 @@ public class AutoMineManager {
             Level level = mc.level;
 
             try {
+               // 全局自动进食正在占用右键/快捷栏时让路（例如进食途中开启了自动挖矿）。
+               if (AutoEatManager.INSTANCE.isBusy()) {
+                  return;
+               }
+
                if (Compat.screen(mc) instanceof DeathScreen) {
                   this.handleDeath(mc);
                   return;
@@ -410,7 +415,7 @@ public class AutoMineManager {
                   return;
                }
 
-               if (this.phase != AutoMineManager.Phase.EAT && player.getFoodData().getFoodLevel() <= 14) {
+               if (this.phase != AutoMineManager.Phase.EAT && player.getFoodData().getFoodLevel() <= AutoEatManager.triggerLevel()) {
                   this.phase = AutoMineManager.Phase.EAT;
                   this.eatTicks = 0;
                   this.eatSwapMenuSlot = -1;
@@ -1018,19 +1023,19 @@ public class AutoMineManager {
    private void tickEat(Minecraft mc, LocalPlayer player) {
       this.releaseMovementKeys();
       if (this.eatTicks == 0) {
-         int foodSlot = this.findFoodHotbarSlot(player);
-         if (foodSlot >= 0) {
-            player.getInventory().setSelectedSlot(foodSlot);
-         } else {
-            int menuSlot = this.findFoodMainMenuSlot(player);
-            if (menuSlot < 0) {
-               this.finishEat(mc, player);
-               return;
-            }
+         // 与全局自动进食共用同一套挑选策略：不吃有害/贵重食物，优先选刚好补满的。
+         int slot = AutoEatManager.foodSlot(player);
+         if (slot < 0) {
+            this.finishEat(mc, player);
+            return;
+         }
 
-            int hotbar = player.getInventory().getSelectedSlot();
-            mc.gameMode.handleContainerInput(0, menuSlot, hotbar, ContainerInput.SWAP, player);
-            this.eatSwapMenuSlot = menuSlot;
+         if (slot < 9) {
+            player.getInventory().setSelectedSlot(slot);
+         } else {
+            // 背包主格 9..35 的 menu 槽号与物品栏下标一致。
+            mc.gameMode.handleContainerInput(0, slot, player.getInventory().getSelectedSlot(), ContainerInput.SWAP, player);
+            this.eatSwapMenuSlot = slot;
          }
       }
 
@@ -1054,12 +1059,7 @@ public class AutoMineManager {
       }
 
       this.eatTicks = 0;
-      if (player.getFoodData().getFoodLevel() <= 14) {
-         this.phase = AutoMineManager.Phase.WORK;
-      } else {
-         this.phase = AutoMineManager.Phase.WORK;
-      }
-
+      this.phase = AutoMineManager.Phase.WORK;
       this.resumeMining();
    }
 
@@ -1140,32 +1140,8 @@ public class AutoMineManager {
 
 
 
-   private int findFoodHotbarSlot(LocalPlayer player) {
-      for (int i = 0; i < 9; i++) {
-         if (this.isFood(player.getInventory().getItem(i))) {
-            return i;
-         }
-      }
-
-      return -1;
-   }
-
    private int menuSlotOfInventoryIndex(int invIndex) {
       return invIndex < 9 ? invIndex + 36 : invIndex;
-   }
-
-   private int findFoodMainMenuSlot(LocalPlayer player) {
-      for (int i = 9; i < player.getInventory().getContainerSize(); i++) {
-         if (this.isFood(player.getInventory().getItem(i))) {
-            return this.menuSlotOfInventoryIndex(i);
-         }
-      }
-
-      return -1;
-   }
-
-   private boolean isFood(ItemStack stack) {
-      return stack != null && !stack.isEmpty() && stack.has(DataComponents.FOOD);
    }
 
    private int findPickaxeSlot(LocalPlayer player) {

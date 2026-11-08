@@ -2,6 +2,7 @@ package kaptainwutax.seedcrackerX.automine;
 
 import java.util.HashSet;
 import java.util.Set;
+import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
 import kaptainwutax.seedcrackerX.command.ClientCommand;
 import kaptainwutax.seedcrackerX.config.Config;
 import kaptainwutax.seedcrackerX.elytra.ElytraHuntManager;
@@ -174,7 +175,7 @@ public final class ShulkerAutoStore {
    }
 
    private void tryTrigger() {
-      if (this.cooldown > 0 || !Config.get().autoMineShulkerSave) {
+      if (this.cooldown > 0 || !Config.get().autoMineShulkerSave || AutoEatManager.INSTANCE.isBusy()) {
          return;
       }
 

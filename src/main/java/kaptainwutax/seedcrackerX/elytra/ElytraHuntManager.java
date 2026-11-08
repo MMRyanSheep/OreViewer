@@ -10,6 +10,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
 import kaptainwutax.seedcrackerX.automine.BaritoneBridge;
 import kaptainwutax.seedcrackerX.command.ClientCommand;
 import kaptainwutax.seedcrackerX.fly.FlyManager;
@@ -553,6 +554,12 @@ public final class ElytraHuntManager {
       if (!this.isRunning()) {
          return;
       }
+
+      // 自动进食占用右键/快捷栏期间让路，避免互相抢输入。
+      if (AutoEatManager.INSTANCE.isBusy()) {
+         return;
+      }
+
       Minecraft mc = Minecraft.getInstance();
       LocalPlayer player = mc.player;
       ClientLevel level = mc.level;

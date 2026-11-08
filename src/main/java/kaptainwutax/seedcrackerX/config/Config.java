@@ -64,6 +64,10 @@ public class Config {
    public boolean xrayAntiXray = true;
    public boolean autoMineShulkerSave = true;
    public boolean autoMineAttackMobs = true;
+   /** 饱食度不足时自动吃背包里的食物（全局功能，与自动挖矿是否开启无关）。 */
+   public boolean autoEatEnabled = true;
+   /** 饱食度低于等于该值时触发自动进食，范围 1..19。 */
+   public int autoEatThreshold = 18;
    public Map<String, int[]> buffSettings = new HashMap<>();
    public long activeSeed = 0L;
    public String activeVersion = "";

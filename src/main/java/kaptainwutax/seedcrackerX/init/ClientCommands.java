@@ -5,6 +5,7 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import java.util.ArrayList;
 import java.util.List;
+import kaptainwutax.seedcrackerX.command.AutoEatCommand;
 import kaptainwutax.seedcrackerX.command.AutoMineCommand;
 import kaptainwutax.seedcrackerX.command.BuffCommand;
 import kaptainwutax.seedcrackerX.command.ClientCommand;
@@ -86,5 +87,6 @@ public class ClientCommands {
       COMMANDS.add(new ElytraCommand());
       COMMANDS.add(new ElytraAliasCommand());
       COMMANDS.add(new ShulkerCommand());
+      COMMANDS.add(new AutoEatCommand());
    }
 }
