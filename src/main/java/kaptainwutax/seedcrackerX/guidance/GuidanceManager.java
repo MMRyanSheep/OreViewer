@@ -140,7 +140,7 @@ public class GuidanceManager {
 
    public void setBlockTarget(String blockPath) {
       if (!OreXrayManager.INSTANCE.isActive()) {
-         Compat.sendSystemMessage(Component.literal("[方块指引] 请先使用 /os sz 设置种子。"));
+         Compat.sendSystemMessage(Component.literal("[方块指引] 请先使用 /ov sz 设置种子。"));
       } else {
          Minecraft mc = Minecraft.getInstance();
          if (mc != null && mc.level != null) {
@@ -155,13 +155,13 @@ public class GuidanceManager {
          this.targets = new ArrayList<>();
          this.lastScanMs = 0L;
          Config.get().guidanceEnabled = true;
-         Compat.sendSystemMessage(Component.literal("[方块指引] 正在按种子计算最近的 3 个 " + blockPath + "，开启射线指引。输入 /os fk off 关闭。"));
+         Compat.sendSystemMessage(Component.literal("[方块指引] 正在按种子计算最近的 3 个 " + blockPath + "，开启射线指引。输入 /ov fk off 关闭。"));
       }
    }
 
    public void setStructureTarget(GuidanceManager.TargetKind kind, int maxTargets) {
       if (!OreXrayManager.INSTANCE.isActive()) {
-         Compat.sendSystemMessage(Component.literal("[指引] 请先使用 /os sz 设置种子。"));
+         Compat.sendSystemMessage(Component.literal("[指引] 请先使用 /ov sz 设置种子。"));
       } else {
          this.activeKind = kind;
          this.biomeTargets = null;
@@ -171,14 +171,14 @@ public class GuidanceManager {
          this.lastScanMs = 0L;
          Config.get().guidanceEnabled = true;
          Compat.sendSystemMessage(
-            Component.literal("[指引] 已开启 " + this.activeLabel + " 指引（原版数据包定位 + 完整生成校验），屏幕中心将指向最近的 " + maxTargets + " 个目标；坐标均为结构所在维度坐标。输入 /os mdc off 或 /os dx off 关闭。")
+            Component.literal("[指引] 已开启 " + this.activeLabel + " 指引（原版数据包定位 + 完整生成校验），屏幕中心将指向最近的 " + maxTargets + " 个目标；坐标均为结构所在维度坐标。输入 /ov mdc off 或 /ov dx off 关闭。")
          );
       }
    }
 
    public void setBiomeTarget(GuidanceManager.TargetKind kind, Collection<Biome> fallbackBiomes, String label, int maxTargets) {
       if (!OreXrayManager.INSTANCE.isActive()) {
-         Compat.sendSystemMessage(Component.literal("[指引] 请先使用 /os sz 设置种子。"));
+         Compat.sendSystemMessage(Component.literal("[指引] 请先使用 /ov sz 设置种子。"));
       } else {
          this.activeKind = kind;
          this.biomeTargets = fallbackBiomes;
@@ -187,7 +187,7 @@ public class GuidanceManager {
          this.targets = new ArrayList<>();
          this.lastScanMs = 0L;
          Config.get().guidanceEnabled = true;
-         Compat.sendSystemMessage(Component.literal("[指引] 已开启 " + label + " 生物群系指引，屏幕中心将指向最近的 " + maxTargets + " 个目标。输入 /os dx off 关闭。"));
+         Compat.sendSystemMessage(Component.literal("[指引] 已开启 " + label + " 生物群系指引，屏幕中心将指向最近的 " + maxTargets + " 个目标。输入 /ov dx off 关闭。"));
       }
    }
 

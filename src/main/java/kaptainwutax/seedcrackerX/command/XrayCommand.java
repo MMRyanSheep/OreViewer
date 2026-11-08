@@ -104,15 +104,15 @@ public class XrayCommand extends ClientCommand {
    private int showStatus() {
       Set<String> on = OreXrayManager.INSTANCE.getXrayCmdOres();
       if (on.isEmpty()) {
-         sendFeedback("[xray] 独立透视未开启。用法：/os xray <矿物名...|全部> [on|off]", ChatFormatting.GRAY);
+         sendFeedback("[xray] 独立透视未开启。用法：/ov xray <矿物名...|全部> [on|off]", ChatFormatting.GRAY);
       } else {
          sendFeedback("[xray] 独立透视中：" + String.join("、", on), ChatFormatting.GREEN);
       }
 
-      sendFeedback("[xray] 本线路直接读客户端已加载区块的方块数据（与 Baritone 矿位扫描同源），无需种子，与 /os xs 互不影响。", ChatFormatting.GRAY);
-      sendFeedback("[xray] 6格延伸（假矿服用）：/os xray 延伸 on|off，当前=" + (OreXrayManager.INSTANCE.isXrayCmdExtend() ? "开" : "关"), ChatFormatting.GRAY);
-      sendFeedback("[xray] 扫描范围：/os xray 范围 <格数|关>，当前=" + rangeText(), ChatFormatting.GRAY);
-      sendFeedback("[xray] 可用矿物：钻石/远古残骸/铁/金/煤/红石/青金石/铜/绿宝石（/os xray 停止 = 全关）", ChatFormatting.GRAY);
+      sendFeedback("[xray] 本线路直接读客户端已加载区块的方块数据（与 Baritone 矿位扫描同源），无需种子，与 /ov xs 互不影响。", ChatFormatting.GRAY);
+      sendFeedback("[xray] 6格延伸（假矿服用）：/ov xray 延伸 on|off，当前=" + (OreXrayManager.INSTANCE.isXrayCmdExtend() ? "开" : "关"), ChatFormatting.GRAY);
+      sendFeedback("[xray] 扫描范围：/ov xray 范围 <格数|关>，当前=" + rangeText(), ChatFormatting.GRAY);
+      sendFeedback("[xray] 可用矿物：钻石/远古残骸/铁/金/煤/红石/青金石/铜/绿宝石（/ov xray 停止 = 全关）", ChatFormatting.GRAY);
       return 0;
    }
 
@@ -167,7 +167,7 @@ public class XrayCommand extends ClientCommand {
             }
 
             if (targets.isEmpty()) {
-               sendFeedback("[xray] 用法：/os xray <矿物名...|全部> [on|off]，无参数显示当前状态。可用矿物：钻石/远古残骸/铁/金/煤/红石/青金石/铜/绿宝石", ChatFormatting.RED);
+               sendFeedback("[xray] 用法：/ov xray <矿物名...|全部> [on|off]，无参数显示当前状态。可用矿物：钻石/远古残骸/铁/金/煤/红石/青金石/铜/绿宝石", ChatFormatting.RED);
                if (invalid.length() > 0) {
                   sendFeedback("[xray] 未识别的矿物：" + invalid, ChatFormatting.YELLOW);
                }
@@ -191,14 +191,14 @@ public class XrayCommand extends ClientCommand {
 
                sendFeedback("[xray] 已" + (enable ? "开启" : "关闭") + "：" + changed, enable ? ChatFormatting.GREEN : ChatFormatting.GOLD);
                if (enable) {
-                  sendFeedback("[xray] 独立透视：直接读客户端已加载区块的矿位。/os xray 范围 关 = 扫整个渲染距离；/os xray 延伸 on 加画真矿周围6格。", ChatFormatting.GRAY);
+                  sendFeedback("[xray] 独立透视：直接读客户端已加载区块的矿位。/ov xray 范围 关 = 扫整个渲染距离；/ov xray 延伸 on 加画真矿周围6格。", ChatFormatting.GRAY);
                }
 
                return 0;
             }
          } else {
             if (parts.length < 2) {
-               sendFeedback("[xray] 当前范围=" + rangeText() + "。用法：/os xray 范围 <格数>（如 16）；/os xray 范围 关 = 取消限制（扫整个渲染距离）", ChatFormatting.GRAY);
+               sendFeedback("[xray] 当前范围=" + rangeText() + "。用法：/ov xray 范围 <格数>（如 16）；/ov xray 范围 关 = 取消限制（扫整个渲染距离）", ChatFormatting.GRAY);
                return 0;
             }
 
@@ -209,7 +209,7 @@ public class XrayCommand extends ClientCommand {
                   OreXrayManager.INSTANCE.setXrayRadius(n);
                   sendFeedback("[xray] 范围已设为 " + n + " 格（0 或 关 = 取消限制）", ChatFormatting.GREEN);
                } catch (NumberFormatException ex) {
-                  sendFeedback("[xray] 无效的范围：" + v + "。用法：/os xray 范围 <格数> 或 /os xray 范围 关", ChatFormatting.RED);
+                  sendFeedback("[xray] 无效的范围：" + v + "。用法：/ov xray 范围 <格数> 或 /ov xray 范围 关", ChatFormatting.RED);
                }
 
                return 0;
@@ -220,7 +220,7 @@ public class XrayCommand extends ClientCommand {
             }
          }
       } else if (parts.length < 2) {
-         sendFeedback("[xray] 6格延伸当前=" + (OreXrayManager.INSTANCE.isXrayCmdExtend() ? "开" : "关") + "。用法：/os xray 延伸 on|off（假矿服开启）", ChatFormatting.GRAY);
+         sendFeedback("[xray] 6格延伸当前=" + (OreXrayManager.INSTANCE.isXrayCmdExtend() ? "开" : "关") + "。用法：/ov xray 延伸 on|off（假矿服开启）", ChatFormatting.GRAY);
          return 0;
       } else {
          boolean on = isOn(parts[1]);

@@ -26,7 +26,7 @@ public class FkCommand extends ClientCommand {
    private int find(String blockId) {
       String path = blockId.trim().toLowerCase();
       if (path.isEmpty()) {
-         sendFeedback("[方块指引] 请输入方块英文ID，例如 /os fk diamond_ore", ChatFormatting.RED);
+         sendFeedback("[方块指引] 请输入方块英文ID，例如 /ov fk diamond_ore", ChatFormatting.RED);
          return 1;
       }
 

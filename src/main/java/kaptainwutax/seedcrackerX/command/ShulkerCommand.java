@@ -6,7 +6,7 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.ChatFormatting;
 
-/** /os ch —— 背包满自动存潜影盒的快捷开关。 */
+/** /ov ch —— 背包满自动存潜影盒的快捷开关。 */
 public class ShulkerCommand extends ClientCommand {
    @Override
    public String getName() {

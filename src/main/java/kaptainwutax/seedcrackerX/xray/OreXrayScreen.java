@@ -93,7 +93,7 @@ public class OreXrayScreen {
                   "开启后：背包 36 格全满、且背包里有未满的潜影盒时，自动把鞘翅、矿物及可堆叠物品存入盒内腾出格子。\n"
                      + "走纯原版交互：临时把潜影盒放在身边 → 打开 → 存入 → 挖回 → 捡回，无需安装 QuickShulker，但需要附近有一格空地。\n"
                      + "工具、食物、穿戴装备、潜影盒本身不会被存入；任何一步失败都会尝试把盒子挖回来。\n"
-                     + "自动收集鞘翅或自动挖矿期间会暂停操作，存完自动继续。也可用 /os ch 快速开关。"
+                     + "自动收集鞘翅或自动挖矿期间会暂停操作，存完自动继续。也可用 /ov ch 快速开关。"
                )
             )
             .setSaveConsumer(val -> {
@@ -109,7 +109,7 @@ public class OreXrayScreen {
                   "开启后：饱食度达到阈值时自动从背包 36 格里挑最合适的食物（优先刚好补满、不浪费），\n"
                      + "必要时临时把食物换到快捷栏，吃完后把快捷栏还原；走纯原版交互，无需服务端模组。\n"
                      + "不会自动吃蜘蛛眼、河豚、毒马铃薯、紫颂果、谜之炖菜；金苹果/腐肉等只在快饿死时才考虑。\n"
-                     + "打开界面、玩家正在右键/挖掘、自动存盒/自动挖矿/鞘翅收集运行期间会暂停。也可用 /os eat 开关。"
+                     + "打开界面、玩家正在右键/挖掘、自动存盒/自动挖矿/鞘翅收集运行期间会暂停。也可用 /ov eat 开关。"
                )
             )
             .setSaveConsumer(val -> {
@@ -133,7 +133,7 @@ public class OreXrayScreen {
       );
       settings.addEntry(
          eb.startBooleanToggle(Component.literal("自动打怪"), Config.get().autoMineAttackMobs)
-            .setTooltip(Component.literal("开启后：自动挖矿时自动攻击 3.5 格内的敌对生物（僵尸、苦力怕等），避免挖矿被打断。关闭后挖矿期间不再自动攻击怪物（可用 /os f 飞行躲避近战）。"))
+            .setTooltip(Component.literal("开启后：自动挖矿时自动攻击 3.5 格内的敌对生物（僵尸、苦力怕等），避免挖矿被打断。关闭后挖矿期间不再自动攻击怪物（可用 /ov f 飞行躲避近战）。"))
             .setSaveConsumer(val -> {
                Config.get().autoMineAttackMobs = val;
                Config.save();
@@ -147,7 +147,7 @@ public class OreXrayScreen {
             .build()
       );
       if (Config.get().seedHistory.isEmpty()) {
-         seeds.addEntry(eb.startTextDescription(Component.literal("暂无种子记录，使用 /os sz <种子> [版本] 添加").withStyle(ChatFormatting.GRAY)).build());
+         seeds.addEntry(eb.startTextDescription(Component.literal("暂无种子记录，使用 /ov sz <种子> [版本] 添加").withStyle(ChatFormatting.GRAY)).build());
       } else {
          List<Config.SeedEntry> history = Config.get().seedHistory;
          seeds.addEntry(eb.startTextDescription(Component.literal("已保存种子记录（共 " + history.size() + " 条，最多 20 条）：")).build());

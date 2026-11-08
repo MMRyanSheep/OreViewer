@@ -35,7 +35,7 @@ public class ProCommand extends ClientCommand {
                })))
             .then(ClientCommands.literal("crack").executes(context -> {
                if (!AutoMineManager.proMode) {
-                  ClientCommand.sendFeedback("请先使用 /os pro on 开启破混淆模式（地狱采集基岩，或末地扫描黑曜石柱）", ChatFormatting.YELLOW);
+                  ClientCommand.sendFeedback("请先使用 /ov pro on 开启破混淆模式（地狱采集基岩，或末地扫描黑曜石柱）", ChatFormatting.YELLOW);
                   return 1;
                } else if (BedrockCollector.get().isCracking()) {
                   ClientCommand.sendFeedback("破译已经在进行中，请稍候", ChatFormatting.YELLOW);
@@ -59,9 +59,9 @@ public class ProCommand extends ClientCommand {
          BedrockCollector.get().reset();
          ClientCommand.sendFeedback("已开启破混淆（反种子混淆）模式", ChatFormatting.GREEN);
          ClientCommand.sendFeedback(
-            "破混淆：地狱自动采集顶层(y123-126)/底层(y1-4)基岩，末地自动扫描黑曜石柱；正常移动扩大范围，数据足够后自动破译真实种子（/os pro status 查看进度，/os pro crack 手动提交基岩破译）", ChatFormatting.AQUA
+            "破混淆：地狱自动采集顶层(y123-126)/底层(y1-4)基岩，末地自动扫描黑曜石柱；正常移动扩大范围，数据足够后自动破译真实种子（/ov pro status 查看进度，/ov pro crack 手动提交基岩破译）", ChatFormatting.AQUA
          );
-         ClientCommand.sendFeedback("破译出种子后点击聊天框 [直接设置]，之后 /os zd 钻石 等自动挖矿将按种子预测位置挖掘", ChatFormatting.YELLOW);
+         ClientCommand.sendFeedback("破译出种子后点击聊天框 [直接设置]，之后 /ov zd 钻石 等自动挖矿将按种子预测位置挖掘", ChatFormatting.YELLOW);
       } else {
          BedrockCollector.get().reset();
          ClientCommand.sendFeedback("已关闭破混淆模式，种子功能恢复正常（基岩采集数据已清空）", ChatFormatting.GREEN);

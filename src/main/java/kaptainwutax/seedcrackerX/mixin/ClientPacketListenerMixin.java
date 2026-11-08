@@ -162,7 +162,7 @@ public abstract class ClientPacketListenerMixin {
             .withStyle(
                style -> style.withColor(ChatFormatting.GREEN)
                   .withBold(true)
-                  .withClickEvent(new RunCommand("/os sz " + seedStr + versionArg))
+                  .withClickEvent(new RunCommand("/ov sz " + seedStr + versionArg))
                   .withHoverEvent(new ShowText(Component.literal("点击设置种子并开启矿物透视")))
             )
       );

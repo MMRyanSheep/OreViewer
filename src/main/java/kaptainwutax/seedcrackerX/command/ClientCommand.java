@@ -24,9 +24,9 @@ public abstract class ClientCommand {
    public final void register(CommandDispatcher<FabricClientCommandSource> dispatcher) {
       LiteralArgumentBuilder<FabricClientCommandSource> builder = ClientCommands.literal(this.getName());
       this.build(builder);
-      LiteralArgumentBuilder<FabricClientCommandSource> seedCrackerRootCommand = (LiteralArgumentBuilder<FabricClientCommandSource>)ClientCommands.literal("os")
+      LiteralArgumentBuilder<FabricClientCommandSource> seedCrackerRootCommand = (LiteralArgumentBuilder<FabricClientCommandSource>)ClientCommands.literal("ov")
          .executes(context -> {
-            Log.error("错误：请输入有效的指令，例如 /os ks 开始反推 或 /os sz 种子 设置矿物透视");
+            Log.error("错误：请输入有效的指令，例如 /ov ks 开始反推 或 /ov sz 种子 设置矿物透视");
             return 1;
          });
       dispatcher.register((LiteralArgumentBuilder)seedCrackerRootCommand.then(builder));

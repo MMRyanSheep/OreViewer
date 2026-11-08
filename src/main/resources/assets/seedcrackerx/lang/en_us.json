@@ -1,5 +1,5 @@
 {
-  "title": "OpenSeed",
+  "title": "OreViewer",
   "settings": "Settings",
   "settings.active": "Active",
   "settings.database": "Send 10+ player server seeds to the database",
@@ -41,7 +41,7 @@
   "info.hashedSeed": "Hashed seed",
   "info.noHashedSeed": "No hashed seed found",
   "fetchedHashedSeed": "The world seed in this dimension is different",
-  "foundRestorableStructures": "Found %s structure/s from the previous session. Restore them with /os data restore",
+  "foundRestorableStructures": "Found %s structure/s from the previous session. Restore them with /ov data restore",
   "foundStructureSeed": "Found structure seed ${SEED}.",
   "finishedSearchNoResult": "Finished search with no results.",
   "crossCompare": "Cross-compared seeds and reduced to ${SEED}.",
@@ -95,11 +95,11 @@
   "ks.alreadyRunning": "Seed cracking is already running.",
   "ks.progress": "Progress: collected %s1 / %s2 bits",
   "ks.lifting": "Liftable structures: collected %s1 / 40 bits",
-  "ks.hint": "Explore the world to find structures. Type /os cracker OFF to stop.",
+  "ks.hint": "Explore the world to find structures. Type /ov cracker OFF to stop.",
   "ks.finished": "Seed cracking succeeded! Collection stopped automatically.",
   "sz.seedSet": "World seed set to:",
   "sz.xrayEnabled": "Ore X-ray enabled. Diamond/Ancient Debris shown as colored boxes.",
-  "sz.openGuiHint": "Type /os xs to open ore X-ray settings.",
+  "sz.openGuiHint": "Type /ov xs to open ore X-ray settings.",
   "xs.title": "Ore X-ray Settings",
   "xs.overworld": "Overworld Ores",
   "xs.nether": "Nether Ores",
@@ -115,8 +115,8 @@
   "xs.renderDistance": "Render Distance (chunks)",
   "xs.antiXray": "Anti-Ore-Obfuscation Mode",
   "xs.antiXray.tooltip": "Renders ore boxes at seed-predicted worldgen positions regardless of the client block data. Shows buried ores that anti-xray servers fake as stone. Also works on vanilla servers.",
-  "xs.guidance": "Guidance switch (/os mdc, /os dx)",
-  "xs.guidance.tooltip": "Master switch for the on-screen guidance. When off, all end-city/structure/biome guidance scanning and rendering stops immediately for better performance. Running /os mdc or /os dx turns it back on automatically.",
+  "xs.guidance": "Guidance switch (/ov mdc, /ov dx)",
+  "xs.guidance.tooltip": "Master switch for the on-screen guidance. When off, all end-city/structure/biome guidance scanning and rendering stops immediately for better performance. Running /ov mdc or /ov dx turns it back on automatically.",
   "xs.seedInfo": "Current seed: %s",
   "zd.title": "Auto Miner Settings",
   "zd.settings": "Auto Miner",
@@ -134,6 +134,6 @@
   "zd.statusLapis": "Mining lapis ore",
   "zd.statusCopper": "Mining copper ore",
   "zd.statusEmerald": "Mining emerald ore",
-  "zd.usage": "Commands: /os zd 钻石|远古残骸|铁|金|煤|红石|青金石|铜|绿宝石 (start mining); /os zd 停止 (stop). Pathing/mining by Baritone; auto-respawn + /back on death; auto eats; drops junk when inventory full; in the Nether mines Nether quartz to repair a Mending pickaxe when low durability."
+  "zd.usage": "Commands: /ov zd 钻石|远古残骸|铁|金|煤|红石|青金石|铜|绿宝石 (start mining); /ov zd 停止 (stop). Pathing/mining by Baritone; auto-respawn + /back on death; auto eats; drops junk when inventory full; in the Nether mines Nether quartz to repair a Mending pickaxe when low durability."
 
 }

@@ -126,9 +126,9 @@ public class AutoMineManager {
       if (!FabricLoader.getInstance().isModLoaded("baritone")) {
          this.info("未检测到 Baritone。请将 Baritone 的 jar 与本 mod 一同放入 mods 文件夹后再使用自动挖矿。");
       } else if (newTasks == null || newTasks.isEmpty()) {
-         this.info("请指定要挖掘的矿物类型，例如 /os zd 钻石 青金石。");
+         this.info("请指定要挖掘的矿物类型，例如 /ov zd 钻石 青金石。");
       } else if (!OreXrayManager.INSTANCE.isActive()) {
-         this.info("请先用 /os sz <种子> 设置种子，自动挖矿根据种子预测的矿物位置进行挖掘。pro 破译出种子后点击 [直接设置] 即可。");
+         this.info("请先用 /ov sz <种子> 设置种子，自动挖矿根据种子预测的矿物位置进行挖掘。pro 破译出种子后点击 [直接设置] 即可。");
       } else {
          this.task.clear();
          this.task.addAll(newTasks);
@@ -170,11 +170,11 @@ public class AutoMineManager {
          }
 
          this.info(
-            "自动挖矿已启动（就近挖掘种子矿物，严格限制在 /os xs 渲染范围 "
+            "自动挖矿已启动（就近挖掘种子矿物，严格限制在 /ov xs 渲染范围 "
                + Math.max(1, OreXrayManager.INSTANCE.renderDistance)
                + " 个区块半径内，由 Baritone 原生寻路挖掘并自动绕岩浆/水）："
                + this.taskName(newTasks)
-               + "。停止请输入 /os zd 停止。"
+               + "。停止请输入 /ov zd 停止。"
          );
       }
    }

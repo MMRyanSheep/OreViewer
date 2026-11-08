@@ -7,4 +7,4 @@ pluginManagement {
     }
 }
 
-rootProject.name = 'OpenSeed26.3'
+rootProject.name = 'OreViewer'

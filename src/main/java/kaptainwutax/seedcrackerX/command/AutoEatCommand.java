@@ -10,7 +10,7 @@ import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 
-/** /os eat —— 饿肚子自动吃背包食物的开关与阈值。 */
+/** /ov eat —— 饿肚子自动吃背包食物的开关与阈值。 */
 public class AutoEatCommand extends ClientCommand {
    @Override
    public String getName() {

@@ -6,7 +6,7 @@ import kaptainwutax.seedcrackerX.elytra.ElytraHuntManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 
-/** {@code /os qc ...} - automatic elytra hunt in the outer End islands. */
+/** {@code /ov qc ...} - automatic elytra hunt in the outer End islands. */
 public class ElytraCommand extends ClientCommand {
    @Override
    public String getName() {
@@ -34,7 +34,7 @@ public class ElytraCommand extends ClientCommand {
                })
             )
       );
-      // 0 = unlimited (collect until /os qc 停止); n = stop after n new elytra.
+      // 0 = unlimited (collect until /ov qc 停止); n = stop after n new elytra.
       builder.then(
          ClientCommands.literal("目标")
             .then(
@@ -55,7 +55,7 @@ public class ElytraCommand extends ClientCommand {
       );
    }
 
-   /** Shared by the optional {@code /os elytra} alias. */
+   /** Shared by the optional {@code /ov elytra} alias. */
    static void buildShared(LiteralArgumentBuilder<FabricClientCommandSource> builder) {
       new ElytraCommand().build(builder);
    }

@@ -1,5 +1,5 @@
 {
-  "title": "OpenSeed",
+  "title": "OreViewer",
   "settings": "设置",
   "settings.active": "激活",
   "settings.database": "把有10+玩家的服务器的种子发送到数据库",
@@ -41,7 +41,7 @@
   "info.hashedSeed": "散列化的种子",
   "info.noHashedSeed": "没有找到散列化的种子",
   "fetchedHashedSeed": "获取散列化的世界种子",
-  "foundRestorableStructures": "找到了前一个会话中的 %s 个结构。用 /os data restore 来恢复它们",
+  "foundRestorableStructures": "找到了前一个会话中的 %s 个结构。用 /ov data restore 来恢复它们",
   "foundStructureSeed": "发现结构种子 ${SEED}",
   "finishedSearchNoResult": "搜索完成，无结果。",
   "crossCompare": "交叉比较了种子，并还原为${SEED}。",
@@ -95,11 +95,11 @@
   "ks.alreadyRunning": "种子反推已在运行中。",
   "ks.progress": "当前进度：已收集 %s1 / %s2 位",
   "ks.lifting": "可挖掘结构：已收集 %s1 / 40 位",
-  "ks.hint": "走动探索世界，结构会自动识别。输入 /os cracker OFF 停止。",
+  "ks.hint": "走动探索世界，结构会自动识别。输入 /ov cracker OFF 停止。",
   "ks.finished": "种子反推成功！已自动停止收集。",
   "sz.seedSet": "已设置世界种子：",
   "sz.xrayEnabled": "矿物透视已开启，钻石/远古残骸位置将以彩色方块显示。",
-  "sz.openGuiHint": "输入 /os xs 打开矿物透视设置界面。",
+  "sz.openGuiHint": "输入 /ov xs 打开矿物透视设置界面。",
   "xs.title": "矿物透视设置",
   "xs.overworld": "主世界矿物",
   "xs.nether": "下界矿物",
@@ -115,8 +115,8 @@
   "xs.renderDistance": "渲染距离（区块）",
   "xs.antiXray": "反矿物透视模式",
   "xs.antiXray.tooltip": "开启后按种子推算的矿物生成位置渲染框体，不依赖客户端收到的真实方块数据。在开了反矿物透视的服务器上可透视到被伪装成石头的深层矿物。原版服务器也适用。",
-  "xs.guidance": "指引开关（/os mdc、/os dx）",
-  "xs.guidance.tooltip": "屏幕指向指引的总开关。关闭后立即停止所有末地城/结构/群系指引的计算与渲染，可显著降低卡顿。再次输入 /os mdc 或 /os dx 会自动重新开启。",
+  "xs.guidance": "指引开关（/ov mdc、/ov dx）",
+  "xs.guidance.tooltip": "屏幕指向指引的总开关。关闭后立即停止所有末地城/结构/群系指引的计算与渲染，可显著降低卡顿。再次输入 /ov mdc 或 /ov dx 会自动重新开启。",
   "xs.seedInfo": "当前种子：%s",
   "zd.title": "自动挖矿设置",
   "zd.settings": "自动挖矿",
@@ -134,6 +134,6 @@
   "zd.statusLapis": "正在自动挖青金石矿",
   "zd.statusCopper": "正在自动挖铜矿",
   "zd.statusEmerald": "正在自动挖绿宝石矿",
-  "zd.usage": "指令：/os zd 钻石|远古残骸|铁|金|煤|红石|青金石|铜|绿宝石 启动对应矿物；/os zd 停止 停止挖矿。寻路挖掘由 Baritone 执行；死亡自动复活并 /back；饥饿自动吃背包食物（全局自动进食可用 /os eat 开关）；背包满自动存潜影盒；地狱镐子耐久不足自动挖下界石英修复（需经验修补）。"
+  "zd.usage": "指令：/ov zd 钻石|远古残骸|铁|金|煤|红石|青金石|铜|绿宝石 启动对应矿物；/ov zd 停止 停止挖矿。寻路挖掘由 Baritone 执行；死亡自动复活并 /back；饥饿自动吃背包食物（全局自动进食可用 /ov eat 开关）；背包满自动存潜影盒；地狱镐子耐久不足自动挖下界石英修复（需经验修补）。"
 
 }

@@ -71,7 +71,7 @@ public class SeedCommand extends ClientCommand {
       Config.save();
       sendFeedback("种子已设置：" + seed + versionNote, ChatFormatting.GREEN);
       sendFeedback("矿物透视已开启（种子已保存，下次启动自动加载）", ChatFormatting.AQUA);
-      sendFeedback("结构/生物群系指引（/os dx、/os mdc）将按该版本推算", ChatFormatting.GRAY);
+      sendFeedback("结构/生物群系指引（/ov dx、/ov mdc）将按该版本推算", ChatFormatting.GRAY);
       return 0;
    }
 

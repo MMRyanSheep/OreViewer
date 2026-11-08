@@ -405,9 +405,9 @@ public final class VanillaStructureLocator {
                   HolderLookup.Provider reg = registries();
                   LevelStorageSource.LevelStorageAccess storage = null;
                   try {
-                     Path dir = Files.createTempDirectory("openseed-worldgen-");
+                     Path dir = Files.createTempDirectory("oreviewer-worldgen-");
                      LevelStorageSource source = LevelStorageSource.createDefault(dir);
-                     storage = source.createAccess("openseed");
+                     storage = source.createAccess("oreviewer");
                      templateStorage = storage;
                      Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                         LevelStorageSource.LevelStorageAccess s = templateStorage;

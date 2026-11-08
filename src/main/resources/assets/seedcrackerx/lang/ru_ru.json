@@ -1,5 +1,5 @@
 {
-  "title": "OpenSeed",
+  "title": "OreViewer",
   "settings": "Настройки",
   "settings.active": "Крякер включен?",
   "settings.database": "Отправить в базу данных? (Работает если больше 10 игроков на сервере)",
@@ -40,7 +40,7 @@
   "info.hashedSeed": "Хешированный сид",
   "info.noHashedSeed": "Хешированный сид не был найден",
   "fetchedHashedSeed": "Сид в данном измерении отличается от прошлого.",
-  "foundRestorableStructures": "Найдено %s структур с прошлой сессии. Восстановите их с помощью /os data restore",
+  "foundRestorableStructures": "Найдено %s структур с прошлой сессии. Восстановите их с помощью /ov data restore",
   "foundStructureSeed": "Найден структурный сид ${SEED}.",
   "finishedSearchNoResult": "Поиск окончен без результатов.",
   "crossCompare": "Перекрестно сравниваем сиды и скоращаем ${SEED}.",

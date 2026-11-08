@@ -449,8 +449,8 @@ public final class BedrockCollector {
                .withStyle(
                   style -> style.withColor(ChatFormatting.AQUA)
                      .withBold(true)
-                     .withClickEvent(new RunCommand("/os sz " + seed))
-                     .withHoverEvent(new ShowText(Component.literal("点击直接设置种子 " + seed + "（等价执行 /os sz " + seed + "）")))
+                     .withClickEvent(new RunCommand("/ov sz " + seed))
+                     .withHoverEvent(new ShowText(Component.literal("点击直接设置种子 " + seed + "（等价执行 /ov sz " + seed + "）")))
                )
          );
          if (!single) {
@@ -464,10 +464,10 @@ public final class BedrockCollector {
       }
 
       if (!single) {
-         say("存在多个世界种子候选（服务器登录种子可能被混淆，无法用哈希校验区分），可依次点击 [直接设置] 并用 /os zd 验证", ChatFormatting.YELLOW);
+         say("存在多个世界种子候选（服务器登录种子可能被混淆，无法用哈希校验区分），可依次点击 [直接设置] 并用 /ov zd 验证", ChatFormatting.YELLOW);
       }
 
-      say("也可以复制种子数字手动执行 /os sz <种子>；/os pro off 可关闭破混淆采集", ChatFormatting.GRAY);
+      say("也可以复制种子数字手动执行 /ov sz <种子>；/ov pro off 可关闭破混淆采集", ChatFormatting.GRAY);
    }
 
    private static void say(String message, ChatFormatting color) {

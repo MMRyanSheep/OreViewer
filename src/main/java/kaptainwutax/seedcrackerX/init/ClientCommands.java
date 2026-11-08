@@ -33,7 +33,7 @@ import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.ChatFormatting;
 
 public class ClientCommands {
-   public static final String PREFIX = "os";
+   public static final String PREFIX = "ov";
    public static final List<ClientCommand> COMMANDS = new ArrayList<>();
    public static RenderCommand RENDER;
    public static FinderCommand FINDER;
@@ -56,7 +56,7 @@ public class ClientCommands {
    public static void registerCommands(CommandDispatcher<FabricClientCommandSource> dispatcher) {
       COMMANDS.forEach(clientCommand -> clientCommand.register(dispatcher));
       dispatcher.register(
-         (LiteralArgumentBuilder)net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal("os")
+         (LiteralArgumentBuilder)net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal("ov")
             .then(net.fabricmc.fabric.api.client.command.v2.ClientCommands.argument("args", StringArgumentType.greedyString()).executes(context -> {
                ClientCommand.sendFeedback("未知指令，请检查拼写", ChatFormatting.RED);
                return 1;

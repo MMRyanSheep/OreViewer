@@ -75,7 +75,7 @@ public class AutoMineCommand extends ClientCommand {
       }
 
       if (!OreXrayManager.INSTANCE.isActive()) {
-         sendFeedback("[自动挖矿] 提示：尚未用 /os sz 设置种子，自动挖矿需要种子预测矿物位置；pro 破译出种子后点击 [直接设置] 即可。", ChatFormatting.YELLOW);
+         sendFeedback("[自动挖矿] 提示：尚未用 /ov sz 设置种子，自动挖矿需要种子预测矿物位置；pro 破译出种子后点击 [直接设置] 即可。", ChatFormatting.YELLOW);
       }
 
       Set<AutoMineManager.Task> tasks = new LinkedHashSet<>();

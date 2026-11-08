@@ -54,7 +54,7 @@ import org.slf4j.LoggerFactory;
  * are not a reason to refuse starting, they are simply recorded as the baseline.
  * After each pickup the baseline is refreshed and the state machine moves on to
  * the next candidate instead of stopping. It keeps going until the configured
- * target count is reached, the inventory is full, or {@code /os qc 停止} is
+ * target count is reached, the inventory is full, or {@code /ov qc 停止} is
  * used.</p>
  *
  * <p>Locating is always done on a single background executor because
@@ -84,7 +84,28 @@ public final class ElytraHuntManager {
    private static final long VERIFY_APPROACH_TIMEOUT_MS = 20000L;
    // Sweeps may have to dig through an end-ship hull, so give them more room.
    private static final long VERIFY_TIMEOUT_MS = 30000L;
-   private static final long TRAVEL_TIMEOUT_MS = 120000L;
+   /**
+    * There is NO fixed flight-time limit any more. The old 120 s wall clock was
+    * the only deadline, so a ship 5000+ blocks away (the outward search pushes
+    * 1500 blocks per round, up to ~100000 in late rounds) was abandoned with
+    * "飞行超时" while the player was still closing in at full speed. Instead we
+    * only give up after a continuous no-progress window: every real step
+    * towards the ship renews the deadline, so trip length can never cause a
+    * false timeout. See {@link #travelDeadlineMs}.
+    */
+   /** Grace period before the first measurable progress (climb out, chunk load). */
+   private static final long TRAVEL_START_GRACE_MS = 120000L;
+   /** +1 s of start grace per this many blocks of initial distance, capped. */
+   private static final double TRAVEL_GRACE_PER_BLOCKS = 250.0;
+   private static final long TRAVEL_MAX_START_GRACE_MS = 240000L;
+   /**
+    * Give up only after this long without any progress. Generous on purpose:
+    * mining through an island can stall horizontal progress for a while, and a
+    * false "飞行超时" is far worse than a slow give-up.
+    */
+   private static final long TRAVEL_STALL_MS = 90000L;
+   /** Distance improvement that counts as progress and renews the deadline. */
+   private static final double TRAVEL_PROGRESS_STEP = 12.0;
    private static final long TAKE_TIMEOUT_MS = 10000L;
    // Vertical-column approach: locate the item frame, climb directly above its
    // X/Z column, then dig straight down through the ship hull. After a pickup
@@ -135,16 +156,21 @@ public final class ElytraHuntManager {
    private static final long DROP_DIG_MS = 8000L;
    private static final double REBIND_RADIUS = 8.0;
    private static final double DROP_RADIUS = 48.0;
-   /** Budget for clearing every guard around a located elytra before searching it. */
+   /** Budget for clearing the ONE guard in front of the elytra frame. */
    private static final long THREAT_TIMEOUT_MS = 25000L;
    private static final long COMBAT_COOLDOWN_MS = 550L;
    private static final double THREAT_ATTACK_RANGE_SQ = 20.25;
    /**
-    * Once the shaft reaches the elytra, any living Shulker this close can fire
-    * levitation missiles. Levitation overrides our flight steering and wrecks
-    * pathfinding, so all of them must die before the state machine is allowed
-    * to look for / approach / pick up the elytra.
+    * Vanilla end_city/ship.nbt (26.3) places exactly three "Sentry" structure
+    * blocks that spawn Shulkers: (6,4,8) in front of / below the "Elytra"
+    * item frame at (6,5,7), plus (8,6,27) on the deck and (4,11,27) on the
+    * mast. Only the first one is ~2 blocks from the frame (and actually sits
+    * in the vertical shaft we dig); the other two are ~20 blocks away and do
+    * not need to die. Selecting by distance to the FRAME rather than to the
+    * player is what limits the kill to that single guard.
     */
+   private static final double GUARD_ANCHOR_RADIUS_SQ = 8.0 * 8.0;
+   /** Still only engage when the player is close enough to the ship to matter. */
    private static final double GUARD_CLEAR_RADIUS_SQ = 24.0 * 24.0;
    private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
    // Approach points around the ship: stay outside the hull but well inside
@@ -223,7 +249,7 @@ public final class ElytraHuntManager {
    private int sweepCount;
    private int baselineElytra;
    private int collected;
-   /** 0 = keep collecting until {@code /os qc 停止}. */
+   /** 0 = keep collecting until {@code /ov qc 停止}. */
    private int targetElytra;
    private int candidateCount = DEFAULT_CANDIDATES;
    private int attempts;
@@ -238,6 +264,10 @@ public final class ElytraHuntManager {
    private int minTargetRadius;
    private int attackAttempts;
    private long phaseStartMs;
+   /** Absolute deadline for the current cruise; renewed whenever the ship gets closer. */
+   private long travelDeadlineMs;
+   /** Smallest horizontal distance to the ship seen during this cruise. */
+   private double travelBestHoriz;
    private long globalStartMs;
    private long lastInfoMs;
    private long lastScanMs;
@@ -320,11 +350,11 @@ public final class ElytraHuntManager {
 
    // ------------------------------------------------------------------ start / stop
 
-   /** Called by {@code /os qc}. Performs every precondition check listed in the plan. */
+   /** Called by {@code /ov qc}. Performs every precondition check listed in the plan. */
    public void start() {
       Minecraft mc = Minecraft.getInstance();
       if (this.isRunning()) {
-         this.info("已在运行中；如需退出请执行 /os qc 停止", ChatFormatting.YELLOW);
+         this.info("已在运行中；如需退出请执行 /ov qc 停止", ChatFormatting.YELLOW);
          return;
       }
       LocalPlayer player = mc.player;
@@ -338,7 +368,7 @@ public final class ElytraHuntManager {
          return;
       }
       if (!OreXrayManager.INSTANCE.isActive()) {
-         this.fail("尚未设置世界种子，请先用 /os sz <种子> 设置");
+         this.fail("尚未设置世界种子，请先用 /ov sz <种子> 设置");
          return;
       }
       if (!player.isAlive() || player.isRemoved()) {
@@ -386,7 +416,7 @@ public final class ElytraHuntManager {
       this.phase = Phase.LOCATING;
       this.phaseStartMs = this.globalStartMs;
       this.info(
-         "开始持续收集（目标 " + (this.targetElytra == 0 ? "不限，/os qc 停止 结束" : this.targetElytra + " 个")
+         "开始持续收集（目标 " + (this.targetElytra == 0 ? "不限，/ov qc 停止 结束" : this.targetElytra + " 个")
             + "），离线定位带船末地城（候选数 " + this.candidateCount + "）…",
          ChatFormatting.GREEN
       );
@@ -411,7 +441,7 @@ public final class ElytraHuntManager {
       this.targetElytra = Math.max(0, Math.min(MAX_TARGET_ELYTRA, count));
       this.info(
          this.targetElytra == 0
-            ? "目标数量设为不限（持续收集，/os qc 停止 结束）"
+            ? "目标数量设为不限（持续收集，/ov qc 停止 结束）"
             : "目标数量已设为 " + this.targetElytra + " 个鞘翅",
          ChatFormatting.GREEN
       );
@@ -476,6 +506,9 @@ public final class ElytraHuntManager {
             + " 玩家高度=" + (player == null ? -1 : (int)player.getY())
             + " 抬升次数=" + this.flight.liftRetries()
             + " 导航=" + this.flight.navState()
+            + " 无进展剩余=" + (this.travelDeadlineMs == 0L
+               ? 0 : Math.max(0L, (this.travelDeadlineMs - System.currentTimeMillis()) / 1000L)) + "s"
+            + " 最近距离=" + (int)this.travelBestHoriz
             + " 挖掘=" + (this.flight.miningBlock() == null ? "无" : format(this.flight.miningBlock())),
          ChatFormatting.AQUA
       );
@@ -511,6 +544,7 @@ public final class ElytraHuntManager {
             + " 清怪计时=" + (this.threatSinceMs == 0L
                ? 0 : (System.currentTimeMillis() - this.threatSinceMs)) + "ms"
             + " 守卫优先=" + this.guardClearanceActive()
+            + " 守卫锚点=" + formatVec(this.guardAnchor(mc.level, player))
             + " 准星=" + (mc.hitResult == null ? "null" : mc.hitResult.getType()),
          ChatFormatting.AQUA
       );
@@ -599,6 +633,11 @@ public final class ElytraHuntManager {
 
       // 自动进食占用右键/快捷栏期间让路，避免互相抢输入。
       if (AutoEatManager.INSTANCE.isBusy()) {
+         if (this.phase == Phase.TRAVELLING) {
+            this.travelDeadlineMs = Math.max(
+               this.travelDeadlineMs, System.currentTimeMillis() + TRAVEL_STALL_MS
+            );
+         }
          return;
       }
 
@@ -623,6 +662,11 @@ public final class ElytraHuntManager {
       if (ShulkerAutoStore.INSTANCE.isBusy()) {
          this.baselineElytra = countElytra(player);
          this.phaseStartMs = now;
+         // Storing into a shulker box pauses the cruise: do not bill it to the
+         // flight budget, otherwise a far target times out during the pause.
+         if (this.phase == Phase.TRAVELLING) {
+            this.travelDeadlineMs = Math.max(this.travelDeadlineMs, now + TRAVEL_STALL_MS);
+         }
          if (this.columnSinceMs != 0L) {
             this.columnSinceMs = now;
          }
@@ -831,6 +875,17 @@ public final class ElytraHuntManager {
       return chosen;
    }
 
+   /**
+    * Grace before the first progress. Slightly longer for distant ships
+    * (climbing to cruise altitude and waiting for chunk generation both take
+    * wall-clock), but still bounded - the rolling no-progress deadline takes
+    * over as soon as the player starts moving.
+    */
+   private static long travelStartGraceMs(double distance) {
+      long extra = (long)(distance / TRAVEL_GRACE_PER_BLOCKS * 1000.0);
+      return Math.min(TRAVEL_MAX_START_GRACE_MS, TRAVEL_START_GRACE_MS + extra);
+   }
+
    private void nextCandidate(LocalPlayer player, long now) {
       if (this.queue.isEmpty()) {
          if (!this.pushOriginAndRelocate(player, now)) {
@@ -855,6 +910,10 @@ public final class ElytraHuntManager {
       this.phase = Phase.TRAVELLING;
       BlockPos city = this.current.pos();
       BlockPos ship = this.current.target();
+      double initialHoriz = player == null ? 0.0
+         : Math.hypot(ship.getX() + 0.5 - player.getX(), ship.getZ() + 0.5 - player.getZ());
+      this.travelBestHoriz = initialHoriz;
+      this.travelDeadlineMs = now + travelStartGraceMs(initialHoriz);
       int shipY = ship.getY() > 0 ? ship.getY() : DEFAULT_SHIP_Y;
       this.flight.setMinCruiseY(Math.max(FlyController.CRUISE_Y, shipY + 28));
       // Prepare the low-altitude approach point for the VERIFYING phase.
@@ -867,6 +926,7 @@ public final class ElytraHuntManager {
       this.info(
          "飞往船坐标 #" + this.attempts + " (" + ship.getX() + ", " + ship.getY() + ", " + ship.getZ() + ")"
             + (this.current.shipLocated() ? "" : "（离线未解析船坐标，暂用城坐标）")
+            + "，距离 " + (int)initialHoriz + " 格（进度制超时，持续靠近不会换点）"
             + "，剩余 " + this.queue.size(),
          ChatFormatting.AQUA
       );
@@ -890,14 +950,34 @@ public final class ElytraHuntManager {
          this.nextCandidate(player, now);
          return;
       }
-      if (now - this.phaseStartMs > TRAVEL_TIMEOUT_MS) {
-         this.nextCandidateWithReason(player, now, "飞行超时");
-         return;
-      }
       // Fly to the ship, not to the city's /locate position.
       BlockPos pos = this.current.target();
       Vec3 target = new Vec3(pos.getX() + 0.5, this.flight.cruiseY(), pos.getZ() + 0.5);
       double horiz = Math.hypot(target.x - player.getX(), target.z - player.getZ());
+
+      // If starting low or inside an enclosed structure (e.g. inside the previous End Ship cabin),
+      // climb steeply to cruiseY first and allow mining through any blocking ceiling/tree.
+      boolean climbingToCruise = player.getY() < this.flight.cruiseY() - 14.0 && horiz > 24.0;
+
+      // A distant ship is NOT a timed-out ship. There is no wall-clock flight
+      // limit at all: only a continuous no-progress window retires a candidate.
+      // Every real step towards the ship (plus active digging / climb-out)
+      // renews the deadline, so even a 100000-block target can be reached.
+      if (this.travelDeadlineMs == 0L) {
+         this.travelBestHoriz = horiz;
+         this.travelDeadlineMs = now + travelStartGraceMs(horiz);
+      }
+      boolean closingIn = horiz + TRAVEL_PROGRESS_STEP < this.travelBestHoriz;
+      if (closingIn) {
+         this.travelBestHoriz = horiz;
+      }
+      if (closingIn || climbingToCruise || this.flight.isMining()) {
+         this.travelDeadlineMs = now + TRAVEL_STALL_MS;
+      }
+      if (now > this.travelDeadlineMs) {
+         this.nextCandidateWithReason(player, now, "飞行无进展（距目标仍有 " + (int)horiz + " 格）");
+         return;
+      }
 
       // Early entity scan when approaching the ship horizontally so we lock on immediately if already synced.
       if (horiz < 64.0 && now - this.lastScanMs >= 500L) {
@@ -925,9 +1005,6 @@ public final class ElytraHuntManager {
          return;
       }
 
-      // If starting low or inside an enclosed structure (e.g. inside the previous End Ship cabin),
-      // climb steeply to cruiseY first and allow mining through any blocking ceiling/tree.
-      boolean climbingToCruise = player.getY() < this.flight.cruiseY() - 14.0 && horiz > 24.0;
       Vec3 navTarget = target;
       if (climbingToCruise) {
          double ux = (target.x - player.getX()) / Math.max(horiz, 1.0);
@@ -957,7 +1034,8 @@ public final class ElytraHuntManager {
       }
       this.throttledInfo(
          "飞行中，距目标 " + (int)horiz + " 格，巡航高度 " + this.flight.cruiseY()
-            + "，导航=" + state,
+            + "，导航=" + state
+            + "，无进展剩余 " + Math.max(0L, (this.travelDeadlineMs - now) / 1000L) + " 秒",
          now
       );
    }
@@ -1290,7 +1368,7 @@ public final class ElytraHuntManager {
       return player.position().add(0.0, 0.0, 1.0);
    }
 
-   /** True in the close-quarters stages where levitating guards must be cleared first. */
+   /** True in the close-quarters stages where the single elytra guard must be cleared first. */
    private boolean guardClearanceActive() {
       return this.phase == Phase.VERIFYING
          || this.phase == Phase.APPROACHING
@@ -1298,15 +1376,57 @@ public final class ElytraHuntManager {
    }
 
    /**
-    * Nearest living Shulker that can actually see us (and therefore fire
-    * levitation missiles) inside the clearance radius. Unlike
-    * {@link FlyController#findThreat}, this does not require the mob to sit on
-    * the ray to the current waypoint: a guard beside the elytra is just as
-    * dangerous while we are digging the shaft, scanning for the frame or
-    * chasing the dropped item.
+    * World-space position of the elytra frame (or the popped elytra drop) on
+    * this ship. Before {@link #tryLockTargetFromScan} records
+    * {@link #targetFramePos} we resolve it from the synced entities so the
+    * guard can be engaged as soon as the frame becomes visible. If nothing is
+    * synced yet we return {@code null}: without the frame there is no way to
+    * tell which of the ship's three Shulkers is the guard, so we kill NONE of
+    * them rather than clearing the whole ship.
+    */
+   private Vec3 guardAnchor(ClientLevel level, LocalPlayer player) {
+      if (this.targetFramePos != null) {
+         return Vec3.atCenterOf(this.targetFramePos);
+      }
+      if (level == null || player == null) {
+         return null;
+      }
+      Vec3 best = null;
+      double bestScore = Double.MAX_VALUE;
+      for (Entity entity : level.entitiesForRendering()) {
+         if (entity == null || entity.isRemoved() || !entity.isAlive()) {
+            continue;
+         }
+         boolean frame = entity instanceof ItemFrame
+            && !frameItem(entity).isEmpty() && frameItem(entity).getItem() == Items.ELYTRA;
+         boolean drop = entity instanceof ItemEntity item && item.getItem().getItem() == Items.ELYTRA;
+         if (!frame && !drop) {
+            continue;
+         }
+         // Prefer the real frame over a drop, then the one closest to the player.
+         double score = (frame ? 0.0 : 1_000_000.0) + player.distanceToSqr(entity);
+         if (score < bestScore) {
+            bestScore = score;
+            best = entity.position();
+         }
+      }
+      return best;
+   }
+
+   /**
+    * The single Shulker generated in front of the elytra item frame. Selection
+    * is anchored to the FRAME, not to the player: the old implementation killed
+    * every visible Shulker within 24 blocks of the player, which meant the deck
+    * and mast sentries (and guards of neighbouring ships) died too. Once this
+    * one guard is gone no Shulker remains inside {@link #GUARD_ANCHOR_RADIUS_SQ},
+    * so combat automatically stops - there is no chain-killing.
     */
    private Entity findGuard(ClientLevel level, LocalPlayer player) {
       if (level == null) {
+         return null;
+      }
+      Vec3 anchor = this.guardAnchor(level, player);
+      if (anchor == null) {
          return null;
       }
       Entity best = null;
@@ -1316,15 +1436,18 @@ public final class ElytraHuntManager {
             || entity.getType() != EntityTypes.SHULKER) {
             continue;
          }
-         double distance = player.distanceToSqr(entity);
-         if (distance > GUARD_CLEAR_RADIUS_SQ || distance >= bestDistance) {
+         double anchorDistance = entity.position().distanceToSqr(anchor);
+         if (anchorDistance > GUARD_ANCHOR_RADIUS_SQ || anchorDistance >= bestDistance) {
+            continue;
+         }
+         if (player.distanceToSqr(entity) > GUARD_CLEAR_RADIUS_SQ) {
             continue;
          }
          if (!hasUnobstructedSight(level, player, entity.getBoundingBox().getCenter())) {
             continue;
          }
          best = entity;
-         bestDistance = distance;
+         bestDistance = anchorDistance;
       }
       return best;
    }
@@ -1334,14 +1457,15 @@ public final class ElytraHuntManager {
     * this is the fallback for a guard tucked inside the ship hull.
     *
     * <p>Once we are beside the elytra (VERIFYING / APPROACHING / TAKING) this
-    * becomes a hard gate: every nearby living Shulker is killed <b>before</b>
-    * the state machine scans for the frame, digs the vertical shaft, attacks
-    * the frame or chases the dropped elytra. A Shulker's levitation effect
+    * becomes a hard gate: the ONE Shulker spawned in front of the elytra frame
+    * is killed <b>before</b> the state machine digs the vertical shaft, attacks
+    * the frame or chases the dropped elytra. That guard's levitation effect
     * overrides the FlyController steering, so pathfinding, mining and pickup
-    * all break if we keep looking for the elytra while the guard is alive.
-    * Combat therefore also takes priority over an active block break and a
-    * close drop chase in these phases. Farther away (long cruise) the original
-    * ray-based "only the mob blocking the path" behaviour is kept.</p>
+    * all break if we keep working while it is alive. Combat therefore also
+    * takes priority over an active block break and a close drop chase.
+    * The deck / mast sentries are deliberately left alone - they are ~20 blocks
+    * from the frame and never sit in the shaft. Farther away (long cruise) the
+    * original ray-based "only the mob blocking the path" behaviour is kept.</p>
     *
     * @return true when this tick was consumed by combat (skip the normal phase).
     */
@@ -1387,13 +1511,17 @@ public final class ElytraHuntManager {
       if (this.threatSinceMs == 0L) {
          this.threatSinceMs = now;
          LOGGER.info("[elytra] {}潜影贝 id={} at {}，{}",
-            clearingGuards ? "鞘翅附近有" : "路径被",
+            clearingGuards ? "鞘翅展示框前有" : "路径被",
             threat.getId(), threat.blockPosition(),
-            clearingGuards ? "先清怪再寻找鞘翅" : "开始清除挡路实体");
+            clearingGuards ? "仅击杀这一只守卫" : "开始清除挡路实体");
       }
       // Clearing a guard is not a normal approach step: do not let it consume
       // the verify / column / take / drop-chase timeouts.
       this.phaseStartMs = now;
+      if (this.phase == Phase.TRAVELLING) {
+         // The rare long-cruise shulker fight must not eat the flight budget.
+         this.travelDeadlineMs = Math.max(this.travelDeadlineMs, now + TRAVEL_STALL_MS);
+      }
       if (this.columnSinceMs != 0L) {
          this.columnSinceMs = now;
          this.columnBlockedSinceMs = 0L;
@@ -1438,7 +1566,7 @@ public final class ElytraHuntManager {
          this.flight.navigate(mc, level, player, stand, true, true);
       }
       this.throttledInfo(
-         clearingGuards ? "鞘翅旁有潜影贝，优先击杀后再寻找鞘翅…" : "前方有潜影贝挡路，正在清除…", now
+         clearingGuards ? "正在击杀鞘翅展示框前那一只守卫潜影贝…" : "前方有潜影贝挡路，正在清除…", now
       );
       if (now - this.threatSinceMs > timeout) {
          LOGGER.warn("[elytra] 清除挡路实体超时 {} ms，改为无视守卫直接取物", now - this.threatSinceMs);
@@ -2092,6 +2220,14 @@ public final class ElytraHuntManager {
 
    private static String format(BlockPos pos) {
       return "(" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")";
+   }
+
+   private static String formatVec(Vec3 pos) {
+      if (pos == null) {
+         return "无";
+      }
+      return "(" + String.format("%.1f", pos.x) + ", " + String.format("%.1f", pos.y)
+         + ", " + String.format("%.1f", pos.z) + ")";
    }
 
    private void info(String message, ChatFormatting color) {

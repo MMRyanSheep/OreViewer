@@ -25,7 +25,7 @@ import org.slf4j.LoggerFactory;
 
 public class StructureSave {
    private static final Logger logger = LoggerFactory.getLogger("structureSave");
-   public static final Path saveDir = Paths.get(FabricLoader.getInstance().getConfigDir().toFile().toString(), "OpenSeed saved structures");
+   public static final Path saveDir = Paths.get(FabricLoader.getInstance().getConfigDir().toFile().toString(), "OreViewer saved structures");
 
    public static void saveStructures(ScheduledSet<DataStorage.Entry<Data<?>>> baseData) {
       try {

@@ -1,5 +1,5 @@
 {
-  "title": "OpenSeed",
+  "title": "OreViewer",
   "settings": "Ayarlar",
   "settings.active": "Aktif",
   "settings.database": "10+ üstü oyuncu bulunan sunucu seed'lerini veri tabanına gönder",
@@ -40,7 +40,7 @@
   "info.hashedSeed": "Hash'lanmış seed",
   "info.noHashedSeed": "Hiç hash'lanmış seed bulunamadı",
   "fetchedHashedSeed": "Bu boyutta dünya seed'i farklı",
-  "foundRestorableStructures": "Önceki oturumdan %s yapı(lar) bulundu. Şu komut ile kurtarın: /os data restore",
+  "foundRestorableStructures": "Önceki oturumdan %s yapı(lar) bulundu. Şu komut ile kurtarın: /ov data restore",
   "foundStructureSeed": "Yapı seed'i bulundu: ${SEED}",
   "finishedSearchNoResult": "Arama sonuç bulunamadan tamamlandı.",
   "crossCompare": "Seed'ler çapraz-karşılaştırma ile karşılaştırıldı ve ${SEED}'a azaltıldı",
