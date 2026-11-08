@@ -9,7 +9,8 @@
     "ClientLevelMixin",
     "ClientPacketListenerMixin",
     "InventoryMixin",
-    "LocalPlayerMixin"
+    "LocalPlayerMixin",
+    "MultiPlayerGameModeMixin"
   ],
   "injectors": {
     "defaultRequire": 1

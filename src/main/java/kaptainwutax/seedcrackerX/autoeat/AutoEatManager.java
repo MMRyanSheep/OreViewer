@@ -164,14 +164,6 @@ public final class AutoEatManager {
          return;
       }
 
-      try {
-         if (ElytraHuntManager.INSTANCE.isRunning()) {
-            return;
-         }
-      } catch (Throwable ignored) {
-         // 选装功能不可用时不影响自动进食。
-      }
-
       int hunger = player.getFoodData().getFoodLevel();
       if (hunger > threshold() || !player.canEat(false)) {
          return;
@@ -184,6 +176,17 @@ public final class AutoEatManager {
             this.warn("饱食度只剩 " + hunger + "/20，但背包里没有可自动食用的食物。", WARN_INTERVAL_MS);
          }
          return;
+      }
+
+      // 旧逻辑只要鞘翅搜寻在跑就直接放弃触发，导致长时间搜寻时自动进食完全失效。
+      // 改为在「确实要开吃」时请求它干净地暂停（松开飞行/攻击键、冻结计时）并让路；
+      // 它正在挖掘/攻击、不便交出控制权时，本次跳过扫描，等下一次再试。
+      try {
+         if (!ElytraHuntManager.INSTANCE.suspendForAutoEat()) {
+            return;
+         }
+      } catch (Throwable ignored) {
+         // 选装功能不可用时不影响自动进食。
       }
 
       this.originalSelectedSlot = player.getInventory().getSelectedSlot();

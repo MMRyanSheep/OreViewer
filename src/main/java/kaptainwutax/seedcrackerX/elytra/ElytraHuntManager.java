@@ -22,6 +22,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ServerboundAttackPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityTypes;
@@ -156,22 +157,26 @@ public final class ElytraHuntManager {
    private static final long DROP_DIG_MS = 8000L;
    private static final double REBIND_RADIUS = 8.0;
    private static final double DROP_RADIUS = 48.0;
-   /** Budget for clearing the ONE guard in front of the elytra frame. */
-   private static final long THREAT_TIMEOUT_MS = 25000L;
-   private static final long COMBAT_COOLDOWN_MS = 550L;
-   private static final double THREAT_ATTACK_RANGE_SQ = 20.25;
    /**
-    * Vanilla end_city/ship.nbt (26.3) places exactly three "Sentry" structure
-    * blocks that spawn Shulkers: (6,4,8) in front of / below the "Elytra"
-    * item frame at (6,5,7), plus (8,6,27) on the deck and (4,11,27) on the
-    * mast. Only the first one is ~2 blocks from the frame (and actually sits
-    * in the vertical shaft we dig); the other two are ~20 blocks away and do
-    * not need to die. Selecting by distance to the FRAME rather than to the
-    * player is what limits the kill to that single guard.
+    * The Shulker guarding the elytra frame is deliberately IGNORED.
+    *
+    * <p>The previous "clear the guard first" behaviour called hover() ->
+    * stopMining() and swapped to a weapon whenever the shaft opened a line
+    * of sight to the Shulker. Every such switch sent ABORT_DESTROY_BLOCK,
+    * so the server-side break progress restarted from zero; back in the
+    * approach phase the shaft opened line of sight again and the hunt
+    * flipped into combat once more. Mine / fight / mine / fight, forever.</p>
+    *
+    * <p>Instead we only knock away the projectiles it fires.
+    * ServerGamePacketListenerImpl.handleAttack (26.3) validates a melee
+    * attack with isWithinAttackRange(mainHand, entityBox, 3.0) and does NOT
+    * check the crosshair, so a plain ServerboundAttackPacket destroys a
+    * ShulkerBullet without turning the player, changing tools or touching
+    * the active block break.</p>
     */
-   private static final double GUARD_ANCHOR_RADIUS_SQ = 8.0 * 8.0;
-   /** Still only engage when the player is close enough to the ship to matter. */
-   private static final double GUARD_CLEAR_RADIUS_SQ = 24.0 * 24.0;
+   private static final double BULLET_SWAT_RANGE_SQ = 3.0 * 3.0;
+   /** Rate-limit the packets; a single hit destroys a ShulkerBullet. */
+   private static final long BULLET_SWAT_COOLDOWN_MS = 120L;
    private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
    // Approach points around the ship: stay outside the hull but well inside
    // entity tracking range. A new angle is used for every re-scan attempt.
@@ -286,8 +291,10 @@ public final class ElytraHuntManager {
    private String dropIssue;
    private int rebindCount;
    private String targetIssue;
-   private long threatSinceMs;
-   private long lastCombatMs;
+   /** Defensive-only: last time a ShulkerBullet was knocked away. */
+   private long lastBulletSwatMs;
+   private int bulletsSwatted;
+   private Vec3 lastBulletPos;
    private long obstacleSinceMs;
    /** Vertical shaft derived from the located item frame coordinates. */
    private ColumnStage columnStage;
@@ -304,6 +311,8 @@ public final class ElytraHuntManager {
    private long departSinceMs;
    /** Non-null = finish with this reason once the vertical departure completes. */
    private String departFinishReason;
+   /** 0 = not paused; otherwise the wall-clock timestamp of the last paused tick. */
+   private long autoEatPauseMs;
 
    private ElytraHuntManager() {
    }
@@ -326,8 +335,8 @@ public final class ElytraHuntManager {
       this.resetDropChase();
       this.rebindCount = 0;
       this.targetIssue = null;
-      this.threatSinceMs = 0L;
-      this.lastCombatMs = 0L;
+      this.lastBulletSwatMs = 0L;
+      this.lastBulletPos = null;
       this.obstacleSinceMs = 0L;
       this.pickupOnly = false;
       this.itemPopped = false;
@@ -397,7 +406,11 @@ public final class ElytraHuntManager {
          );
       }
       this.collected = 0;
+      this.bulletsSwatted = 0;
+      this.lastBulletSwatMs = 0L;
+      this.lastBulletPos = null;
 
+      this.autoEatPauseMs = 0L;
       this.queue.clear();
       this.tried.clear();
       this.attempts = 0;
@@ -541,10 +554,10 @@ public final class ElytraHuntManager {
       this.info(
          "导航=" + this.flight.navState()
             + " " + this.flight.miningDiagnostics()
-            + " 清怪计时=" + (this.threatSinceMs == 0L
-               ? 0 : (System.currentTimeMillis() - this.threatSinceMs)) + "ms"
-            + " 守卫优先=" + this.guardClearanceActive()
-            + " 守卫锚点=" + formatVec(this.guardAnchor(mc.level, player))
+            + " 已击落飞弹=" + this.bulletsSwatted
+            + " 最近飞弹=" + formatVec(this.lastBulletPos)
+            + " 潜影贝=忽略"
+            + " 进食让路=" + (this.autoEatPauseMs != 0L ? "是" : "否")
             + " 准星=" + (mc.hitResult == null ? "null" : mc.hitResult.getType()),
          ChatFormatting.AQUA
       );
@@ -598,7 +611,7 @@ public final class ElytraHuntManager {
       if (!this.isRunning()) {
          return true;
       }
-      if (this.phase == Phase.LOCATING || this.threatSinceMs != 0L || this.flight.isMining()) {
+      if (this.phase == Phase.LOCATING || this.flight.isMining()) {
          return false;
       }
       return true;
@@ -625,30 +638,107 @@ public final class ElytraHuntManager {
       }
    }
 
+   /**
+    * 自动进食准备接管右键/快捷栏时调用。返回 {@code true} 表示鞘翅流程已经暂停，
+    * 整个进食期间 {@link #onClientTick()} 都会让路；返回 {@code false} 表示此刻
+    * 正在挖掘/攻击，换手会重置服务端破坏进度，请调用方延后到下一次扫描。
+    */
+   public boolean suspendForAutoEat() {
+      if (!this.isRunning()) {
+         return true;
+      }
+      Minecraft mc = Minecraft.getInstance();
+      LocalPlayer player = mc == null ? null : mc.player;
+      if (this.flight.isMining()
+         || (mc != null && mc.gameMode != null && mc.gameMode.isDestroying())
+         || (mc != null && mc.options != null && mc.options.keyAttack.isDown())
+         || (player != null && player.isUsingItem())) {
+         return false;
+      }
+      if (mc != null) {
+         // 只松开飞行/攻击/挖掘键，绝不碰 keyUse：原版 handleKeybinds() 发现
+         // player.isUsingItem() 而 keyUse 没按住就会立刻 releaseUsingItem()，
+         // 这正是「鞘翅搜寻时无法长食用食物」的根因。
+         this.flight.pauseForAutoEat(mc);
+      }
+      if (this.autoEatPauseMs == 0L) {
+         this.autoEatPauseMs = System.currentTimeMillis();
+      }
+      return true;
+   }
+
+   /**
+    * 把「让路」这段时间从所有墙钟计时里平移掉。进食期间 onClientTick() 直接
+    * return，若不冻结，恢复后 phaseStartMs / columnSinceMs / dropCloseSinceMs
+    * 等会一次性吃掉 2~4 秒预算，触发进近受阻、吸取超时或飞行无进展而误换点。
+    */
+   private void freezeAutoEatPause(long now) {
+      if (this.autoEatPauseMs == 0L) {
+         this.autoEatPauseMs = now;
+         return;
+      }
+      long delta = now - this.autoEatPauseMs;
+      this.autoEatPauseMs = now;
+      // 单帧跨度过大通常是切世界/游戏暂停，别把计时推到未来。
+      if (delta <= 0L || delta > 30000L) {
+         return;
+      }
+      this.phaseStartMs += delta;
+      this.globalStartMs += delta;
+      this.lastInfoMs = shiftTime(this.lastInfoMs, delta);
+      this.lastScanMs = shiftTime(this.lastScanMs, delta);
+      this.lastAttackMs = shiftTime(this.lastAttackMs, delta);
+      this.lastBulletSwatMs = shiftTime(this.lastBulletSwatMs, delta);
+      this.travelDeadlineMs = shiftTime(this.travelDeadlineMs, delta);
+      this.targetMissingSinceMs = shiftTime(this.targetMissingSinceMs, delta);
+      this.dropChaseSinceMs = shiftTime(this.dropChaseSinceMs, delta);
+      this.dropProgressSinceMs = shiftTime(this.dropProgressSinceMs, delta);
+      this.dropDigUntilMs = shiftTime(this.dropDigUntilMs, delta);
+      this.dropCloseSinceMs = shiftTime(this.dropCloseSinceMs, delta);
+      this.obstacleSinceMs = shiftTime(this.obstacleSinceMs, delta);
+      this.columnSinceMs = shiftTime(this.columnSinceMs, delta);
+      this.columnBlockedSinceMs = shiftTime(this.columnBlockedSinceMs, delta);
+      this.departSinceMs = shiftTime(this.departSinceMs, delta);
+   }
+
+   private static long shiftTime(long value, long delta) {
+      return value == 0L ? 0L : value + delta;
+   }
+
    /** Registered after {@code FlyManager.tick()} in {@code SeedCracker.onInitialize()}. */
    public void onClientTick() {
       if (!this.isRunning()) {
-         return;
-      }
-
-      // 自动进食占用右键/快捷栏期间让路，避免互相抢输入。
-      if (AutoEatManager.INSTANCE.isBusy()) {
-         if (this.phase == Phase.TRAVELLING) {
-            this.travelDeadlineMs = Math.max(
-               this.travelDeadlineMs, System.currentTimeMillis() + TRAVEL_STALL_MS
-            );
-         }
+         this.autoEatPauseMs = 0L;
          return;
       }
 
       Minecraft mc = Minecraft.getInstance();
       LocalPlayer player = mc.player;
+      long now = System.currentTimeMillis();
+
+      // 自动进食（或玩家自己长按右键吃东西）期间彻底让路。
+      // 原版 handleKeybinds() 只要发现 player.isUsingItem() 且 keyUse 未按住，
+      // 就会立刻 releaseUsingItem()，所以这里连输入键都不能乱碰；同时冻结全部
+      // 墙钟计时，否则吃一口的时间会被算成「无进展」而误判超时、换掉目标。
+      if (AutoEatManager.INSTANCE.isBusy() || (player != null && player.isUsingItem())) {
+         this.freezeAutoEatPause(now);
+         if (this.phase == Phase.TRAVELLING) {
+            this.travelDeadlineMs = Math.max(this.travelDeadlineMs, now + TRAVEL_STALL_MS);
+         }
+         this.flight.pauseForAutoEat(mc);
+         return;
+      }
+      if (this.autoEatPauseMs != 0L) {
+         // 进食结束：把最后一段暂停也平移掉，再恢复巡航/进近。
+         this.freezeAutoEatPause(now);
+         this.autoEatPauseMs = 0L;
+      }
+
       ClientLevel level = mc.level;
       if (player == null || level == null || !player.isAlive() || player.isRemoved() || !isEnd(level)) {
          this.abort("玩家不可用 / 已死亡 / 离开末地");
          return;
       }
-      long now = System.currentTimeMillis();
       if (this.targetElytra > 0 && now - this.globalStartMs > GLOBAL_TIMEOUT_MS) {
          this.abort("单次运行总时限已到（已收集 " + this.collected + " 个）");
          return;
@@ -680,15 +770,13 @@ public final class ElytraHuntManager {
          return;
       }
 
-      // Probe the path every tick rather than trusting the previous nav state:
-      // a guard tucked into the ship hull would otherwise make the controller
-      // push into its hitbox until a timeout gives up. Long cruises ignore
-      // distant mobs - see tickThreat().
-      // The vertical departure must not be interrupted by combat navigation.
-      if (this.phase != Phase.LOCATING && this.phase != Phase.DEPARTING
-         && this.tickThreat(mc, player, level, now)) {
-         return;
-      }
+      // Purely defensive and NEVER consumes the tick. The Shulker itself is
+      // ignored; only its projectiles are knocked away. No aiming, no hover,
+      // no stopMining and no tool swap are involved, so the vertical shaft
+      // keeps its server-side destroy progress while this runs.
+      // If there is no bullet in reach we simply fall through to the normal
+      // phase (dig the column / attack the frame / chase the dropped elytra).
+      this.defendBullets(mc, player, level, now);
 
       switch (this.phase) {
          case LOCATING -> this.tickLocating(mc, player, now);
@@ -1345,237 +1433,68 @@ public final class ElytraHuntManager {
       }
    }
 
-   // ------------------------------------------------------------------ hostile guards
-
-   /** The point the current phase is trying to reach; used for the threat ray probe. */
-   private Vec3 threatGoal(LocalPlayer player) {
-      Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
-      if (target != null && !target.isRemoved()) {
-         return target.position();
-      }
-      if (this.targetFramePos != null) {
-         return Vec3.atCenterOf(this.targetFramePos);
-      }
-      if (this.sweepTarget != null) {
-         return this.sweepTarget;
-      }
-      if (this.verifyPoint != null) {
-         return this.verifyPoint;
-      }
-      if (this.current != null) {
-         return Vec3.atCenterOf(this.current.target());
-      }
-      return player.position().add(0.0, 0.0, 1.0);
-   }
-
-   /** True in the close-quarters stages where the single elytra guard must be cleared first. */
-   private boolean guardClearanceActive() {
-      return this.phase == Phase.VERIFYING
-         || this.phase == Phase.APPROACHING
-         || this.phase == Phase.TAKING;
-   }
+   // ------------------------------------------------------------------ projectile defence
 
    /**
-    * World-space position of the elytra frame (or the popped elytra drop) on
-    * this ship. Before {@link #tryLockTargetFromScan} records
-    * {@link #targetFramePos} we resolve it from the synced entities so the
-    * guard can be engaged as soon as the frame becomes visible. If nothing is
-    * synced yet we return {@code null}: without the frame there is no way to
-    * tell which of the ship's three Shulkers is the guard, so we kill NONE of
-    * them rather than clearing the whole ship.
-    */
-   private Vec3 guardAnchor(ClientLevel level, LocalPlayer player) {
-      if (this.targetFramePos != null) {
-         return Vec3.atCenterOf(this.targetFramePos);
-      }
-      if (level == null || player == null) {
-         return null;
-      }
-      Vec3 best = null;
-      double bestScore = Double.MAX_VALUE;
-      for (Entity entity : level.entitiesForRendering()) {
-         if (entity == null || entity.isRemoved() || !entity.isAlive()) {
-            continue;
-         }
-         boolean frame = entity instanceof ItemFrame
-            && !frameItem(entity).isEmpty() && frameItem(entity).getItem() == Items.ELYTRA;
-         boolean drop = entity instanceof ItemEntity item && item.getItem().getItem() == Items.ELYTRA;
-         if (!frame && !drop) {
-            continue;
-         }
-         // Prefer the real frame over a drop, then the one closest to the player.
-         double score = (frame ? 0.0 : 1_000_000.0) + player.distanceToSqr(entity);
-         if (score < bestScore) {
-            bestScore = score;
-            best = entity.position();
-         }
-      }
-      return best;
-   }
-
-   /**
-    * The single Shulker generated in front of the elytra item frame. Selection
-    * is anchored to the FRAME, not to the player: the old implementation killed
-    * every visible Shulker within 24 blocks of the player, which meant the deck
-    * and mast sentries (and guards of neighbouring ships) died too. Once this
-    * one guard is gone no Shulker remains inside {@link #GUARD_ANCHOR_RADIUS_SQ},
-    * so combat automatically stops - there is no chain-killing.
-    */
-   private Entity findGuard(ClientLevel level, LocalPlayer player) {
-      if (level == null) {
-         return null;
-      }
-      Vec3 anchor = this.guardAnchor(level, player);
-      if (anchor == null) {
-         return null;
-      }
-      Entity best = null;
-      double bestDistance = Double.MAX_VALUE;
-      for (Entity entity : level.entitiesForRendering()) {
-         if (entity == null || entity.isRemoved() || !entity.isAlive()
-            || entity.getType() != EntityTypes.SHULKER) {
-            continue;
-         }
-         double anchorDistance = entity.position().distanceToSqr(anchor);
-         if (anchorDistance > GUARD_ANCHOR_RADIUS_SQ || anchorDistance >= bestDistance) {
-            continue;
-         }
-         if (player.distanceToSqr(entity) > GUARD_CLEAR_RADIUS_SQ) {
-            continue;
-         }
-         if (!hasUnobstructedSight(level, player, entity.getBoundingBox().getCenter())) {
-            continue;
-         }
-         best = entity;
-         bestDistance = anchorDistance;
-      }
-      return best;
-   }
-
-   /**
-    * Clear the shulker that blocks the path. FlyController tries a detour first;
-    * this is the fallback for a guard tucked inside the ship hull.
+    * Knock away ShulkerBullets while completely IGNORING the Shulker itself.
     *
-    * <p>Once we are beside the elytra (VERIFYING / APPROACHING / TAKING) this
-    * becomes a hard gate: the ONE Shulker spawned in front of the elytra frame
-    * is killed <b>before</b> the state machine digs the vertical shaft, attacks
-    * the frame or chases the dropped elytra. That guard's levitation effect
-    * overrides the FlyController steering, so pathfinding, mining and pickup
-    * all break if we keep working while it is alive. Combat therefore also
-    * takes priority over an active block break and a close drop chase.
-    * The deck / mast sentries are deliberately left alone - they are ~20 blocks
-    * from the frame and never sit in the shaft. Farther away (long cruise) the
-    * original ray-based "only the mob blocking the path" behaviour is kept.</p>
+    * <p>This deliberately does NOT consume the tick: when no projectile is in
+    * melee reach the state machine simply carries on digging the column,
+    * attacking the item frame or chasing the dropped elytra. The old guard
+    * clearance was a hard gate that called hover() -&gt; stopMining() and
+    * swapped to a weapon whenever the shaft opened a line of sight, which
+    * aborted the server-side block break and produced an endless
+    * mine / fight / mine / fight ping-pong.</p>
     *
-    * @return true when this tick was consumed by combat (skip the normal phase).
+    * <p>26.3 specifics:
+    * <ul>
+    *   <li>ServerGamePacketListenerImpl.handleAttack only checks the entity id,
+    *       isWithinAttackRange(mainHand, entityBox, 3.0) and a few item flags.
+    *       It never checks the crosshair, so NO aiming is needed: the player
+    *       keeps looking at the block being mined.</li>
+    *   <li>We send the vanilla packet directly instead of calling
+    *       MultiPlayerGameMode.attack(), because that method resets the client
+    *       attack-strength ticker. Doing that on every projectile would starve
+    *       the item-frame attack (which needs a full attack strength).</li>
+    *   <li>No equipForAttack / hover / stopMining / hitResult / phase-timer
+    *       changes here, so an active destroy session keeps both its tool and
+    *       its server-side progress.</li>
+    * </ul></p>
     */
-   private boolean tickThreat(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
-      if (this.flight.isIgnoringThreats()) {
-         return false;
+   private void defendBullets(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
+      if (mc == null || player == null || level == null || mc.getConnection() == null
+         || !player.isAlive() || player.isRemoved()
+         || (mc.gui != null && mc.gui.screen() != null)) {
+         return;
       }
-      boolean clearingGuards = this.guardClearanceActive();
-      Entity threat;
-      double maxRangeSq;
-      long timeout;
-      if (clearingGuards) {
-         // Priority gate: kill the guards first, then run "find the elytra".
-         threat = this.findGuard(level, player);
-         maxRangeSq = GUARD_CLEAR_RADIUS_SQ;
-         timeout = THREAT_TIMEOUT_MS;
-      } else {
-         // Do not interrupt an active block break for a guard unless the guard is right in our face.
-         if (this.flight.isMining()) {
-            return false;
+      Vec3 eye = player.getEyePosition();
+      Entity nearest = null;
+      double nearestDistSq = Double.MAX_VALUE;
+      for (Entity entity : level.entitiesForRendering()) {
+         if (entity == null || entity.isRemoved()
+            || entity.getType() != EntityTypes.SHULKER_BULLET) {
+            continue;
          }
-         if (this.pickupOnly && this.droppedItem != null && !this.droppedItem.isRemoved()
-            && player.distanceToSqr(this.droppedItem) < 144.0) {
-            return false;
-         }
-         threat = FlyController.findThreat(level, player, this.threatGoal(player));
-         maxRangeSq = 64.0;
-         timeout = 12000L;
-      }
-      if (threat == null || player.distanceToSqr(threat) > maxRangeSq) {
-         if (this.threatSinceMs != 0L) {
-            LOGGER.info("[elytra] 挡路实体已清除或超出近距范围，恢复正常接近");
-         }
-         this.threatSinceMs = 0L;
-         this.flight.clearEntityState();
-         return false;
-      }
-      // Only engage if we actually have unobstructed line of sight to the Shulker.
-      if (!hasUnobstructedSight(level, player, threat.getBoundingBox().getCenter())) {
-         this.threatSinceMs = 0L;
-         return false;
-      }
-      if (this.threatSinceMs == 0L) {
-         this.threatSinceMs = now;
-         LOGGER.info("[elytra] {}潜影贝 id={} at {}，{}",
-            clearingGuards ? "鞘翅展示框前有" : "路径被",
-            threat.getId(), threat.blockPosition(),
-            clearingGuards ? "仅击杀这一只守卫" : "开始清除挡路实体");
-      }
-      // Clearing a guard is not a normal approach step: do not let it consume
-      // the verify / column / take / drop-chase timeouts.
-      this.phaseStartMs = now;
-      if (this.phase == Phase.TRAVELLING) {
-         // The rare long-cruise shulker fight must not eat the flight budget.
-         this.travelDeadlineMs = Math.max(this.travelDeadlineMs, now + TRAVEL_STALL_MS);
-      }
-      if (this.columnSinceMs != 0L) {
-         this.columnSinceMs = now;
-         this.columnBlockedSinceMs = 0L;
-      }
-      if (this.dropChaseSinceMs != 0L) {
-         this.dropChaseSinceMs = now;
-         this.dropProgressSinceMs = now;
-      }
-      if (clearingGuards) {
-         // A paused pickup must not be judged as "hovered 6 s and still nothing".
-         this.dropCloseSinceMs = 0L;
-         this.dropDigUntilMs = 0L;
-         if (this.flight.isMining()) {
-            // End the shaft break before engaging: navigate() step 1 would
-            // otherwise resume tickMining() on the old block and never fly to
-            // the guard. hover() -> stopMining() also makes the weapon swap
-            // safe (no tool change during an active destroy progress).
-            this.flight.hover(mc, player, false);
+         double distSq = eye.distanceToSqr(entity.getBoundingBox().getCenter());
+         if (distSq <= BULLET_SWAT_RANGE_SQ && distSq < nearestDistSq) {
+            nearest = entity;
+            nearestDistSq = distSq;
          }
       }
-      double eyeDist = player.getEyePosition().distanceTo(threat.getBoundingBox().getCenter());
-      if (eyeDist <= 3.25) {
-         // hover() calls stopMining(): end the block break BEFORE switching to a
-         // weapon, otherwise the server resets the destroy progress (and the
-         // tool swap would be overwritten by the mining loop anyway).
-         this.flight.hover(mc, player, false);
-         FlyController.aimAt(player, threat);
-         if (mc.gameMode != null
-            && player.getAttackStrengthScale(0.0F) >= 0.9F
-            && now - this.lastCombatMs >= COMBAT_COOLDOWN_MS) {
-            if (!this.flight.isMining()) {
-               FlyController.equipForAttack(player);
-            }
-            mc.gameMode.attack(player, threat);
-            player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
-            this.lastCombatMs = now;
-         }
-      } else {
-         Vec3 toPlayer = player.position().subtract(threat.position());
-         double len = Math.max(0.001, toPlayer.length());
-         Vec3 stand = threat.position().add(toPlayer.scale(2.2 / len)).subtract(0.0, 0.5, 0.0);
-         this.flight.navigate(mc, level, player, stand, true, true);
+      if (nearest == null || now - this.lastBulletSwatMs < BULLET_SWAT_COOLDOWN_MS) {
+         return;
       }
-      this.throttledInfo(
-         clearingGuards ? "正在击杀鞘翅展示框前那一只守卫潜影贝…" : "前方有潜影贝挡路，正在清除…", now
-      );
-      if (now - this.threatSinceMs > timeout) {
-         LOGGER.warn("[elytra] 清除挡路实体超时 {} ms，改为无视守卫直接取物", now - this.threatSinceMs);
-         this.threatSinceMs = 0L;
-         this.flight.ignoreThreatsFor(18000L);
-         this.flight.clearEntityState();
-         this.info("清怪超时，改为直接靠近取物（18 秒）…", ChatFormatting.YELLOW);
+      try {
+         // Exactly the packet Minecraft.startAttack() sends for an entity hit;
+         // ShulkerBullet.hurtServer() destroys the projectile on any damage.
+         mc.getConnection().send(new ServerboundAttackPacket(nearest.getId()));
+         player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+         this.lastBulletSwatMs = now;
+         this.lastBulletPos = nearest.position();
+         this.bulletsSwatted++;
+      } catch (Throwable ignored) {
+         // A failed defensive packet must never disturb the hunt.
       }
-      return true;
    }
 
    private static boolean hasUnobstructedSight(ClientLevel level, LocalPlayer player, Vec3 point) {
@@ -2080,9 +1999,7 @@ public final class ElytraHuntManager {
       if (player.getInventory().getFreeSlot() < 0) {
          if (ShulkerAutoStore.INSTANCE.canStoreInventory(player)) {
             this.info("背包已满，正在将鞘翅存入潜影盒后继续收集…", ChatFormatting.GOLD);
-            if (this.threatSinceMs == 0L) {
-               ShulkerAutoStore.INSTANCE.tryTriggerImmediate();
-            }
+            ShulkerAutoStore.INSTANCE.tryTriggerImmediate();
             this.beginDeparture(player, now, null);
             return;
          }

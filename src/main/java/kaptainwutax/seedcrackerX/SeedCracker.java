@@ -48,7 +48,7 @@ public class SeedCracker implements ModInitializer {
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> ProgressDisplay.onClientTick());
       // 背包满自动存盒是全局功能；先注册，自动挖矿在它运行期间会让路。
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> ShulkerAutoStore.INSTANCE.onClientTick());
-      // 自动进食是全局功能：饱食度不足时接管右键，其它自动化期间让路。
+      // 自动进食是全局功能：饱食度不足时接管右键，其它自动化（含鞘翅搜寻）暂停让路。
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> AutoEatManager.INSTANCE.onClientTick());
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> AutoMineManager.INSTANCE.onClientTick());
       ClientTickEvents.END_CLIENT_TICK.register((EndTick)client -> BuffManager.INSTANCE.tick());

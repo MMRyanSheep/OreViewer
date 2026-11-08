@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
@@ -95,10 +96,55 @@ public final class FlyController {
    private static int toolMoves;
    private static String lastToolAction = "未切换";
 
+   /**
+    * Deadline during which MultiPlayerGameMode.stopDestroyBlock() is suppressed.
+    *
+    * <p>Minecraft.continueAttack() calls stopDestroyBlock() on EVERY tick whose
+    * crosshair hits an ENTITY (the ignored Shulker or one of its bullets) or
+    * whenever keyAttack is released. That sends ABORT_DESTROY_BLOCK, silently
+    * resetting the server-side break progress back to zero - which is why the
+    * shaft could be mined forever without ever breaking a block. We refresh
+    * this deadline on each mining tick and clear it in stopMining(), so it
+    * lapses by itself if the hunt is aborted. See MultiPlayerGameModeMixin.</p>
+    */
+   private static volatile long destroyProtectedUntilMs;
+
+   /** True while we are actively driving a block break that must not be aborted. */
+   public static boolean isDestroyProtected() {
+      return System.currentTimeMillis() < FlyController.destroyProtectedUntilMs;
+   }
+
    public static void resetToolState() {
       FlyController.lastToolMoveMs = 0L;
       FlyController.toolMoves = 0;
       FlyController.lastToolAction = "未切换";
+   }
+
+   /**
+    * True while a long item use (auto-eat, or the player's own held right click)
+    * owns {@code keyUse}. Minecraft.handleKeybinds() calls releaseUsingItem() as
+    * soon as {@code isUsingItem()} is true but keyUse is not down, so forcibly
+    * clearing that key - which steerRaw/tickMining used to do on EVERY tick -
+    * silently cancelled eating while the elytra hunt was running.
+    */
+   private static boolean useKeyInUse(Minecraft mc) {
+      if (AutoEatManager.INSTANCE.isBusy()) {
+         return true;
+      }
+      LocalPlayer player = mc == null ? null : mc.player;
+      return player != null && player.isUsingItem();
+   }
+
+   /**
+    * Release flight/attack inputs while another subsystem (auto-eat) owns the
+    * player's hands. keyUse is deliberately left alone, see {@link #useKeyInUse}.
+    */
+   public void pauseForAutoEat(Minecraft mc) {
+      if (mc == null || mc.options == null) {
+         return;
+      }
+      this.stopMining(mc);
+      this.releaseMovementKeys(mc);
    }
 
    /** Equip the fastest tool for {@code state}. Safe to call every tick. */
@@ -1432,6 +1478,9 @@ public final class FlyController {
       if (pos == null || mc.gameMode == null) {
          return NavState.FAILED;
       }
+      // Keep vanilla's ABORT_DESTROY_BLOCK away for this break session, even
+      // when an entity sits on the crosshair. Refreshed every mining tick.
+      FlyController.destroyProtectedUntilMs = System.currentTimeMillis() + 1000L;
       if (isPassableBlock(level, pos)) {
          this.stopMining(mc);
          return NavState.DONE;
@@ -1486,7 +1535,9 @@ public final class FlyController {
 
       if (mc.options != null) {
          mc.options.keyAttack.setDown(vanillaHandlesTick);
-         mc.options.keyUse.setDown(false);
+         if (!useKeyInUse(mc)) {
+            mc.options.keyUse.setDown(false);
+         }
       }
 
       try {
@@ -1519,6 +1570,9 @@ public final class FlyController {
 
    /** Idempotent cleanup: abort any pending block break and release the attack key. */
    private void stopMining(Minecraft mc) {
+      // Cleared BEFORE the explicit stopDestroyBlock() below, so our own abort
+      // is still delivered to the server.
+      FlyController.destroyProtectedUntilMs = 0L;
       if (mc != null && mc.options != null) {
          mc.options.keyAttack.setDown(false);
       }
@@ -1607,7 +1661,9 @@ public final class FlyController {
 
       if (mc != null && mc.options != null) {
          mc.options.keyAttack.setDown(false);
-         mc.options.keyUse.setDown(false);
+         if (!useKeyInUse(mc)) {
+            mc.options.keyUse.setDown(false);
+         }
 
          // Decompose current horizontal velocity into player's local yaw frame
          Vec3 vel = player.getDeltaMovement();
@@ -1682,7 +1738,9 @@ public final class FlyController {
       this.releaseMovementKeys(mc);
       if (mc != null && mc.options != null) {
          mc.options.keyAttack.setDown(false);
-         mc.options.keyUse.setDown(false);
+         if (!useKeyInUse(mc)) {
+            mc.options.keyUse.setDown(false);
+         }
       }
       this.clearPath();
       this.resetStuck();
