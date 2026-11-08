@@ -10,7 +10,10 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
@@ -91,6 +94,9 @@ public final class FlyController {
    );
    private static final long TOOL_MOVE_COOLDOWN_MS = 800L;
    private static final int MAX_TOOL_MOVES = 24;
+   /** Minimum score advantage before a backpack tool is swapped into the hotbar. */
+   private static final double MINING_INVENTORY_MARGIN = 5.0;
+   private static final double ATTACK_INVENTORY_MARGIN = 10.0;
 
    private static long lastToolMoveMs;
    private static int toolMoves;
@@ -175,13 +181,29 @@ public final class FlyController {
       int hotbarSlot = bestHotbarSlot(inventory, state, intent);
       double hotbarScore = hotbarSlot >= 0 ? toolScore(inventory.getItem(hotbarSlot), state, intent) : -1.0;
 
-      // Check if main inventory has a strictly better tool when hotbar has none (or only a weak non-pickaxe).
-      if (hotbarSlot < 0 || (intent == ToolIntent.MINE && hotbarScore < 100.0)) {
+      // Mining is block-specific: even a top-tier hotbar pickaxe is the WRONG
+      // tool for a chest/barrel (MINEABLE_WITH_AXE) because it gets no speed
+      // bonus there. The old "hotbarScore < 100" gate treated any pickaxe as
+      // good enough, so an axe sitting in the backpack was never considered.
+      // Always compare against the backpack when mining; keep the old gate for
+      // weapons so combat behaviour is unchanged.
+      boolean checkInventory = intent == ToolIntent.MINE
+         || hotbarSlot < 0
+         || hotbarScore < 100.0;
+      double margin = intent == ToolIntent.MINE
+         ? MINING_INVENTORY_MARGIN
+         : ATTACK_INVENTORY_MARGIN;
+      if (checkInventory) {
          int invSlot = bestInventorySlot(inventory, state, intent);
-         if (invSlot >= 0 && toolScore(inventory.getItem(invSlot), state, intent) > hotbarScore + 10.0) {
-            if (moveToolFromInventory(player, invSlot, intent)) {
-               hotbarSlot = bestHotbarSlot(inventory, state, intent);
-            }
+         double invScore = invSlot >= 0 ? toolScore(inventory.getItem(invSlot), state, intent) : -1.0;
+         // Mining: only bring in a tool that ACTUALLY speeds up this block
+         // (score >= 100 means destroySpeed > 1). Otherwise breaking a
+         // tag-less block such as a shulker box would reshuffle the hotbar
+         // mid-break and reset the server-side destroy progress.
+         boolean effective = intent != ToolIntent.MINE || invScore >= 100.0;
+         if (effective && invScore > hotbarScore + margin
+            && moveToolFromInventory(player, invSlot, intent)) {
+            hotbarSlot = bestHotbarSlot(inventory, state, intent);
          }
       }
 
@@ -189,13 +211,14 @@ public final class FlyController {
          FlyController.lastToolAction = (intent == ToolIntent.MINE ? "无可用挖掘工具" : "无可用武器");
          return false;
       }
+      String target = intent == ToolIntent.MINE ? " 目标=" + blockLabel(state) : "";
       if (hotbarSlot != inventory.getSelectedSlot()) {
          selectSlot(player, hotbarSlot);
          FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘切工具" : "攻击切武器")
-            + " → 槽" + (hotbarSlot + 1) + " " + itemName(inventory.getItem(hotbarSlot));
+            + " → 槽" + (hotbarSlot + 1) + " " + itemName(inventory.getItem(hotbarSlot)) + target;
       } else {
          FlyController.lastToolAction = (intent == ToolIntent.MINE ? "挖掘" : "攻击")
-            + "沿用 " + itemName(inventory.getItem(hotbarSlot));
+            + "沿用 " + itemName(inventory.getItem(hotbarSlot)) + target;
       }
       return true;
    }
@@ -253,7 +276,12 @@ public final class FlyController {
       Item item = stack.getItem();
       double base = -1.0;
       if (intent == ToolIntent.MINE) {
-         Integer rank = PICKAXE_RANK.get(item);
+         // Rank by the REAL mining speed of this stack against this exact block.
+         // In 26.3 Item.getDestroySpeed() reads the TOOL component rules: an axe
+         // gets e.g. 8.0 on a chest (MINEABLE_WITH_AXE), while a pickaxe gets
+         // only the 1.0 default. The old fixed "100 + pickaxe tier" bonus made a
+         // pickaxe unbeatable on EVERY block, so chests were mined bare-hand slow
+         // and the axe was never equipped.
          float destroySpeed = 1.0F;
          if (state != null) {
             try {
@@ -261,10 +289,13 @@ public final class FlyController {
             } catch (Throwable ignored) {
             }
          }
-         if (rank != null) {
-            base = 100.0 + rank * 10.0 + destroySpeed * 2.0;
-         } else if (destroySpeed > 1.0F) {
-            base = 50.0 + destroySpeed * 2.0;
+         if (destroySpeed > 1.0F) {
+            base = 100.0 + destroySpeed * 10.0;
+         } else if (isMiningTool(stack)) {
+            // No tool speeds this block up (shulker box, glass, ...): keep a
+            // tool in hand instead of some random item, with the historical
+            // slight pickaxe preference.
+            base = PICKAXE_RANK.containsKey(item) ? 20.0 : 10.0;
          } else {
             return -1.0;
          }
@@ -293,6 +324,47 @@ public final class FlyController {
       return base;
    }
 
+   /** True for pickaxes, axes, shovels, hoes, shears, ... (26.3 TOOL component). */
+   private static boolean isMiningTool(ItemStack stack) {
+      if (stack == null || stack.isEmpty()) {
+         return false;
+      }
+      try {
+         if (stack.get(DataComponents.TOOL) != null) {
+            return true;
+         }
+      } catch (Throwable ignored) {
+      }
+      return PICKAXE_RANK.containsKey(stack.getItem());
+   }
+
+   /** Compact debug label showing which tool category the target block wants. */
+   private static String blockLabel(BlockState state) {
+      if (state == null) {
+         return "无";
+      }
+      String id;
+      try {
+         id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
+      } catch (Throwable ignored) {
+         id = state.getBlock().getClass().getSimpleName();
+      }
+      String tool = "通用";
+      try {
+         if (state.is(BlockTags.MINEABLE_WITH_AXE)) {
+            tool = "斧";
+         } else if (state.is(BlockTags.MINEABLE_WITH_PICKAXE)) {
+            tool = "镐";
+         } else if (state.is(BlockTags.MINEABLE_WITH_SHOVEL)) {
+            tool = "锹";
+         } else if (state.is(BlockTags.MINEABLE_WITH_HOE)) {
+            tool = "锄";
+         }
+      } catch (Throwable ignored) {
+      }
+      return id + "[" + tool + "]";
+   }
+
    /** Move or SWAP a tool from main inventory (slots 9..35) into the hotbar, even if hotbar is full. */
    private static boolean moveToolFromInventory(LocalPlayer player, int invSlot, ToolIntent intent) {
       Minecraft mc = Minecraft.getInstance();
@@ -315,11 +387,13 @@ public final class FlyController {
          }
       }
       if (targetHotbar < 0) {
-         // Hotbar is full: pick a expendable hotbar slot (not pickaxe, not weapon, not elytra).
+         // Hotbar is full: pick an expendable slot, but never evict a tool
+         // (axes included - they are the correct tool for chests/wood), a
+         // weapon, or the elytra.
          for (int i = Inventory.getSelectionSize() - 1; i >= 0; i--) {
             ItemStack s = inventory.getItem(i);
             Item item = s.getItem();
-            if (!PICKAXE_RANK.containsKey(item) && !WEAPON_SCORE.containsKey(item) && item != Items.ELYTRA) {
+            if (!isMiningTool(s) && !WEAPON_SCORE.containsKey(item) && item != Items.ELYTRA) {
                targetHotbar = i;
                break;
             }
