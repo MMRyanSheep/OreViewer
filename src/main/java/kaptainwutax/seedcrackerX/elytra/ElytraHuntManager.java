@@ -549,6 +549,38 @@ public final class ElytraHuntManager {
 
    // ------------------------------------------------------------------ tick dispatcher
 
+   /** Whether ShulkerAutoStore is allowed to start a storage session right now. */
+   public boolean allowsShulkerStore() {
+      if (!this.isRunning()) {
+         return true;
+      }
+      if (this.phase == Phase.LOCATING || this.threatSinceMs != 0L || this.flight.isMining()) {
+         return false;
+      }
+      return true;
+   }
+
+   /** Called by ShulkerAutoStore when a storage session completes (or aborts). */
+   public void onShulkerStoreFinished() {
+      Minecraft mc = Minecraft.getInstance();
+      if (mc != null && mc.player != null) {
+         this.baselineElytra = countElytra(mc.player);
+      }
+      FlyController.resetToolState();
+      long now = System.currentTimeMillis();
+      this.phaseStartMs = now;
+      if (this.columnSinceMs != 0L) {
+         this.columnSinceMs = now;
+      }
+      if (this.departSinceMs != 0L) {
+         this.departSinceMs = now;
+      }
+      if (this.dropChaseSinceMs != 0L) {
+         this.dropChaseSinceMs = now;
+         this.dropProgressSinceMs = now;
+      }
+   }
+
    /** Registered after {@code FlyManager.tick()} in {@code SeedCracker.onInitialize()}. */
    public void onClientTick() {
       if (!this.isRunning()) {
@@ -574,6 +606,23 @@ public final class ElytraHuntManager {
       }
       if (countElytra(player) > this.baselineElytra) {
          this.onElytraGained(mc, player, now);
+         return;
+      }
+      // Yield control while ShulkerAutoStore is placing/opening/storing/breaking the shulker box,
+      // and keep baselineElytra synchronized as elytras are moved into the box.
+      if (ShulkerAutoStore.INSTANCE.isBusy()) {
+         this.baselineElytra = countElytra(player);
+         this.phaseStartMs = now;
+         if (this.columnSinceMs != 0L) {
+            this.columnSinceMs = now;
+         }
+         if (this.departSinceMs != 0L) {
+            this.departSinceMs = now;
+         }
+         if (this.dropChaseSinceMs != 0L) {
+            this.dropChaseSinceMs = now;
+            this.dropProgressSinceMs = now;
+         }
          return;
       }
 
@@ -1735,6 +1784,17 @@ public final class ElytraHuntManager {
             this.dropCloseSinceMs = now;
          }
          this.flight.hover(mc, player, false);
+         // If the inventory was filled by mined blocks while digging down to the cabin,
+         // store into a shulker box or drop 1 stack of mined junk blocks so the elytra can be picked up.
+         if (player.getInventory().getFreeSlot() < 0) {
+            if (ShulkerAutoStore.INSTANCE.canStoreInventory(player) && ShulkerAutoStore.INSTANCE.tryTriggerImmediate()) {
+               return;
+            }
+            if (ShulkerAutoStore.INSTANCE.dropOneJunkSlotForPickup(mc, player)) {
+               this.dropCloseSinceMs = now;
+               return;
+            }
+         }
          if (now - this.dropCloseSinceMs > DROP_PICKUP_WAIT_MS) {
             String full = player.getInventory().getFreeSlot() < 0 ? "（背包已满）" : "";
             this.nextCandidateWithReason(
@@ -1794,7 +1854,15 @@ public final class ElytraHuntManager {
          return;
       }
       if (player.getInventory().getFreeSlot() < 0) {
-         this.beginDeparture(player, now, "背包已满，无法继续拾取");
+         if (ShulkerAutoStore.INSTANCE.canStoreInventory(player)) {
+            this.info("背包已满，正在将鞘翅存入潜影盒后继续收集…", ChatFormatting.GOLD);
+            if (this.threatSinceMs == 0L) {
+               ShulkerAutoStore.INSTANCE.tryTriggerImmediate();
+            }
+            this.beginDeparture(player, now, null);
+            return;
+         }
+         this.beginDeparture(player, now, "背包已满（且无可用潜影盒可存入），无法继续拾取");
          return;
       }
       this.beginDeparture(player, now, null);
@@ -1816,6 +1884,17 @@ public final class ElytraHuntManager {
    }
 
    private void tickDeparting(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
+      // While climbing out through the End Ship cabin/roof, immediately trigger ShulkerAutoStore
+      // as soon as a valid support block on the ship is within reach.
+      if (this.departFinishReason == null
+         && player.getInventory().getFreeSlot() < 0
+         && ShulkerAutoStore.INSTANCE.canStoreInventory(player)) {
+         if (ShulkerAutoStore.INSTANCE.tryTriggerImmediate()) {
+            this.flight.hover(mc, player, true);
+            return;
+         }
+      }
+
       FlyController.ColumnState column = this.flight.travelColumn(
          mc, level, player, this.departX, this.departZ, this.departY, true
       );
@@ -1830,6 +1909,9 @@ public final class ElytraHuntManager {
       this.departFinishReason = null;
       this.departSinceMs = 0L;
       this.flight.hover(mc, player, true);
+      if (reason == null && player.getInventory().getFreeSlot() < 0 && !ShulkerAutoStore.INSTANCE.canStoreInventory(player)) {
+         reason = "背包已满（且无可用潜影盒可存入），无法继续拾取";
+      }
       if (reason != null) {
          this.finish(mc, reason);
       } else {

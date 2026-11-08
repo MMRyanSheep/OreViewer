@@ -32,7 +32,7 @@ public class ShulkerCommand extends ClientCommand {
       boolean on = Config.get().autoMineShulkerSave;
       sendFeedback(
          "[自动存盒] 当前" + (on ? "已开启" : "已关闭")
-            + "。开启时：背包满 + 背包内有未满的潜影盒 → 自动把可堆叠物品存入盒内并取回盒子。",
+            + "。开启时：背包满 + 背包内有未满的潜影盒 → 自动把鞘翅、矿物等物品存入盒内并取回盒子。",
          on ? ChatFormatting.GREEN : ChatFormatting.YELLOW
       );
       return 1;

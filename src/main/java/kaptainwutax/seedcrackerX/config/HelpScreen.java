@@ -43,7 +43,7 @@ public class HelpScreen {
       automine.addEntry(eb.startTextDescription(Component.literal("/os ch [开|关|状态]").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
       automine.addEntry(
          eb.startTextDescription(
-            Component.literal("  背包满自动存盒开关。背包全满且背包内有未满的潜影盒时，自动把矿物等物品存入盒子并取回，存完继续挖矿。")
+            Component.literal("  背包满自动存盒开关。背包全满且背包内有未满的潜影盒时，自动把鞘翅、矿物等物品存入盒子并取回，存完继续收集鞘翅或挖矿。")
                .withStyle(s -> s.withColor(ChatFormatting.WHITE))
          ).build()
       );
