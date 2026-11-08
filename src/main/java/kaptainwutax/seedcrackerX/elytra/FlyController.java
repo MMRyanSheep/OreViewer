@@ -318,6 +318,14 @@ public final class FlyController {
       FAILED          // internal: mining timed out or failed
    }
 
+   /** Outcome of a strictly vertical, single-column movement (used by the elytra approach). */
+   public enum ColumnState {
+      MOVING,   // sliding onto the column, or flying vertically inside it
+      MINING,   // breaking the block that blocks the shaft
+      ARRIVED,  // aligned with the column and at the requested feet Y
+      BLOCKED   // an unbreakable / unloaded block stops the shaft
+   }
+
    private static final float PITCH_LIMIT = 45.0F;
    private static final double CRUISE_VERTICAL_DEADZONE = 0.85;
    private static final double LOCAL_VERTICAL_DEADZONE = 0.22;
@@ -570,6 +578,102 @@ public final class FlyController {
       boolean isFinal = nextWaypoint == target;
       this.steer(mc, player, nextWaypoint, slow || !isFinal, LOCAL_VERTICAL_DEADZONE);
       return this.setNav(isFinal ? NavState.CLEAR : NavState.DETOUR);
+   }
+
+   /**
+    * Strictly vertical approach / departure inside one fixed X/Z column.
+    *
+    * <p>Unlike {@link #navigate}, this never plans a detour and never leaves the
+    * column: it first slides horizontally onto {@code (columnX, columnZ)} at the
+    * current altitude, then moves the player's feet towards {@code targetFeetY}
+    * while breaking the blocks of the 1x2 shaft in the direction of travel.
+    * Mining reuses {@link #startMiningBlock} / {@link #tickMining}, so tool
+    * switching and vanilla {@code destroyProgress} stay consistent with the
+    * normal 3D navigation path.</p>
+    *
+    * @param targetFeetY requested player <b>feet</b> Y; below the current Y digs
+    *                    down through the floor, above it digs up through the ceiling
+    */
+   public ColumnState travelColumn(
+      Minecraft mc, ClientLevel level, LocalPlayer player,
+      double columnX, double columnZ, double targetFeetY, boolean allowMine
+   ) {
+      if (mc == null || level == null || player == null) {
+         return ColumnState.BLOCKED;
+      }
+      long now = System.currentTimeMillis();
+      this.ensureFlight(player);
+
+      // Never interrupt an active break session: changing the target mid-break
+      // resets the server-side destroy progress in 1.21+/26.x.
+      if (this.miningPos != null) {
+         if (isPassableBlock(level, this.miningPos)) {
+            this.stopMining(mc);
+         } else {
+            NavState mineState = this.tickMining(mc, level, player, now);
+            if (mineState == NavState.MINING || mineState == NavState.APPROACH_MINE) {
+               this.setNav(mineState);
+               return ColumnState.MINING;
+            }
+            if (mineState == NavState.FAILED) {
+               this.stopMining(mc);
+               return ColumnState.BLOCKED;
+            }
+            this.stopMining(mc);
+         }
+      }
+
+      double dx = columnX - player.getX();
+      double dz = columnZ - player.getZ();
+      double horiz = Math.sqrt(dx * dx + dz * dz);
+      double dy = targetFeetY - player.getY();
+      if (horiz <= 0.35 && Math.abs(dy) <= 0.45) {
+         this.hover(mc, player, false);
+         this.setNav(NavState.CLEAR);
+         return ColumnState.ARRIVED;
+      }
+
+      BlockPos blocker = null;
+      if (horiz > 0.35) {
+         // Still off-column: clear only the blocks on the short horizontal slide.
+         Vec3 alignPoint = new Vec3(columnX, player.getY(), columnZ);
+         blocker = this.findNextBlockToMine(
+            level, player, BlockPos.containing(alignPoint), alignPoint
+         );
+      } else {
+         // On-column: sweep the player's FULL AABB one block up/down the shaft.
+         // A 0.68-wide body usually straddles two X/Z columns, so checking only
+         // the centre block would leave a ledge that silently pins the player.
+         double stepY = player.getY() + (dy < 0.0 ? -1.0 : 1.0);
+         Vec3 step = new Vec3(columnX, stepY, columnZ);
+         blocker = this.findNextBlockToMine(level, player, BlockPos.containing(step), step);
+      }
+
+      if (blocker != null) {
+         if (!allowMine || !isMineableBlock(level, player, blocker)) {
+            this.hover(mc, player, false);
+            this.setNav(NavState.BLOCKED);
+            return ColumnState.BLOCKED;
+         }
+         this.startMiningBlock(player, level, blocker, now);
+         NavState mineState = this.tickMining(mc, level, player, now);
+         if (mineState == NavState.FAILED) {
+            this.stopMining(mc);
+            return ColumnState.BLOCKED;
+         }
+         this.setNav(mineState);
+         return ColumnState.MINING;
+      }
+
+      // Shaft is clear for the next two blocks: keep X/Z pinned and move only
+      // along the column. steerRaw (not steer) so an ongoing break is not reset.
+      this.stopMining(mc);
+      Vec3 stepTarget = horiz > 0.35
+         ? new Vec3(columnX, player.getY(), columnZ)
+         : new Vec3(columnX, targetFeetY, columnZ);
+      this.steerRaw(mc, player, stepTarget, true, 0.15);
+      this.setNav(NavState.CLEAR);
+      return ColumnState.MOVING;
    }
 
    private static Vec3 waypointVec(BlockPos pos) {

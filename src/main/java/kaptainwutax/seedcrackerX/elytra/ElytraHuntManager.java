@@ -20,7 +20,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityTypes;
@@ -35,7 +34,6 @@ import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
@@ -87,8 +85,17 @@ public final class ElytraHuntManager {
    // Sweeps may have to dig through an end-ship hull, so give them more room.
    private static final long VERIFY_TIMEOUT_MS = 30000L;
    private static final long TRAVEL_TIMEOUT_MS = 120000L;
-   private static final long APPROACH_TIMEOUT_MS = 15000L;
    private static final long TAKE_TIMEOUT_MS = 10000L;
+   // Vertical-column approach: locate the item frame, climb directly above its
+   // X/Z column, then dig straight down through the ship hull. After a pickup
+   // the same strictly vertical motion is used to fly back out before cruising.
+   private static final int DESCENT_CLEARANCE = 8;
+   private static final double DESCENT_FLOOR_OFFSET = 2.0;
+   private static final double COLUMN_ALIGN_XZ = 1.0;
+   private static final long VERTICAL_APPROACH_TIMEOUT_MS = 60000L;
+   private static final long COLUMN_BLOCKED_TIMEOUT_MS = 3000L;
+   private static final int DEPART_CLEARANCE = 24;
+   private static final long DEPART_TIMEOUT_MS = 30000L;
    // Only enforced for a finite target; unlimited collection stops on user input.
    private static final long GLOBAL_TIMEOUT_MS = 1200000L;
    private static final long LOCATE_TIMEOUT_MS = 90000L;
@@ -131,8 +138,6 @@ public final class ElytraHuntManager {
    private static final long THREAT_TIMEOUT_MS = 25000L;
    private static final long COMBAT_COOLDOWN_MS = 550L;
    private static final double THREAT_ATTACK_RANGE_SQ = 20.25;
-   /** Total time a single candidate may spend detouring / mining / clearing guards. */
-   private static final long OBSTACLE_GRACE_MS = 45000L;
    private static final double[][] SWEEP_OFFSETS = {{32, 0}, {0, 32}, {-32, 0}, {0, -32}, {48, 48}};
    // Approach points around the ship: stay outside the hull but well inside
    // entity tracking range. A new angle is used for every re-scan attempt.
@@ -148,8 +153,15 @@ public final class ElytraHuntManager {
       VERIFYING,
       APPROACHING,
       TAKING,
+      DEPARTING,
       DONE,
       ABORTED
+   }
+
+   /** Sub-stage of the strictly vertical approach to the located item frame. */
+   private enum ColumnStage {
+      ALIGN,   // fly to the point directly above the frame's X/Z column
+      DESCEND  // dig straight down inside that column
    }
 
    /** Result of re-resolving the live target on the current client tick. */
@@ -240,6 +252,21 @@ public final class ElytraHuntManager {
    private long threatSinceMs;
    private long lastCombatMs;
    private long obstacleSinceMs;
+   /** Vertical shaft derived from the located item frame coordinates. */
+   private ColumnStage columnStage;
+   private double columnX;
+   private double columnZ;
+   private double columnTopY;
+   private double columnFloorY;
+   private long columnSinceMs;
+   private long columnBlockedSinceMs;
+   /** Vertical departure after a pickup, before the next candidate is chosen. */
+   private double departX;
+   private double departZ;
+   private double departY;
+   private long departSinceMs;
+   /** Non-null = finish with this reason once the vertical departure completes. */
+   private String departFinishReason;
 
    private ElytraHuntManager() {
    }
@@ -267,6 +294,11 @@ public final class ElytraHuntManager {
       this.obstacleSinceMs = 0L;
       this.pickupOnly = false;
       this.itemPopped = false;
+      this.columnStage = null;
+      this.columnSinceMs = 0L;
+      this.columnBlockedSinceMs = 0L;
+      this.departSinceMs = 0L;
+      this.departFinishReason = null;
    }
 
    /** Forget all drop-chase progress (new candidate, or the frame got its elytra back). */
@@ -458,6 +490,16 @@ public final class ElytraHuntManager {
          ChatFormatting.AQUA
       );
       this.info(
+         "进近阶段=" + (this.columnStage == null ? "无" : this.columnStage)
+            + " 垂直列=(" + String.format("%.1f", this.columnX) + ", " + String.format("%.1f", this.columnZ) + ")"
+            + " 列顶=" + (int)this.columnTopY
+            + " 列底=" + (int)this.columnFloorY
+            + " 飞离目标Y=" + (int)this.departY
+            + " 飞离计时=" + (this.departSinceMs == 0L
+               ? 0 : (System.currentTimeMillis() - this.departSinceMs)) + "ms",
+         ChatFormatting.AQUA
+      );
+      this.info(
          "导航=" + this.flight.navState()
             + " " + this.flight.miningDiagnostics()
             + " 清怪计时=" + (this.threatSinceMs == 0L
@@ -536,7 +578,9 @@ public final class ElytraHuntManager {
       // a guard tucked into the ship hull would otherwise make the controller
       // push into its hitbox until a timeout gives up. Long cruises ignore
       // distant mobs - see tickThreat().
-      if (this.phase != Phase.LOCATING && this.tickThreat(mc, player, level, now)) {
+      // The vertical departure must not be interrupted by combat navigation.
+      if (this.phase != Phase.LOCATING && this.phase != Phase.DEPARTING
+         && this.tickThreat(mc, player, level, now)) {
          return;
       }
 
@@ -546,6 +590,7 @@ public final class ElytraHuntManager {
          case VERIFYING -> this.tickVerifying(mc, player, level, now);
          case APPROACHING -> this.tickApproaching(mc, player, level, now);
          case TAKING -> this.tickTaking(mc, player, level, now);
+         case DEPARTING -> this.tickDeparting(mc, player, level, now);
          default -> {
          }
       }
@@ -800,7 +845,7 @@ public final class ElytraHuntManager {
          if (earlyScan.structureHint != null) {
             this.structureHint = earlyScan.structureHint;
          }
-         if (this.tryLockTargetFromScan(earlyScan, now)) {
+         if (this.tryLockTargetFromScan(earlyScan, player, now)) {
             return;
          }
       }
@@ -855,14 +900,17 @@ public final class ElytraHuntManager {
       );
    }
 
-   private boolean tryLockTargetFromScan(ScanResult scan, long now) {
+   private boolean tryLockTargetFromScan(ScanResult scan, LocalPlayer player, long now) {
       if (scan.elytraFrame != null) {
          this.clearTarget();
          this.targetFrame = scan.elytraFrame;
          this.targetFramePos = scan.elytraFrame.blockPosition();
-         this.phaseStartMs = now;
+         this.beginColumnApproach(player, scan.elytraFrame, now);
          this.phase = Phase.APPROACHING;
-         this.info("找到带鞘翅的展示框，开始 3D 寻路接近…", ChatFormatting.GREEN);
+         this.info(
+            "已定位展示框坐标 " + format(this.targetFramePos) + "，先飞到正上方，再沿该列垂直向下挖掘…",
+            ChatFormatting.GREEN
+         );
          return true;
       }
       if (scan.dropped != null) {
@@ -870,12 +918,32 @@ public final class ElytraHuntManager {
          this.droppedItem = scan.dropped;
          this.targetFramePos = scan.dropped.blockPosition();
          this.pickupOnly = true;
-         this.phaseStartMs = now;
+         this.beginColumnApproach(player, scan.dropped, now);
          this.phase = Phase.APPROACHING;
-         this.info("发现已掉落但未拾取的鞘翅，前往吸取…", ChatFormatting.GREEN);
+         this.info(
+            "已定位掉落鞘翅坐标 " + format(this.targetFramePos) + "，先飞到正上方，再沿该列垂直向下挖掘…",
+            ChatFormatting.GREEN
+         );
          return true;
       }
       return false;
+   }
+
+   /**
+    * Step 1 of the approach: fix the X/Z column from the located entity and
+    * remember the ceiling point (directly above it) and the floor point (just
+    * below it). Everything afterwards moves inside this one column.
+    */
+   private void beginColumnApproach(LocalPlayer player, Entity target, long now) {
+      Vec3 pos = target.position();
+      this.columnX = pos.x;
+      this.columnZ = pos.z;
+      this.columnTopY = Math.max(pos.y + DESCENT_CLEARANCE, player.getY() + 2.0);
+      this.columnFloorY = pos.y - DESCENT_FLOOR_OFFSET;
+      this.columnStage = ColumnStage.ALIGN;
+      this.columnSinceMs = now;
+      this.columnBlockedSinceMs = 0L;
+      this.phaseStartMs = now;
    }
 
    // ------------------------------------------------------------------ VERIFYING
@@ -895,7 +963,7 @@ public final class ElytraHuntManager {
          if (midScan.structureHint != null) {
             this.structureHint = midScan.structureHint;
          }
-         if (this.tryLockTargetFromScan(midScan, now)) {
+         if (this.tryLockTargetFromScan(midScan, player, now)) {
             return;
          }
       }
@@ -945,7 +1013,7 @@ public final class ElytraHuntManager {
          this.structureHint = scan.structureHint;
       }
 
-      if (this.tryLockTargetFromScan(scan, now)) {
+      if (this.tryLockTargetFromScan(scan, player, now)) {
          return;
       }
       if (!scan.chunkLoaded) {
@@ -1432,9 +1500,18 @@ public final class ElytraHuntManager {
          this.info("检测到掉落的鞘翅，开始吸取追踪…", ChatFormatting.AQUA);
          return;
       }
-      long approachLimit = this.pickupOnly ? VERIFY_APPROACH_TIMEOUT_MS : APPROACH_TIMEOUT_MS;
-      if (now - this.phaseStartMs > approachLimit) {
-         this.nextCandidateWithReason(player, now, "贴身接近超时");
+      // FRAME (or a frame-anchored pickup target): strictly vertical column approach.
+      if (this.columnStage == null) {
+         Entity fallback = this.pickupOnly ? this.droppedItem : this.targetFrame;
+         if (fallback == null) {
+            this.throttledInfo("目标实体正在重新同步…", now);
+            return;
+         }
+         this.beginColumnApproach(player, fallback, now);
+         this.columnStage = ColumnStage.DESCEND;
+      }
+      if (now - this.columnSinceMs > VERTICAL_APPROACH_TIMEOUT_MS) {
+         this.nextCandidateWithReason(player, now, "垂直进近超时");
          return;
       }
       Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
@@ -1443,133 +1520,82 @@ public final class ElytraHuntManager {
          return;
       }
 
-      // As soon as the ItemFrame is within true attack range and unobstructed, take it immediately!
-      if (status == TargetStatus.FRAME && canAttackEntity(level, player, target)) {
-         this.obstacleSinceMs = 0L;
-         this.flight.hover(mc, player, false);
-         FlyController.aimAt(player, target);
+      // Step 2a: reach the point directly above the located coordinates.
+      if (this.columnStage == ColumnStage.ALIGN) {
+         Vec3 overhead = new Vec3(this.columnX, this.columnTopY, this.columnZ);
+         double horiz = Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ());
+         if (horiz > COLUMN_ALIGN_XZ || player.getY() < this.columnTopY - 2.0) {
+            FlyController.NavState state = this.flight.navigate(mc, level, player, overhead, true, true);
+            if (state == FlyController.NavState.BLOCKED) {
+               this.flight.lift();
+            }
+            this.throttledInfo(
+               "正在飞到展示框正上方（水平还差 " + (int)horiz + " 格，高度还差 "
+                  + (int)Math.max(0.0, this.columnTopY - player.getY()) + " 格）…", now
+            );
+            return;
+         }
+         this.flight.hover(mc, player, true);
+         this.columnStage = ColumnStage.DESCEND;
+         this.columnSinceMs = now;
+         this.columnBlockedSinceMs = 0L;
          this.phaseStartMs = now;
-         this.attackAttempts = 0;
-         this.lastAttackMs = 0L;
-         this.itemPopped = false;
-         this.resetDropChase();
-         this.phase = Phase.TAKING;
-         this.info("已进入展示框有效攻击距离且视线畅通，开始取物", ChatFormatting.AQUA);
+         this.info("已抵达展示框正上方，开始沿同一垂直列向下挖掘…", ChatFormatting.AQUA);
          return;
       }
 
-      Vec3 hoverPoint = this.pickupOnly
-         ? target.position().add(0.0, 0.1, 0.0)
-         : hoverPointFor(level, target, player);
-      double distance = player.position().distanceTo(hoverPoint);
-      double arrival = this.pickupOnly ? 1.2 : 1.8;
-
-      if (distance > arrival) {
-         FlyController.NavState state = this.flight.navigate(mc, level, player, hoverPoint, true, true);
-         if (obstacleWork(state)) {
-            if (this.obstacleSinceMs == 0L) {
-               this.obstacleSinceMs = now;
-            }
-            if (now - this.obstacleSinceMs > OBSTACLE_GRACE_MS) {
-               this.nextCandidateWithReason(player, now, "通路持续受阻（绕行 / 挖掘 / 清怪）");
-               return;
-            }
-            this.phaseStartMs = now;
-            this.throttledInfo(
-               state == FlyController.NavState.MINING
-                  ? "接近路径有方块阻挡，正在挖掘通道…"
-                  : "正在通过 3D 寻路接近目标…",
-               now
-            );
-         } else {
-            this.obstacleSinceMs = 0L;
-            this.throttledInfo("接近目标中，还差 " + String.format("%.1f", distance) + " 格", now);
-         }
+      // Step 2b: take a live frame as soon as the vertical shaft gives us a clear hit.
+      if (!this.pickupOnly && status == TargetStatus.FRAME && canAttackEntity(level, player, target)) {
+         this.enterTaking(mc, player, target, now, "已进入展示框有效攻击距离，开始取物");
          return;
+      }
+
+      // Step 2c: dig straight down inside the located column. No sideways detour.
+      FlyController.ColumnState column = this.flight.travelColumn(
+         mc, level, player, this.columnX, this.columnZ, this.columnFloorY, true
+      );
+      if (column == FlyController.ColumnState.MINING) {
+         this.columnSinceMs = now; // breaking blocks is progress, not a stall
+         this.columnBlockedSinceMs = 0L;
+         this.throttledInfo("正沿展示框正上方向下挖掘通道…", now);
+         return;
+      }
+      if (column == FlyController.ColumnState.BLOCKED) {
+         if (this.columnBlockedSinceMs == 0L) {
+            this.columnBlockedSinceMs = now;
+         }
+         if (now - this.columnBlockedSinceMs > COLUMN_BLOCKED_TIMEOUT_MS) {
+            this.nextCandidateWithReason(player, now, "垂直通道被不可挖掘方块阻断");
+            return;
+         }
+         this.throttledInfo("垂直通道暂时受阻，等待方块可挖…", now);
+         return;
+      }
+      this.columnBlockedSinceMs = 0L;
+      if (column == FlyController.ColumnState.ARRIVED
+         || player.getY() <= this.columnFloorY + 0.5) {
+         this.enterTaking(mc, player, target, now, "已沿垂直列挖到展示框位置，开始取物");
+         return;
+      }
+      this.throttledInfo(
+         "正沿展示框垂直列下降（还差 " + (int)Math.max(0.0, player.getY() - this.columnFloorY) + " 格）…", now
+      );
+   }
+
+   /** Common TAKING transition for the attack-range hit and the shaft bottom. */
+   private void enterTaking(Minecraft mc, LocalPlayer player, Entity target, long now, String message) {
+      this.flight.hover(mc, player, false);
+      if (!this.pickupOnly) {
+         FlyController.aimAt(player, target);
       }
       this.obstacleSinceMs = 0L;
-      this.flight.hover(mc, player, false);
-      if (this.pickupOnly) {
-         this.throttledInfo("正在吸取掉落的鞘翅…", now);
-         return;
-      }
-      FlyController.aimAt(player, target);
       this.phaseStartMs = now;
       this.attackAttempts = 0;
       this.lastAttackMs = 0L;
       this.itemPopped = false;
       this.resetDropChase();
       this.phase = Phase.TAKING;
-      this.info("已就位，开始左键取物", ChatFormatting.AQUA);
-   }
-
-   /**
-    * Compute the optimal player-feet hover point in front of the ItemFrame.
-    *
-    * <p>Note: {@code FlyController} treats {@code target.y} as the player's
-    * <b>feet</b> Y ({@code player.getY()}), while the player's eyes are at
-    * {@code feet + 1.62} and head top is at {@code feet + 1.8}. Setting
-    * {@code y = frame.getY() + 0.5} in the legacy code placed the player's
-    * head inside the End Ship cabin ceiling! Here we place the player's feet
-    * on the cabin floor (~1 block below the frame) and prefer an already-open
-    * 1x2 column with direct line of sight to the frame.</p>
-    */
-   private static Vec3 hoverPointFor(ClientLevel level, Entity target, LocalPlayer player) {
-      Direction facing = null;
-      if (target instanceof ItemFrame frame) {
-         try {
-            facing = frame.getDirection();
-         } catch (Throwable ignored) {
-         }
-      }
-      Vec3 frameCenter = target.getBoundingBox().getCenter();
-      int frameBlockY = target.blockPosition().getY();
-
-      if (facing != null && level != null) {
-         Direction sideDir = facing.getClockWise();
-         double[] dists = {1.5, 1.2, 1.9, 0.9};
-         int[] dyFeet = {-1, 0, -2};
-         int[] sides = {0, -1, 1};
-
-         for (double d : dists) {
-            for (int dy : dyFeet) {
-               for (int side : sides) {
-                  double cx = target.getX() + facing.getStepX() * d + sideDir.getStepX() * side * 0.7;
-                  double cz = target.getZ() + facing.getStepZ() * d + sideDir.getStepZ() * side * 0.7;
-                  int bx = (int)Math.floor(cx);
-                  int by = frameBlockY + dy;
-                  int bz = (int)Math.floor(cz);
-                  if (!FlyController.isPassableColumn(level, bx, by, bz)) {
-                     continue;
-                  }
-                  Vec3 eyePos = new Vec3(bx + 0.5, by + 1.62, bz + 0.5);
-                  try {
-                     BlockHitResult hit = level.clip(
-                        new ClipContext(eyePos, frameCenter, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player)
-                     );
-                     if (hit.getType() == HitResult.Type.MISS) {
-                        return new Vec3(bx + 0.5, by + 0.08, bz + 0.5);
-                     }
-                  } catch (Throwable ignored) {
-                  }
-               }
-            }
-         }
-         return new Vec3(
-            target.getX() + facing.getStepX() * 1.5,
-            frameBlockY - 1 + 0.08,
-            target.getZ() + facing.getStepZ() * 1.5
-         );
-      }
-
-      double dx = player.getX() - target.getX();
-      double dz = player.getZ() - target.getZ();
-      double length = Math.max(Math.sqrt(dx * dx + dz * dz), 0.001);
-      return new Vec3(
-         target.getX() + dx / length * 1.6,
-         target.getY() - 1.0,
-         target.getZ() + dz / length * 1.6
-      );
+      this.info(message, ChatFormatting.AQUA);
    }
 
    // ------------------------------------------------------------------ TAKING
@@ -1608,16 +1634,21 @@ public final class ElytraHuntManager {
          return;
       }
       if (!canAttackEntity(level, player, frame)) {
-         FlyController.NavState state = this.flight.navigate(
-            mc, level, player, hoverPointFor(level, frame, player), true, true
+         // Still inside one vertical shaft: never fall back to a side hover point.
+         if (this.columnStage == null) {
+            this.beginColumnApproach(player, frame, now);
+            this.columnStage = ColumnStage.DESCEND;
+         }
+         FlyController.ColumnState column = this.flight.travelColumn(
+            mc, level, player, this.columnX, this.columnZ, this.columnFloorY - 1.0, true
          );
-         if (obstacleWork(state)) {
+         if (column == FlyController.ColumnState.MINING) {
             this.phaseStartMs = now;
          }
          this.throttledInfo(
-            state == FlyController.NavState.MINING
-               ? "展示框被方块遮挡，正在挖开阻挡…"
-               : "正在贴近展示框至有效攻击距离…",
+            column == FlyController.ColumnState.MINING
+               ? "展示框仍被方块遮挡，继续沿垂直列向下挖掘…"
+               : "正在沿垂直列贴近展示框至有效攻击距离…",
             now
          );
          return;
@@ -1678,13 +1709,17 @@ public final class ElytraHuntManager {
       // Use 3D A* + block mining whenever a block is between the player and the drop,
       // or during an active dig window.
       if ((!directClear && distance > 0.9) || (this.dropDigUntilMs != 0L && now < this.dropDigUntilMs)) {
-         FlyController.NavState state = this.flight.navigate(
-            mc, level, player, drop.position(), true, true
+         // Same vertical rule for a dropped elytra: come down the item's own column.
+         FlyController.ColumnState column = this.flight.travelColumn(
+            mc, level, player, drop.getX(), drop.getZ(), drop.getY() - 0.4, true
          );
-         this.dropIssue = "寻路/挖路中（导航=" + state + "，最近 "
+         this.dropIssue = "垂直挖路中（" + column + "，最近 "
             + String.format("%.1f", this.dropBestDistance) + " 格）";
-         this.throttledInfo("正在挖开 / 绕行接近掉落的鞘翅…", now);
-         return;
+         if (column == FlyController.ColumnState.MOVING || column == FlyController.ColumnState.MINING) {
+            this.throttledInfo("正沿掉落鞘翅的正上方向下挖掘…", now);
+            return;
+         }
+         // ARRIVED / BLOCKED: fall through to the exact pickup hover below.
       }
       if (this.dropDigUntilMs != 0L) {
          this.dropDigUntilMs = 0L;
@@ -1759,14 +1794,51 @@ public final class ElytraHuntManager {
          this.baselineElytra = countElytra(player);
       }
       if (this.targetElytra > 0 && this.collected >= this.targetElytra) {
-         this.finish(mc, "已达目标数量 " + this.targetElytra + " 个");
+         this.beginDeparture(player, now, "已达目标数量 " + this.targetElytra + " 个");
          return;
       }
       if (player.getInventory().getFreeSlot() < 0) {
-         this.finish(mc, "背包已满，无法继续拾取");
+         this.beginDeparture(player, now, "背包已满，无法继续拾取");
          return;
       }
-      this.continueHunting(player, now);
+      this.beginDeparture(player, now, null);
+   }
+
+   /**
+    * Step 3: after a successful pickup, climb straight up out of the ship along
+    * the player's current X/Z before resuming the hunt (or finishing).
+    */
+   private void beginDeparture(LocalPlayer player, long now, String finishReason) {
+      this.departX = player.getX();
+      this.departZ = player.getZ();
+      this.departY = Math.max(player.getY() + DEPART_CLEARANCE, this.flight.cruiseY());
+      this.departSinceMs = now;
+      this.departFinishReason = finishReason;
+      this.phaseStartMs = now;
+      this.phase = Phase.DEPARTING;
+      this.info("已拾取鞘翅，正沿当前垂直列向上飞离船体…", ChatFormatting.AQUA);
+   }
+
+   private void tickDeparting(Minecraft mc, LocalPlayer player, ClientLevel level, long now) {
+      FlyController.ColumnState column = this.flight.travelColumn(
+         mc, level, player, this.departX, this.departZ, this.departY, true
+      );
+      if (column != FlyController.ColumnState.ARRIVED
+         && now - this.departSinceMs <= DEPART_TIMEOUT_MS) {
+         this.throttledInfo(
+            "正在垂直向上飞离（还差 " + (int)Math.max(0.0, this.departY - player.getY()) + " 格）…", now
+         );
+         return;
+      }
+      String reason = this.departFinishReason;
+      this.departFinishReason = null;
+      this.departSinceMs = 0L;
+      this.flight.hover(mc, player, true);
+      if (reason != null) {
+         this.finish(mc, reason);
+      } else {
+         this.continueHunting(player, now);
+      }
    }
 
    /** Reset per-candidate state and immediately pick the next ship. */
