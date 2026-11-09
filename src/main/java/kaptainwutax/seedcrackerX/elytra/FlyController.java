@@ -2,6 +2,7 @@ package kaptainwutax.seedcrackerX.elytra;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
@@ -510,6 +511,14 @@ public final class FlyController {
    private static final double MINE_REACH = 4.25;
    private static final double MINE_APPROACH_DIST = 2.1;
    private static final long MINE_TIMEOUT_MS = 12000L;
+   /**
+    * A block whose break timed out must not be picked again immediately.
+    * Without this cooldown the planner re-selected the very same ladder /
+    * protected block after every 12s timeout, producing an endless loop.
+    */
+   private static final long MINE_FAILURE_COOLDOWN_MS = 20000L;
+   /** {@code BlockPos.asLong() -> expiry millis}; only touched on the client thread. */
+   private static final Map<Long, Long> MINE_FAILURES = new HashMap<>();
    private static final double THREAT_PROBE_DISTANCE = 28.0;
    private static final double THREAT_PADDING = 0.35;
 
@@ -559,6 +568,8 @@ public final class FlyController {
    private boolean miningFootBlocker;
    private long miningStartMs;
    private int offAimTicks;
+   /** Whether the REAL crosshair (OUTLINE raycast) lands on the mining target. */
+   private boolean crosshairOnTarget;
    private long ignoreThreatUntilMs;
    private NavState navState = NavState.CLEAR;
 
@@ -586,6 +597,8 @@ public final class FlyController {
 
    public void resetForNewTarget() {
       this.stopMining(Minecraft.getInstance());
+      FlyController.MINE_FAILURES.clear();
+      this.crosshairOnTarget = false;
       this.cruiseY = CRUISE_Y;
       this.liftRetries = 0;
       this.clearPath();
@@ -1580,7 +1593,7 @@ public final class FlyController {
          int cy = BlockPos.getY(cLong);
          int cz = BlockPos.getZ(cLong);
 
-         if (cx == gx && cy == gy && gz == gz) {
+         if (cx == gx && cy == gy && cz == gz) {
             bestIdx = current;
             break;
          }
@@ -1919,6 +1932,9 @@ public final class FlyController {
    }
 
    public static boolean isMineableBlock(ClientLevel level, LocalPlayer player, BlockPos pos) {
+      if (pos == null || isMineFailure(pos)) {
+         return false;
+      }
       try {
          if (level.getChunk(pos.getX() >> 4, pos.getZ() >> 4, ChunkStatus.FULL, false) == null) {
             return false;
@@ -1938,6 +1954,36 @@ public final class FlyController {
       } catch (Throwable ignored) {
          return false;
       }
+   }
+
+   /** True while {@code pos} is still in the post-failure cooldown. */
+   private static boolean isMineFailure(BlockPos pos) {
+      if (pos == null) {
+         return false;
+      }
+      Long until = FlyController.MINE_FAILURES.get(pos.asLong());
+      if (until == null) {
+         return false;
+      }
+      if (System.currentTimeMillis() >= until) {
+         FlyController.MINE_FAILURES.remove(pos.asLong());
+         return false;
+      }
+      return true;
+   }
+
+   /**
+    * Blacklist a block whose break never completed (server-side protection,
+    * a client-only ghost block, a thin shape we cannot aim at, ...). A*
+    * then routes around it instead of re-selecting it every timeout.
+    */
+   private static void markMineFailure(BlockPos pos) {
+      if (pos == null) {
+         return;
+      }
+      long now = System.currentTimeMillis();
+      FlyController.MINE_FAILURES.entrySet().removeIf(e -> e.getValue() < now);
+      FlyController.MINE_FAILURES.put(pos.asLong(), now + FlyController.MINE_FAILURE_COOLDOWN_MS);
    }
 
    /**
@@ -2024,7 +2070,15 @@ public final class FlyController {
       }
 
       if (best == null) {
-         return candidates.get(0);
+         // Keep the "boxed in by unbreakable blocks" path (the caller reports
+         // BLOCKED), but never hand back a block that just timed out - that is
+         // what used to re-trigger the same frozen break over and over.
+         for (BlockPos candidate : candidates) {
+            if (!isMineFailure(candidate)) {
+               return candidate;
+            }
+         }
+         return null;
       }
 
       // If another mineable block occludes the ray from eye to `best`, mine the occluder first!
@@ -2038,6 +2092,11 @@ public final class FlyController {
    /**
     * Check if the ray from {@code player.getEyePosition()} to {@code targetPos}
     * hits a closer mineable block first.
+    *
+    * <p>Only genuinely solid (non-passable) blocks may be returned. Vines and
+    * similar blocks have an OUTLINE shape but no collision shape, so choosing
+    * them as a mining target makes {@code tickMining()} see "already broken"
+    * on the very next tick and re-select them forever.</p>
     */
    private BlockPos findOccluder(ClientLevel level, LocalPlayer player, BlockPos targetPos) {
       Vec3 eye = player.getEyePosition();
@@ -2048,7 +2107,9 @@ public final class FlyController {
          );
          if (hit.getType() == HitResult.Type.BLOCK) {
             BlockPos hitPos = hit.getBlockPos();
-            if (!hitPos.equals(targetPos) && isMineableBlock(level, player, hitPos)) {
+            if (!hitPos.equals(targetPos)
+               && !isPassableBlock(level, hitPos)
+               && isMineableBlock(level, player, hitPos)) {
                return hitPos;
             }
          }
@@ -2061,19 +2122,70 @@ public final class FlyController {
       return this.findOccluder(level, player, currentMining);
    }
 
-   /** Find a point on {@code pos} that has direct unobstructed line of sight from the player's eyes. */
+   /**
+    * True when a ray from the eyes to {@code aim} really lands on {@code pos}
+    * with the same OUTLINE mode used by {@code LocalPlayer.raycastHitResult()}.
+    * The vanilla crosshair is recomputed by {@code Minecraft.pick()} on every
+    * tick, so a synthetic {@code mc.hitResult} alone is not enough to drive a
+    * break: if the real ray misses, {@code Minecraft.continueAttack(true)} calls
+    * {@code stopDestroyBlock()} and the server-side progress never advances.
+    */
+   private static boolean crosshairHitsTarget(ClientLevel level, LocalPlayer player, BlockPos pos, Vec3 aim) {
+      try {
+         BlockHitResult hit = level.clip(
+            new ClipContext(player.getEyePosition(), aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player)
+         );
+         return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(pos);
+      } catch (Throwable ignored) {
+         return false;
+      }
+   }
+
+   /**
+    * Find a point <b>on the block's real shape</b> with direct line of sight
+    * from the player's eyes.
+    *
+    * <p>This is the ladder fix. In 26.3 a ladder has a collision/outline shape
+    * of {@code AABB[0,0,0.8125] -> [1,1,1]}: a 3/16 thick panel attached to
+    * one face, with the voxel centre being empty air. The old implementation
+    * always aimed at {@code pos + 0.5 (+/- 0.35)}, i.e. inside that empty
+    * space, so the real crosshair never hit the ladder. Vanilla then called
+    * {@code stopDestroyBlock()} every tick - which our own mixin suppresses -
+    * and the break neither progressed nor aborted: the hunt kept re-selecting
+    * the same ladder forever ("frozen on a ladder"). The same applies to
+    * trapdoors, slabs, panes and other partial cubes.</p>
+    */
    private static Vec3 findBestAimPoint(ClientLevel level, LocalPlayer player, BlockPos pos) {
       Vec3 eye = player.getEyePosition();
-      Vec3 center = Vec3.atCenterOf(pos);
+      AABB shapeBox = null;
       try {
          VoxelShape shape = level.getBlockState(pos).getShape(level, pos);
          if (!shape.isEmpty()) {
-            center = shape.bounds().move(pos).getCenter();
+            shapeBox = shape.bounds().move(pos);
          }
       } catch (Throwable ignored) {
       }
+      Vec3 center = shapeBox == null ? Vec3.atCenterOf(pos) : shapeBox.getCenter();
 
-      // Candidate aim points: center and 6 face insets towards the player
+      List<Vec3> candidates = new ArrayList<>();
+      candidates.add(center);
+      if (shapeBox != null) {
+         // Face centres of the ACTUAL shape, inset slightly so a ray from
+         // outside definitely intersects the block rather than grazing it.
+         double mx = (shapeBox.minX + shapeBox.maxX) * 0.5;
+         double my = (shapeBox.minY + shapeBox.maxY) * 0.5;
+         double mz = (shapeBox.minZ + shapeBox.maxZ) * 0.5;
+         double e = 0.002;
+         candidates.add(new Vec3(mx, my, shapeBox.minZ + e));
+         candidates.add(new Vec3(mx, my, shapeBox.maxZ - e));
+         candidates.add(new Vec3(shapeBox.minX + e, my, mz));
+         candidates.add(new Vec3(shapeBox.maxX - e, my, mz));
+         candidates.add(new Vec3(mx, shapeBox.minY + e, mz));
+         candidates.add(new Vec3(mx, shapeBox.maxY - e, mz));
+      }
+
+      // Legacy voxel-centre offsets remain useful for full cubes when the
+      // shape centre is occluded by a neighbouring block.
       double[][] offsets = {
          {0.0, 0.0, 0.0},
          {0.0, 0.35, 0.0},
@@ -2083,26 +2195,26 @@ public final class FlyController {
          {0.0, 0.0, 0.35},
          {0.0, 0.0, -0.35}
       };
-      Vec3 bestFallback = center;
-      double bestDistSq = Double.MAX_VALUE;
       for (double[] off : offsets) {
-         Vec3 pt = new Vec3(pos.getX() + 0.5 + off[0], pos.getY() + 0.5 + off[1], pos.getZ() + 0.5 + off[2]);
-         double dSq = eye.distanceToSqr(pt);
-         if (dSq < bestDistSq) {
-            bestDistSq = dSq;
-            bestFallback = pt;
-         }
+         candidates.add(new Vec3(pos.getX() + 0.5 + off[0], pos.getY() + 0.5 + off[1], pos.getZ() + 0.5 + off[2]));
+      }
+
+      // A MISS is NOT acceptable here: it used to be treated as "clear shot",
+      // but it means the crosshair will not hit the block at all.
+      for (Vec3 pt : candidates) {
          try {
             BlockHitResult hit = level.clip(
                new ClipContext(eye, pt, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player)
             );
-            if (hit.getType() == HitResult.Type.MISS || hit.getBlockPos().equals(pos)) {
+            if (hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(pos)) {
                return pt;
             }
          } catch (Throwable ignored) {
          }
       }
-      return bestFallback;
+      // Fall back to a point on the real shape. Manual break driving in
+      // tickMining() still advances the break even when nothing is visible.
+      return center;
    }
 
    private static Direction bestFaceDirection(LocalPlayer player, BlockPos pos) {
@@ -2196,16 +2308,19 @@ public final class FlyController {
          + " 列偏移=" + String.format("%.2f", this.lastColumnOffset)
          + " 对准容差=" + String.format("%.2f", this.columnAlignTolerance(Minecraft.getInstance().player))
          + " 路径节点=" + (this.currentPath == null ? 0 : (this.pathIndex + "/" + this.currentPath.size()))
-         + " 准星偏离=" + this.offAimTicks + " tick";
+         + " 准星偏离=" + this.offAimTicks + " tick"
+         + " 准星命中=" + this.crosshairOnTarget
+         + " 挖掘冷却=" + FlyController.MINE_FAILURES.size();
    }
 
    // ------------------------------------------------------------------ Mining Execution
 
    private void startMiningBlock(LocalPlayer player, ClientLevel level, BlockPos blocker, long now) {
       this.alignPulseActive = false;
-      if (blocker.equals(this.miningPos)) {
+      if (blocker == null || blocker.equals(this.miningPos)) {
          return;
       }
+      this.crosshairOnTarget = false;
       BlockState state = level.getBlockState(blocker);
       equipForMining(player, state);
       int feetY = player.blockPosition().getY();
@@ -2236,6 +2351,8 @@ public final class FlyController {
          return NavState.DONE;
       }
       if (now - this.miningStartMs > MINE_TIMEOUT_MS) {
+         // Never let the planner re-select this exact block over and over.
+         markMineFailure(pos);
          this.stopMining(mc);
          return NavState.FAILED;
       }
@@ -2245,6 +2362,15 @@ public final class FlyController {
       this.miningDir = bestFaceDirection(player, pos);
       Vec3 eye = player.getEyePosition();
       double distToAim = eye.distanceTo(aim);
+
+      // The real crosshair is recomputed by Minecraft.pick() every tick. If it
+      // does not land on our target, Minecraft.continueAttack(true) calls
+      // stopDestroyBlock() (which our mixin suppresses) and NO
+      // continueDestroyBlock() ever runs - the break stalls forever. Detect
+      // that here and drive the break manually, exactly like ShulkerAutoStore.
+      boolean crosshairHits = crosshairHitsTarget(level, player, pos, aim);
+      this.crosshairOnTarget = crosshairHits;
+      this.offAimTicks = crosshairHits ? 0 : this.offAimTicks + 1;
 
       if (distToAim > MINE_REACH) {
          this.offAimTicks = 0;
@@ -2270,8 +2396,9 @@ public final class FlyController {
          equipForMining(player, level.getBlockState(pos));
       }
 
-      // Ensure mc.hitResult points to the block we are mining so Minecraft.continueAttack(true)
-      // does not call stopDestroyBlock() on the next tick.
+      // Best-effort: keep our synthetic hit so a same-tick vanilla attack also
+      // targets the block. Minecraft.pick() overwrites this next tick, which is
+      // why the manual-drive path above is required for partial-shape blocks.
       HitResult crosshair = mc.hitResult;
       boolean entityOnCrosshair = crosshair != null && crosshair.getType() == HitResult.Type.ENTITY;
       if (!entityOnCrosshair) {
@@ -2281,7 +2408,8 @@ public final class FlyController {
       boolean vanillaHandlesTick = mc.mouseHandler != null
          && mc.mouseHandler.isMouseGrabbed()
          && !player.isUsingItem()
-         && !entityOnCrosshair;
+         && !entityOnCrosshair
+         && crosshairHits;
 
       if (mc.options != null) {
          mc.options.keyAttack.setDown(vanillaHandlesTick);
@@ -2292,8 +2420,9 @@ public final class FlyController {
 
       try {
          if (vanillaHandlesTick) {
-            // When mouse is grabbed and no screen is open, Minecraft.continueAttack(true)
-            // already calls gameMode.continueDestroyBlock() once per tick during handleKeybinds().
+            // Real crosshair hits the target and the mouse is grabbed:
+            // Minecraft.continueAttack(true) already calls
+            // gameMode.continueDestroyBlock() once per tick.
             // Only call startDestroyBlock on the very first tick if not yet destroying.
             if (!this.miningStarted && !mc.gameMode.isDestroying()) {
                mc.gameMode.startDestroyBlock(pos, direction);
@@ -2301,8 +2430,11 @@ public final class FlyController {
             }
             this.miningStarted = true;
          } else {
-            // Screen is open (e.g., chat) or mouse is unfocused or an entity is in the way:
-            // drive the break directly once per tick.
+            // Crosshair misses (thin ladder panel, entity in the way, screen
+            // open, mouse not grabbed): release the attack key and drive the
+            // break ourselves. stopDestroyBlock() is suppressed by
+            // MultiPlayerGameModeMixin while isDestroyProtected() is active,
+            // so the server-side destroy progress keeps accumulating.
             if (!mc.gameMode.isDestroying()) {
                mc.gameMode.startDestroyBlock(pos, direction);
             } else {
@@ -2312,6 +2444,7 @@ public final class FlyController {
             this.miningStarted = true;
          }
       } catch (Throwable ignored) {
+         markMineFailure(pos);
          this.stopMining(mc);
          return NavState.FAILED;
       }
@@ -2341,6 +2474,7 @@ public final class FlyController {
       this.miningFootBlocker = false;
       this.miningStartMs = 0L;
       this.offAimTicks = 0;
+      this.crosshairOnTarget = false;
    }
 
    private static void aimAtVec(LocalPlayer player, Vec3 target) {
