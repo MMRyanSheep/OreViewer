@@ -478,6 +478,22 @@ public final class FlyController {
    private static final double DESCENT_HOLD_Y = 0.20;
    /** Horizontal tolerance for declaring the column reached. */
    private static final double COLUMN_ARRIVE_XZ = 0.75;
+   /**
+    * MC 26.3 keeps 91% of the horizontal velocity each tick in creative
+    * flight, so releasing all movement keys still coasts another
+    * {@code v * 0.91 / 0.09 ~ 10 * v} blocks. At a raised fly speed one
+    * keypress can therefore coast 5+ blocks: a position-based "fly to the
+    * centre" servo can never converge on a 1x1 column. Fine alignment uses
+    * single pulses from a hard-braked standstill instead (see
+    * {@link #driveHorizontalAlignKeys}), so the step size is always exactly
+    * one impulse, whatever the fly speed.
+    */
+   /** Bounds for the "directly above the frame" X/Z tolerance. */
+   private static final double COLUMN_ALIGN_MIN_XZ = 0.18;
+   private static final double COLUMN_ALIGN_MAX_XZ = 0.55;
+   private static final double COLUMN_ALIGN_HARD_CAP_XZ = 1.2;
+   /** Tolerance floor derived from the measured single-pulse step. */
+   private static final double ALIGN_STEP_TOLERANCE = 0.6;
 
    // Swept AABB & A* parameters
    private static final double PROBE_DISTANCE = 40.0;
@@ -521,6 +537,12 @@ public final class FlyController {
    /** Last blocking block found below the player, for the /ov qc debug line. */
    private BlockPos lastColumnBlocker;
    private double lastColumnOffset;
+
+   // Fine horizontal-alignment state (single-pulse + hard brake).
+   private double alignStep;
+   private double alignLastX;
+   private double alignLastZ;
+   private boolean alignPulseActive;
 
    // 3D A* path state
    private List<BlockPos> currentPath;
@@ -682,6 +704,10 @@ public final class FlyController {
       this.verticalSampleMs = 0L;
       this.lastColumnBlocker = null;
       this.lastColumnOffset = 0.0;
+      this.alignStep = 0.0;
+      this.alignLastX = 0.0;
+      this.alignLastZ = 0.0;
+      this.alignPulseActive = false;
    }
 
    /**
@@ -777,11 +803,19 @@ public final class FlyController {
     * let the full-AABB blocker scan in {@link #travelColumn} dig whatever is
     * actually under the player's feet, in whichever column it happens to be.</p>
     */
-   private void driveColumnDescent(Minecraft mc, LocalPlayer player, double targetFeetY) {
+   private void driveColumnDescent(
+      Minecraft mc, LocalPlayer player, double targetFeetY, double columnX, double columnZ
+   ) {
       if (mc == null || mc.options == null) {
          return;
       }
-      this.brakeHorizontal(mc, player);
+      // Keep the shaft under the frame even if a raised fly speed drifts us
+      // sideways. This is only a weak correction with a wide dead band: the
+      // descent is NEVER gated on being centred (that gate is what used to
+      // stall the vertical dig), the full-AABB blocker scan always runs.
+      this.driveHorizontalAlignKeys(
+         mc, player, columnX, columnZ, Math.max(0.5, 1.5 * this.columnAlignTolerance(player))
+      );
       // Hold sneak until the feet actually reach the target instead of
       // stopping a couple of blocks short at a high fly speed.
       this.driveDescentVertical(mc, player, targetFeetY);
@@ -790,6 +824,86 @@ public final class FlyController {
       if (!useKeyInUse(mc)) {
          mc.options.keyUse.setDown(false);
       }
+   }
+
+   /**
+    * How close to the block centre counts as "directly above the frame".
+    * The floor grows with the MEASURED single-pulse step, so even a fly-speed
+    * tweak injected into {@code aiStep} (which never touches Abilities) cannot
+    * make the target unreachable: one pulse simply moves one step.
+    */
+   public double columnAlignTolerance(LocalPlayer player) {
+      double speed = player == null ? 0.05 : Math.max(0.02F, player.getAbilities().getFlyingSpeed());
+      double base = Mth.clamp(1.6 * speed, COLUMN_ALIGN_MIN_XZ, COLUMN_ALIGN_MAX_XZ);
+      return Mth.clamp(
+         Math.max(base, ALIGN_STEP_TOLERANCE * this.alignStep),
+         COLUMN_ALIGN_MIN_XZ, COLUMN_ALIGN_HARD_CAP_XZ
+      );
+   }
+
+   /**
+    * Fine horizontal alignment by SINGLE PULSES from a hard-braked standstill.
+    *
+    * <p>Creative flight keeps 91% of horizontal velocity each tick, so a held
+    * movement key coasts ~10x its velocity. At a raised fly speed that makes
+    * any position/coast-predicted servo oscillate instead of converging. Here
+    * the horizontal velocity is zeroed client-side every tick (the same
+    * technique {@code ShulkerAutoStore} uses to hold a precise position), and
+    * at most ONE forward pulse is issued. The next tick therefore moves
+    * exactly one impulse towards the column centre, and the step is measured
+    * so {@link #columnAlignTolerance} can scale the arrival band.</p>
+    *
+    * <p>Vertical keys are deliberately left untouched: the caller owns them.</p>
+    */
+   private void driveHorizontalAlignKeys(
+      Minecraft mc, LocalPlayer player, double columnX, double columnZ, double tolerance
+   ) {
+      if (mc == null || mc.options == null || player == null) {
+         return;
+      }
+      double dx = columnX - player.getX();
+      double dz = columnZ - player.getZ();
+      double dist = Math.sqrt(dx * dx + dz * dz);
+
+      // Measure the previous pulse BEFORE zeroing anything. Only ticks that
+      // actually issued a pulse count, so a long coarse flight cannot inflate
+      // the estimate.
+      if (this.alignPulseActive) {
+         double moved = Math.hypot(player.getX() - this.alignLastX, player.getZ() - this.alignLastZ);
+         if (moved > 0.001 && moved < 8.0) {
+            this.alignStep = Math.max(moved, this.alignStep * 0.9);
+         }
+      }
+      this.alignLastX = player.getX();
+      this.alignLastZ = player.getZ();
+
+      if (dist > 0.18) {
+         player.setYRot((float)(Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
+      }
+      player.setXRot(0.0F);
+
+      Vec3 vel = player.getDeltaMovement();
+      boolean pulse = dist > tolerance;
+      // Hard brake: keep exactly one impulse of movement per alignment tick.
+      player.setDeltaMovement(0.0, vel.y, 0.0);
+      mc.options.keyUp.setDown(pulse);
+      mc.options.keyDown.setDown(false);
+      mc.options.keyLeft.setDown(false);
+      mc.options.keyRight.setDown(false);
+      mc.options.keySprint.setDown(false);
+      mc.options.keyAttack.setDown(false);
+      if (!useKeyInUse(mc)) {
+         mc.options.keyUse.setDown(false);
+      }
+      this.alignPulseActive = pulse;
+   }
+
+   /** Horizontal alignment while HOLDING the feet at {@code holdFeetY}. */
+   private void driveHorizontalAlign(
+      Minecraft mc, LocalPlayer player, double columnX, double columnZ, double holdFeetY
+   ) {
+      this.driveHorizontalAlignKeys(mc, player, columnX, columnZ, this.columnAlignTolerance(player));
+      this.driveVertical(mc, player, holdFeetY, LOCAL_VERTICAL_DEADZONE);
    }
 
    // ------------------------------------------------------------------ main navigation entry
@@ -939,8 +1053,15 @@ public final class FlyController {
     * direction of travel. Blocking blocks are found by scanning the FULL player
     * AABB footprint ({@link #findVerticalBlocker}), so a fraction-of-a-block
     * horizontal offset - common when a mod raises the creative fly speed - can
-    * no longer hide the floor block under the player's feet. Descending no
-    * longer waits for an exact 1x1 column centre alignment.</p>
+    * no longer hide the floor block under the player's feet. Descending is no
+    * longer GATED on an exact 1x1 column centre alignment (that gate caused
+    * the old "keeps trying to descend, never mines the floor" stall).</p>
+    *
+    * <p>The gate now lives in {@link #alignOverhead}: the caller must first
+    * place the player directly above the frame with that method, and only then
+    * start descending with this one. That keeps the strict "dig down from
+    * directly above the display frame" behaviour without bringing the stall
+    * back, because the descent itself never waits for alignment.</p>
     *
     * <p>Mining reuses {@link #startMiningBlock} / {@link #tickMining}, so tool
     * switching and vanilla {@code destroyProgress} stay consistent with the
@@ -1034,10 +1155,104 @@ public final class FlyController {
          // Do NOT gate the descent on reaching the exact block centre. At a
          // raised fly speed that alignment never converges, so the old code
          // only "tried to descend" while never digging the floor underfoot.
-         this.driveColumnDescent(mc, player, targetFeetY);
+         this.driveColumnDescent(mc, player, targetFeetY, columnX, columnZ);
       } else {
          this.steerRaw(mc, player, new Vec3(columnX, targetFeetY, columnZ), true, 0.14);
       }
+      this.setNav(NavState.CLEAR);
+      return ColumnState.MOVING;
+   }
+
+   /**
+    * HARD GATE before {@link #travelColumn}: put the player directly above the
+    * item frame's block column and hold that altitude until the X/Z offset is
+    * inside {@link #columnAlignTolerance}. Only then may the caller begin the
+    * downward dig, so the elytra is always approached from straight above
+    * instead of from the side of the cabin.
+    *
+    * <p>Unlike the old "centre first" branch inside {@code travelColumn}, this
+    * method never mixes horizontal alignment with vertical digging: the full
+    * player AABB is swept towards the column centre (so offsets cannot hide a
+    * blocking block), and the horizontal servo uses single pulses from a hard
+    * brake so a raised fly speed cannot make it oscillate forever. The descent
+    * in {@code travelColumn} is untouched.</p>
+    *
+    * @param holdFeetY altitude to hold while aligning (normally the shaft top)
+    * @return ARRIVED only when centred AND at/above the requested altitude
+    */
+   public ColumnState alignOverhead(
+      Minecraft mc, ClientLevel level, LocalPlayer player,
+      double columnX, double columnZ, double holdFeetY, boolean allowMine
+   ) {
+      if (mc == null || level == null || player == null) {
+         return ColumnState.BLOCKED;
+      }
+      long now = System.currentTimeMillis();
+      this.ensureFlight(player);
+      this.sampleVerticalSpeed(player);
+
+      // Never interrupt an active break session: changing the target mid-break
+      // resets the server-side destroy progress in 26.x.
+      if (this.miningPos != null) {
+         if (isPassableBlock(level, this.miningPos)) {
+            this.stopMining(mc);
+         } else {
+            NavState mineState = this.tickMining(mc, level, player, now);
+            if (mineState == NavState.MINING || mineState == NavState.APPROACH_MINE) {
+               this.setNav(mineState);
+               return ColumnState.MINING;
+            }
+            if (mineState == NavState.FAILED) {
+               this.stopMining(mc);
+               return ColumnState.BLOCKED;
+            }
+            this.stopMining(mc);
+         }
+      }
+
+      double dx = columnX - player.getX();
+      double dz = columnZ - player.getZ();
+      double horiz = Math.sqrt(dx * dx + dz * dz);
+      this.lastColumnOffset = horiz;
+      double tolerance = this.columnAlignTolerance(player);
+      double dy = holdFeetY - player.getY();
+      // dy > 0 => target above us; allowing a few blocks of extra height is
+      // harmless (still "directly above"), but never start the descent from
+      // BELOW the shaft top.
+      double heightBand = Math.max(1.0, this.verticalArrivalBand());
+      // The vertical servo can only hold within one impulse-scaled band, so
+      // demanding an exact 0.6-block altitude would never finish at a raised
+      // fly speed. The caller aims a couple of blocks above the shaft top, so
+      // even a full band of error still leaves us above the display frame.
+      boolean atHeight = dy <= heightBand && dy >= -heightBand - 2.0;
+      if (horiz <= tolerance && atHeight) {
+         this.hover(mc, player, false);
+         this.setNav(NavState.CLEAR);
+         return ColumnState.ARRIVED;
+      }
+
+      // Full-AABB sweep towards the column centre at the CURRENT altitude.
+      Vec3 alignPoint = new Vec3(columnX, player.getY(), columnZ);
+      BlockPos blocker = this.findNextBlockToMine(level, player, BlockPos.containing(alignPoint), alignPoint);
+      this.lastColumnBlocker = blocker;
+      if (blocker != null) {
+         if (!allowMine || !isMineableBlock(level, player, blocker)) {
+            this.hover(mc, player, false);
+            this.setNav(NavState.BLOCKED);
+            return ColumnState.BLOCKED;
+         }
+         this.startMiningBlock(player, level, blocker, now);
+         NavState mineState = this.tickMining(mc, level, player, now);
+         if (mineState == NavState.FAILED) {
+            this.stopMining(mc);
+            return ColumnState.BLOCKED;
+         }
+         this.setNav(mineState);
+         return ColumnState.MINING;
+      }
+
+      this.stopMining(mc);
+      this.driveHorizontalAlign(mc, player, columnX, columnZ, holdFeetY);
       this.setNav(NavState.CLEAR);
       return ColumnState.MOVING;
    }
@@ -1979,6 +2194,7 @@ public final class FlyController {
          + " 贴身阻挡=" + this.miningFootBlocker
          + " 脚下阻挡=" + (this.lastColumnBlocker == null ? "无" : this.lastColumnBlocker)
          + " 列偏移=" + String.format("%.2f", this.lastColumnOffset)
+         + " 对准容差=" + String.format("%.2f", this.columnAlignTolerance(Minecraft.getInstance().player))
          + " 路径节点=" + (this.currentPath == null ? 0 : (this.pathIndex + "/" + this.currentPath.size()))
          + " 准星偏离=" + this.offAimTicks + " tick";
    }
@@ -1986,6 +2202,7 @@ public final class FlyController {
    // ------------------------------------------------------------------ Mining Execution
 
    private void startMiningBlock(LocalPlayer player, ClientLevel level, BlockPos blocker, long now) {
+      this.alignPulseActive = false;
       if (blocker.equals(this.miningPos)) {
          return;
       }
@@ -2278,6 +2495,7 @@ public final class FlyController {
    /** Stop horizontal movement and stay airborne. */
    public void hover(Minecraft mc, LocalPlayer player, boolean levelPitch) {
       this.stopMining(mc);
+      this.alignPulseActive = false;
       this.ensureFlight(player);
       this.brakeInPlace(mc, player);
       if (levelPitch) {

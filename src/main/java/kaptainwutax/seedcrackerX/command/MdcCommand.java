@@ -20,7 +20,7 @@ public class MdcCommand extends ClientCommand {
    }
 
    private int start() {
-      GuidanceManager.INSTANCE.setStructureTarget(GuidanceManager.TargetKind.END_CITY, 3);
+      GuidanceManager.INSTANCE.setStructureTarget(GuidanceManager.TargetKind.END_CITY, 3, true);
       return 0;
    }
 

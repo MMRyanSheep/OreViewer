@@ -40,11 +40,17 @@ public class HelpScreen {
       automine.addEntry(eb.startTextDescription(Component.literal("/ov zd 停止").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
       automine.addEntry(eb.startTextDescription(Component.literal("  停止自动挖矿。")).build());
       automine.addEntry(eb.startTextDescription(Component.literal("")).build());
-      automine.addEntry(eb.startTextDescription(Component.literal("/ov ch [开|关|状态]").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
+      automine.addEntry(eb.startTextDescription(Component.literal("/ov ch [开|关|状态|立即]").withStyle(s -> s.withColor(ChatFormatting.YELLOW))).build());
       automine.addEntry(
          eb.startTextDescription(
             Component.literal("  背包满自动存盒开关。背包全满且背包内有未满的潜影盒时，自动把鞘翅、矿物等物品存入盒子并取回，存完继续收集鞘翅或挖矿。")
                .withStyle(s -> s.withColor(ChatFormatting.WHITE))
+         ).build()
+      );
+      automine.addEntry(
+         eb.startTextDescription(
+            Component.literal("  /ov ch 状态 显示背包空格、潜影盒、可存物品与受阻原因；/ov ch 立即 强制存盒一次，满包却没反应时先看这两条。")
+               .withStyle(s -> s.withColor(ChatFormatting.GRAY))
          ).build()
       );
       automine.addEntry(eb.startTextDescription(Component.literal("")).build());

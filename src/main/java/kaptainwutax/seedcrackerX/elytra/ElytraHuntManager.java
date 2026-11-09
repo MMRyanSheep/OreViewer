@@ -112,7 +112,13 @@ public final class ElytraHuntManager {
    // in front of the frame, then dig a 1x1 vertical shaft down through the cabin roof.
    private static final int DESCENT_CLEARANCE = 7;
    private static final double DESCENT_FLOOR_OFFSET = 1.0;
-   private static final double COLUMN_ALIGN_XZ = 0.85;
+   /** Above this distance a coarse 3D flight to the overhead point is used; below it the strict align servo takes over. */
+   private static final double COLUMN_COARSE_XZ = 3.0;
+   /** Maximum X/Z drift tolerated while descending before re-centring directly over the frame. */
+   private static final double COLUMN_DESCENT_MAX_XZ = 1.2;
+   /** At a raised fly speed exact centring may be physically unreachable: accept a slightly wider column after this long. */
+   private static final long COLUMN_ALIGN_GRACE_MS = 20000L;
+   private static final double COLUMN_ALIGN_FALLBACK_XZ = 0.6;
    private static final long VERTICAL_APPROACH_TIMEOUT_MS = 60000L;
    private static final long COLUMN_BLOCKED_TIMEOUT_MS = 3000L;
    private static final int DEPART_CLEARANCE = 24;
@@ -303,6 +309,8 @@ public final class ElytraHuntManager {
    private double columnZ;
    private double columnTopY;
    private double columnFloorY;
+   /** Lowest feet Y reached during the current descent; used to renew the approach timeout on real progress. */
+   private double columnBestY;
    private long columnSinceMs;
    private long columnBlockedSinceMs;
    /** Vertical departure after a pickup, before the next candidate is chosen. */
@@ -347,6 +355,7 @@ public final class ElytraHuntManager {
       this.columnStage = null;
       this.columnSinceMs = 0L;
       this.columnBlockedSinceMs = 0L;
+      this.columnBestY = 0.0;
       this.departSinceMs = 0L;
       this.departBestY = 0.0;
       this.departProgressMs = 0L;
@@ -559,6 +568,9 @@ public final class ElytraHuntManager {
             + " 垂直列=(" + String.format("%.1f", this.columnX) + ", " + String.format("%.1f", this.columnZ) + ")"
             + " 列顶=" + (int)this.columnTopY
             + " 列底=" + (int)this.columnFloorY
+            + " 列偏移=" + (player == null
+               ? "-" : String.format("%.2f", Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ())))
+            + " 对准容差=" + String.format("%.2f", this.flight.columnAlignTolerance(player))
             + " 飞离起点=(" + String.format("%.1f", this.departX) + ", " + String.format("%.1f", this.departZ) + ")"
             + " 飞离目标Y=" + (int)this.departY
             + " 飞离最高Y=" + (int)this.departBestY
@@ -1323,11 +1335,11 @@ public final class ElytraHuntManager {
       }
       this.columnTopY = topBlockY + 0.08;
       this.columnFloorY = block.getY() - DESCENT_FLOOR_OFFSET;
-      double horiz = player == null ? Double.MAX_VALUE
-         : Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ());
-      this.columnStage = (player != null && horiz <= COLUMN_ALIGN_XZ && player.getY() >= block.getY() - 0.5)
-         ? ColumnStage.DESCEND
-         : ColumnStage.ALIGN;
+      this.columnBestY = player == null ? this.columnTopY : player.getY();
+      // NEVER skip the overhead leg. Skipping it (the old `horiz <= 0.85`
+      // shortcut) is what let the shaft be started from the side of the
+      // cabin: travelColumn no longer re-centres X/Z before descending.
+      this.columnStage = ColumnStage.ALIGN;
       this.columnSinceMs = now;
       this.columnBlockedSinceMs = 0L;
       this.phaseStartMs = now;
@@ -1873,14 +1885,19 @@ public final class ElytraHuntManager {
          this.info("检测到掉落的鞘翅，开始吸取追踪…", ChatFormatting.AQUA);
          return;
       }
-      // Immediate check: if the frame is already in unobstructed attack reach, take it right away.
       Entity target = this.pickupOnly ? this.droppedItem : this.targetFrame;
       if (target == null || target.isRemoved() || !target.isAlive()) {
          this.throttledInfo("目标实体正在重新同步…", now);
          return;
       }
-      if (!this.pickupOnly && status == TargetStatus.FRAME && canAttackEntity(level, player, target)) {
-         this.enterTaking(mc, player, target, now, "已进入展示框有效攻击距离，开始取物");
+      // Only take the frame from the vertical shaft. An unobstructed shot from
+      // the SIDE of the cabin must NOT short-circuit the strict overhead
+      // approach - that is exactly the "approaching from another direction"
+      // regression this gate prevents.
+      if (!this.pickupOnly && status == TargetStatus.FRAME
+         && this.columnStage == ColumnStage.DESCEND
+         && canAttackEntity(level, player, target)) {
+         this.enterTaking(mc, player, target, now, "已沿垂直列进入展示框有效攻击距离，开始取物");
          return;
       }
 
@@ -1893,24 +1910,60 @@ public final class ElytraHuntManager {
          return;
       }
 
-      // Step 2a: reach the point directly above the located coordinates.
+      // Step 2a: HARD GATE - fly to the point directly above the located
+      // coordinates and centre the 1x1 column before ANY downward digging.
+      // The anti-stall rewrite of travelColumn deliberately stopped re-centring
+      // X/Z, so this gate is the only thing that guarantees the descent starts
+      // from directly above the display frame.
       if (this.columnStage == ColumnStage.ALIGN) {
-         Vec3 overhead = new Vec3(this.columnX, this.columnTopY, this.columnZ);
          double horiz = Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ());
-         boolean aboveTarget = player.getY() >= target.blockPosition().getY() + 1.0;
-         if (horiz > COLUMN_ALIGN_XZ || (!aboveTarget && player.getY() < this.columnTopY - 1.5)) {
-            if (horiz <= 2.2 && Math.abs(player.getY() - this.columnTopY) <= 4.0) {
-               this.flight.travelColumn(mc, level, player, this.columnX, this.columnZ, this.columnTopY, true);
-            } else {
-               FlyController.NavState state = this.flight.navigate(
-                  mc, level, player, overhead, horiz < 10.0, true
-               );
-               if (state == FlyController.NavState.BLOCKED) {
-                  this.flight.lift();
+         // Aim a little ABOVE the shaft top: at a raised fly speed the vertical
+         // servo can only hold within one impulse-scaled band, and starting the
+         // descent from inside the roof must be avoided.
+         double holdY = this.columnTopY + 2.0;
+         Vec3 overhead = new Vec3(this.columnX, holdY, this.columnZ);
+         boolean coarse = horiz > COLUMN_COARSE_XZ
+            || player.getY() < this.columnTopY - 8.0
+            || player.getY() > this.columnTopY + 12.0;
+         FlyController.ColumnState align;
+         if (coarse) {
+            FlyController.NavState state = this.flight.navigate(
+               mc, level, player, overhead, horiz < 10.0, true
+            );
+            if (state == FlyController.NavState.BLOCKED) {
+               this.flight.lift();
+            }
+            align = FlyController.ColumnState.MOVING;
+         } else {
+            align = this.flight.alignOverhead(
+               mc, level, player, this.columnX, this.columnZ, holdY, true
+            );
+         }
+         boolean aligned = align == FlyController.ColumnState.ARRIVED;
+         // At a raised fly speed one keypress already coasts several blocks, so
+         // an exact centre may be physically unreachable. Accept a slightly
+         // wider column after a grace period instead of stalling forever.
+         if (!aligned && !coarse && align != FlyController.ColumnState.BLOCKED
+            && now - this.columnSinceMs > COLUMN_ALIGN_GRACE_MS
+            && horiz <= COLUMN_ALIGN_FALLBACK_XZ
+            && player.getY() >= this.columnTopY - 2.0) {
+            aligned = true;
+            this.info("高速飞行下已达到对准精度上限，仍从展示框正上方开始下挖…", ChatFormatting.YELLOW);
+         }
+         if (!aligned) {
+            if (align == FlyController.ColumnState.BLOCKED) {
+               if (this.columnBlockedSinceMs == 0L) {
+                  this.columnBlockedSinceMs = now;
                }
+               if (now - this.columnBlockedSinceMs > COLUMN_BLOCKED_TIMEOUT_MS) {
+                  this.nextCandidateWithReason(player, now, "无法飞到展示框正上方（被不可挖掘方块阻断）");
+                  return;
+               }
+            } else {
+               this.columnBlockedSinceMs = 0L;
             }
             this.throttledInfo(
-               "正在飞到展示框正上方（水平还差 " + String.format("%.1f", horiz) + " 格，高度还差 "
+               "正在飞到展示框正上方并对准垂直列（水平还差 " + String.format("%.2f", horiz) + " 格，高度还差 "
                   + (int)Math.max(0.0, this.columnTopY - player.getY()) + " 格）…", now
             );
             return;
@@ -1919,12 +1972,27 @@ public final class ElytraHuntManager {
          this.columnStage = ColumnStage.DESCEND;
          this.columnSinceMs = now;
          this.columnBlockedSinceMs = 0L;
+         this.columnBestY = player.getY();
          this.phaseStartMs = now;
          this.info("已对准展示框正上方 1x1 垂直列，开始向下挖掘进舱…", ChatFormatting.AQUA);
          return;
       }
 
       // Step 2b: dig straight down inside the located 1x1 block-centered column.
+      double columnHoriz = Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ());
+      if (columnHoriz > COLUMN_DESCENT_MAX_XZ) {
+         // Hold the current altitude and re-centre instead of continuing to
+         // dig a shaft that has wandered away from the frame.
+         this.flight.alignOverhead(mc, level, player, this.columnX, this.columnZ, player.getY(), true);
+         this.throttledInfo(
+            "下降时偏离展示框垂直列（" + String.format("%.2f", columnHoriz) + " 格），正在重新对准正上方…", now
+         );
+         return;
+      }
+      if (player.getY() < this.columnBestY - 0.8) {
+         this.columnBestY = player.getY();
+         this.columnSinceMs = now; // real downward progress, not a stall
+      }
       FlyController.ColumnState column = this.flight.travelColumn(
          mc, level, player, this.columnX, this.columnZ, this.columnFloorY, true
       );
@@ -2008,23 +2076,24 @@ public final class ElytraHuntManager {
          return;
       }
       if (!canAttackEntity(level, player, frame)) {
-         // Stay in the 1x1 block-centered column at cabin floor level (never dig down into the obsidian floor).
+         // Strictly vertical: never fall back to 3D A* here. That fallback used
+         // to fly / dig towards the frame from the side of the cabin, which is
+         // exactly the behaviour the user rejected.
          if (this.columnStage == null) {
             this.beginColumnApproach(player, frame, now);
             this.columnStage = ColumnStage.DESCEND;
+         }
+         double horiz = Math.hypot(this.columnX - player.getX(), this.columnZ - player.getZ());
+         if (horiz > COLUMN_DESCENT_MAX_XZ) {
+            this.flight.alignOverhead(mc, level, player, this.columnX, this.columnZ, player.getY(), true);
+            this.throttledInfo("取物时偏离展示框垂直列，正在重新对准正上方…", now);
+            return;
          }
          FlyController.ColumnState column = this.flight.travelColumn(
             mc, level, player, this.columnX, this.columnZ, this.columnFloorY, true
          );
          if (column == FlyController.ColumnState.MINING) {
             this.phaseStartMs = now;
-         } else if (column == FlyController.ColumnState.ARRIVED || column == FlyController.ColumnState.BLOCKED) {
-            FlyController.NavState nav = this.flight.navigate(
-               mc, level, player, new Vec3(this.columnX, this.columnFloorY, this.columnZ), true, true
-            );
-            if (nav == FlyController.NavState.MINING) {
-               this.phaseStartMs = now;
-            }
          }
          this.throttledInfo(
             column == FlyController.ColumnState.MINING
@@ -2197,10 +2266,24 @@ public final class ElytraHuntManager {
             this.beginDeparture(player, now, null);
             return;
          }
-         this.beginDeparture(player, now, "背包已满（且无可用潜影盒可存入），无法继续拾取");
+         this.beginDeparture(player, now, this.fullInventoryReason(mc, player));
          return;
       }
       this.beginDeparture(player, now, null);
+   }
+
+   /** 背包满且无法继续收集时，给出自动存盒的真实受阻原因，而不是笼统的「无可用潜影盒」。 */
+   private String fullInventoryReason(Minecraft mc, LocalPlayer player) {
+      String why;
+      try {
+         why = ShulkerAutoStore.INSTANCE.diagnose(mc, player);
+      } catch (Throwable t) {
+         why = "诊断失败：" + t.getClass().getSimpleName();
+      }
+      if (why == null) {
+         why = "原因未知";
+      }
+      return "背包已满，暂时无法存入潜影盒（" + why + "），无法继续拾取";
    }
 
    /**
@@ -2264,7 +2347,7 @@ public final class ElytraHuntManager {
       this.departProgressMs = 0L;
       this.flight.hover(mc, player, true);
       if (reason == null && player.getInventory().getFreeSlot() < 0 && !ShulkerAutoStore.INSTANCE.canStoreInventory(player)) {
-         reason = "背包已满（且无可用潜影盒可存入），无法继续拾取";
+         reason = this.fullInventoryReason(mc, player);
       }
       if (reason != null) {
          this.finish(mc, reason);

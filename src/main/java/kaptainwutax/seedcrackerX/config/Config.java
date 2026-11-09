@@ -64,6 +64,8 @@ public class Config {
    public boolean xrayAntiXray = true;
    public boolean autoMineShulkerSave = true;
    public boolean autoMineAttackMobs = true;
+   /** 配置迁移标记：旧版把 autoMineShulkerSave 以 false 落盘，升级后需一次性打开。 */
+   public int settingsVersion = 0;
    /** 饱食度不足时自动吃背包里的食物（全局功能，与自动挖矿是否开启无关）。 */
    public boolean autoEatEnabled = true;
    /** 饱食度低于等于该值时触发自动进食，范围 1..19。 */
@@ -101,11 +103,17 @@ public class Config {
    public static void load() {
       Gson gson = new Gson();
       if (file.exists()) {
+         boolean migrate = false;
          try (Reader reader = new FileReader(file)) {
             INSTANCE = (Config)gson.fromJson(reader, Config.class);
          } catch (Exception e) {
             logger.error("seedcracker couldn't load config, deleting it...", e);
             file.delete();
+            INSTANCE = new Config();
+         }
+
+         if (INSTANCE == null) {
+            INSTANCE = new Config();
          }
 
          INSTANCE.active = false;
@@ -116,6 +124,26 @@ public class Config {
          if (INSTANCE.activeVersion == null) {
             INSTANCE.activeVersion = "";
          }
+
+         // 旧版本里 autoMineShulkerSave 的默认值是 false，并被写进了 seedcracker.json。
+         // 后来代码默认改成 true，但老配置文件里的显式 false 仍会覆盖默认值，导致
+         // 「背包满了却完全不存盒、也没有任何提示」。这里做一次性迁移；迁移之后
+         // 用户再用 /ov ch 关 关闭就不会被重新打开。
+         if (INSTANCE.settingsVersion < 2) {
+            INSTANCE.settingsVersion = 2;
+            if (!INSTANCE.autoMineShulkerSave) {
+               INSTANCE.autoMineShulkerSave = true;
+               logger.info("[config] 已将旧配置中关闭的自动存盒迁移为开启（/ov ch 关 可关闭）");
+            }
+            migrate = true;
+         }
+
+         logger.info("[config] autoMineShulkerSave={}, settingsVersion={}", INSTANCE.autoMineShulkerSave, INSTANCE.settingsVersion);
+         if (migrate) {
+            save();
+         }
+      } else {
+         INSTANCE.settingsVersion = 2;
       }
    }
 

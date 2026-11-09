@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 import kaptainwutax.seedcrackerX.Features;
 import kaptainwutax.seedcrackerX.config.Config;
+import kaptainwutax.seedcrackerX.elytra.CityCandidate;
 import kaptainwutax.seedcrackerX.util.Compat;
 import kaptainwutax.seedcrackerX.xray.OreXrayManager;
 import net.minecraft.client.Camera;
@@ -94,6 +95,8 @@ public class GuidanceManager {
    private Collection<Biome> biomeTargets = null;
    private String activeLabel = "";
    private int maxTargets = 3;
+   /** Only /ov mdc: filter end cities down to the ones that actually generated a ship. */
+   private boolean shipsOnly = false;
    private volatile String fkBlockPath = null;
    private volatile List<GuidanceManager.GuidanceTarget> targets = new ArrayList<>();
    private final AtomicBoolean scanning = new AtomicBoolean(false);
@@ -135,6 +138,7 @@ public class GuidanceManager {
       this.biomeTargets = null;
       this.activeLabel = "";
       this.fkBlockPath = null;
+      this.shipsOnly = false;
       this.targets = new ArrayList<>();
    }
 
@@ -150,6 +154,7 @@ public class GuidanceManager {
          this.activeKind = GuidanceManager.TargetKind.FK_BLOCK;
          this.biomeTargets = null;
          this.fkBlockPath = blockPath;
+         this.shipsOnly = false;
          this.activeLabel = blockPath;
          this.maxTargets = 3;
          this.targets = new ArrayList<>();
@@ -160,6 +165,10 @@ public class GuidanceManager {
    }
 
    public void setStructureTarget(GuidanceManager.TargetKind kind, int maxTargets) {
+      this.setStructureTarget(kind, maxTargets, false);
+   }
+
+   public void setStructureTarget(GuidanceManager.TargetKind kind, int maxTargets, boolean shipsOnly) {
       if (!OreXrayManager.INSTANCE.isActive()) {
          Compat.sendSystemMessage(Component.literal("[指引] 请先使用 /ov sz 设置种子。"));
       } else {
@@ -167,6 +176,7 @@ public class GuidanceManager {
          this.biomeTargets = null;
          this.activeLabel = labelFor(kind);
          this.maxTargets = maxTargets;
+         this.shipsOnly = shipsOnly;
          this.targets = new ArrayList<>();
          this.lastScanMs = 0L;
          Config.get().guidanceEnabled = true;
@@ -184,6 +194,7 @@ public class GuidanceManager {
          this.biomeTargets = fallbackBiomes;
          this.activeLabel = label;
          this.maxTargets = maxTargets;
+         this.shipsOnly = false;
          this.targets = new ArrayList<>();
          this.lastScanMs = 0L;
          Config.get().guidanceEnabled = true;
@@ -221,6 +232,7 @@ public class GuidanceManager {
                long fSeed = seed;
                int fMax = this.maxTargets;
                String fFkPath = this.fkBlockPath;
+               boolean fShipsOnly = this.shipsOnly;
                Level fLevel = mc.level;
                RegistryAccess registry = mc.level.registryAccess();
                String dimId = mc.level.dimension().identifier().getPath();
@@ -240,7 +252,7 @@ public class GuidanceManager {
                         boolean usedVanilla = this.setupVanillaPipeline(registry, fSeed, dimId, dimMinY, dimHeight);
                         this.scanBiomes(pos, fSeed, Config.get().getVersion(), kind, result, usedVanilla);
                      } else {
-                        this.scanStructures(pos, fSeed, Config.get().getVersion(), kind, result, registry, dimId, dimMinY, dimHeight, fPlayerInNether);
+                        this.scanStructures(pos, fSeed, Config.get().getVersion(), kind, result, registry, dimId, dimMinY, dimHeight, fPlayerInNether, fShipsOnly);
                      }
                   } catch (Throwable t) {
                      LOGGER.error("[guidance] scan failed", t);
@@ -281,11 +293,29 @@ public class GuidanceManager {
       String dimId,
       int minY,
       int height,
-      boolean playerInNether
+      boolean playerInNether,
+      boolean shipsOnly
    ) {
       int color = kind == GuidanceManager.TargetKind.END_CITY ? COLOR_END_CITY : COLOR_STRUCTURE;
       VanillaStructureLocator.Dim dim = VanillaStructureLocator.dimFor(kind);
       BlockPos origin = dim == null ? playerPos : VanillaStructureLocator.originFor(dim, playerPos, playerInNether);
+
+      // /ov mdc reuses the elytra hunt's ship-filtered city search, so only
+      // cities that actually generated an end ship are ever pointed at.
+      if (shipsOnly) {
+         try {
+            VanillaStructureLocator.CityResult ships = VanillaStructureLocator.findEndCitiesWithShip(
+               seed, origin, Math.max(1, this.maxTargets)
+            );
+            for (CityCandidate city : ships.cities()) {
+               BlockPos cityPos = city.pos();
+               out.add(new GuidanceManager.GuidanceTarget(cityPos, color, origin, renderPosFor(cityPos, dim, playerInNether)));
+            }
+         } catch (Throwable t) {
+            LOGGER.warn("[guidance] end city ship scan failed", t);
+         }
+         return;
+      }
 
       VanillaStructureLocator.Result found;
       try {

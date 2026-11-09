@@ -1,6 +1,8 @@
 package kaptainwutax.seedcrackerX.automine;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import kaptainwutax.seedcrackerX.autoeat.AutoEatManager;
@@ -37,11 +39,14 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemContainerContents;
 import net.minecraft.world.item.component.SwingAnimation;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.ShulkerBoxBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import org.slf4j.Logger;
@@ -58,7 +63,7 @@ import org.slf4j.LoggerFactory;
  *    <li>在附近找一格不与玩家碰撞体积重叠的支撑方块放置潜影盒；</li>
  *    <li>非潜影盒手持状态右键打开盒子，服务器端下发 ShulkerBoxMenu；</li>
  *    <li>对背包中的鞘翅、矿物及可堆叠物品逐格 QUICK_MOVE（等同 shift 点击）存入盒子；</li>
- *    <li>关闭界面、切镐子挖掉盒子、把带内容的盒子捡回背包；</li>
+ *    <li>关闭界面、先挖掉挡在玩家与盒子之间（或压在盒子上方）的方块，再挖掉盒子、把带内容的盒子捡回背包；</li>
  *    <li>恢复自动鞘翅收集或自动挖矿。</li>
  * </ol>
  *
@@ -69,10 +74,37 @@ public final class ShulkerAutoStore {
    public static final ShulkerAutoStore INSTANCE = new ShulkerAutoStore();
    private static final Logger LOGGER = LoggerFactory.getLogger("SeedCrackerX-ShulkerStore");
 
-   private static final int TOTAL_TIMEOUT_TICKS = 600;
+   private static final int TOTAL_TIMEOUT_TICKS = 1000;
    private static final int MAX_MOVES = 27;
    private static final int MAX_NON_ORE_MOVES = 8;
    private static final double MAX_REACH_SQ = 18.0;
+   /** 清障阶段总上限：多个阻挡方块逐个开挖也不至于把整次存盒拖死。 */
+   private static final int MAX_CLEAR_TICKS = 360;
+   /** 单个阻挡方块挖不动（基岩 / 领地保护 / 黑曜石太慢）时的放弃上限。 */
+   private static final int MAX_BLOCKER_TICKS = 220;
+   /** 满包但存盒没能启动时，聊天提示的最短间隔（毫秒），避免刷屏。 */
+   private static final long HINT_INTERVAL_MS = 10000L;
+   /**
+    * 存盒挖掘期间屏蔽原版 {@code stopDestroyBlock()}。
+    * 26.3 的 {@code Minecraft.handleKeybinds()} 只要左键没按下就会每帧调用一次
+    * {@code stopDestroyBlock()}（{@code continueAttack(false)} 分支），会把服务端
+    * 的破坏进度反复清零。挖掘中持续续期，收尾时由 {@link #stopBreaking(Minecraft)}
+    * 先清零再主动 ABORT。
+    */
+   private static volatile long destroyProtectedUntilMs;
+
+   /** 供 {@code MultiPlayerGameModeMixin} 判断当前是否处于存盒挖掘会话。 */
+   public static boolean isDestroyProtected() {
+      return System.currentTimeMillis() < ShulkerAutoStore.destroyProtectedUntilMs;
+   }
+
+   private static void protectDestroy(long millis) {
+      ShulkerAutoStore.destroyProtectedUntilMs = System.currentTimeMillis() + millis;
+   }
+
+   private static void clearDestroyProtection() {
+      ShulkerAutoStore.destroyProtectedUntilMs = 0L;
+   }
    private static final Set<String> ORE_DROP_ITEMS = Set.of(
       "diamond", "emerald", "lapis_lazuli", "redstone", "coal",
       "raw_iron", "raw_gold", "raw_copper",
@@ -113,7 +145,7 @@ public final class ShulkerAutoStore {
 
    private enum State {
       IDLE, PREPARE, PLACE, WAIT_PLACE, OPEN_BOX, WAIT_OPEN, STORE,
-      WAIT_CLOSE, BREAK, COLLECT
+      WAIT_CLOSE, CLEAR_OBSTRUCTION, BREAK, COLLECT
    }
 
    private State state = State.IDLE;
@@ -133,8 +165,18 @@ public final class ShulkerAutoStore {
    private int nonOreMoves;
    private boolean breakStarted;
    private boolean failed;
+   /** 总超时只兜底回收一次，防止 abort→BREAK→下一 tick 又超时→abort 的死循环。 */
+   private boolean timeoutRecovering;
    private final Set<Integer> attemptedSlots = new HashSet<>();
+   /** 当前正在挖的方块（清障阶段为阻挡方块，BREAK 阶段为潜影盒本身）。 */
+   private BlockPos breakTarget;
+   private int breakTargetTicks;
+   /** 挖不动的阻挡方块，避免在同一个基岩/受保护方块上空转到超时。 */
+   private final Set<BlockPos> skippedBlockers = new HashSet<>();
    private Level startLevel;
+   private long lastHintMs;
+   private String lastHintReason;
+   private long lastTriggerErrorMs;
 
    private ShulkerAutoStore() {
    }
@@ -152,7 +194,163 @@ public final class ShulkerAutoStore {
       if (!this.inventoryFull(player)) {
          return false;
       }
-      return this.findNonFullShulkerSlot(player) >= 0;
+      int box = this.findNonFullShulkerSlot(player);
+      // 只有盒子却没有能腾出格子的物品时，存盒并不会让拾取继续；
+      // 不能让鞘翅搜寻误以为「可以存盒」而继续跑下一个点。
+      return box >= 0 && this.countStorable(player, box) > 0;
+   }
+
+   /**
+    * 诊断「此刻为什么没有开始自动存盒」。返回 null 表示所有条件都已满足，随时可以开始。
+    * 用于 /ov ch 状态、满包时的节流提示，以及鞘翅搜寻在背包满结束时的准确原因。
+    */
+   public String diagnose(Minecraft mc, LocalPlayer player) {
+      if (player == null) {
+         return "玩家不存在";
+      }
+      if (!Config.get().autoMineShulkerSave) {
+         return "自动存盒开关已关闭（输入 /ov ch 开 开启）";
+      }
+      if (this.state != State.IDLE) {
+         return "存盒流程正在进行中";
+      }
+      if (mc == null || mc.level == null || mc.gameMode == null || mc.options == null) {
+         return "世界尚未加载";
+      }
+      if (this.cooldown > 0) {
+         return "上一次存盒刚结束，冷却中（剩余 " + this.cooldown + " tick）";
+      }
+      if (Compat.screen(mc) != null) {
+         return "当前打开了界面";
+      }
+      if (!(player.containerMenu instanceof InventoryMenu)) {
+         return "当前不在背包界面";
+      }
+      if (AutoEatManager.INSTANCE.isBusy()) {
+         return "自动进食进行中，稍后自动重试";
+      }
+      try {
+         if (ElytraHuntManager.INSTANCE.isRunning() && !ElytraHuntManager.INSTANCE.allowsShulkerStore()) {
+            return "鞘翅搜寻正在定位或挖掘，稍后自动重试";
+         }
+      } catch (Throwable ignored) {
+      }
+      if (!this.inventoryFull(player)) {
+         return "背包还没满（还有 " + this.freeSlots(player) + " 个空格）";
+      }
+      int boxes = this.countShulkers(player);
+      if (boxes == 0) {
+         return "背包里没有潜影盒";
+      }
+      int box = this.findNonFullShulkerSlot(player);
+      if (box < 0) {
+         return "背包里的 " + boxes + " 个潜影盒都已装满";
+      }
+      if (this.countStorable(player, box) == 0) {
+         return "背包里没有可自动存入的物品（工具、食物、装备、容器类不会存入）";
+      }
+      if (this.findPlacementSpot(mc.level, player) == null) {
+         return "附近没有可放置潜影盒的安全空地（落到地面或开阔处会自动重试）";
+      }
+      return null;
+   }
+
+   /** /ov ch 状态 用的一行实时诊断。 */
+   public String statusLine() {
+      Minecraft mc = Minecraft.getInstance();
+      LocalPlayer player = mc == null ? null : mc.player;
+      int free = player == null ? -1 : this.freeSlots(player);
+      int boxes = player == null ? 0 : this.countShulkers(player);
+      int box = player == null ? -1 : this.findNonFullShulkerSlot(player);
+      int storable = (player == null || box < 0) ? 0 : this.countStorable(player, box);
+      String reason;
+      try {
+         reason = this.diagnose(mc, player);
+      } catch (Throwable t) {
+         reason = "诊断异常：" + t.getClass().getSimpleName();
+      }
+      return "开关=" + (Config.get().autoMineShulkerSave ? "开" : "关")
+         + " / 空格=" + free + "/36"
+         + " / 潜影盒=" + boxes + "（未满：" + (box >= 0 ? "有" : "无") + "）"
+         + " / 可存格=" + storable
+         + " / 流程=" + this.state
+         + " / 挖掘目标=" + (this.breakTarget == null ? "无" : this.posText(this.breakTarget))
+         + " / 跳过阻挡=" + this.skippedBlockers.size()
+         + " / 冷却=" + this.cooldown + "tick"
+         + " / 判定=" + (reason == null ? "条件齐备，可以存盒" : reason);
+   }
+
+   /**
+    * 手动强制启动一次存盒：忽略开关、冷却、鞘翅搜寻/自动进食让路，
+    * 但仍要求背包满、有未满潜影盒、有可存物品、附近能放置盒子。失败时把原因发到聊天。
+    */
+   public boolean forceStore() {
+      if (this.state != State.IDLE) {
+         this.warn("存盒流程正在进行中，请稍候。", ChatFormatting.YELLOW);
+         return false;
+      }
+
+      Minecraft mc = Minecraft.getInstance();
+      LocalPlayer player = mc == null ? null : mc.player;
+      String reason;
+      if (player == null) {
+         reason = "玩家不存在";
+      } else if (mc.level == null || mc.gameMode == null || mc.options == null) {
+         reason = "世界尚未加载";
+      } else if (Compat.screen(mc) != null) {
+         reason = "当前打开了界面，请先关闭";
+      } else if (!(player.containerMenu instanceof InventoryMenu)) {
+         reason = "当前不在背包界面";
+      } else if (!this.inventoryFull(player)) {
+         reason = "背包还没满（还有 " + this.freeSlots(player) + " 个空格）";
+      } else if (this.countShulkers(player) == 0) {
+         reason = "背包里没有潜影盒";
+      } else {
+         int box = this.findNonFullShulkerSlot(player);
+         if (box < 0) {
+            reason = "背包里的潜影盒都已装满";
+         } else if (this.countStorable(player, box) == 0) {
+            reason = "背包里没有可自动存入的物品";
+         } else {
+            BlockPos support = this.findPlacementSpot(mc.level, player);
+            if (support == null) {
+               reason = "附近没有可放置潜影盒的安全空地，请移到地面或开阔处再试";
+            } else {
+               this.cooldown = 0;
+               this.begin(mc, player, box, support);
+               return true;
+            }
+         }
+      }
+
+      this.warn("无法开始存盒：" + reason, ChatFormatting.YELLOW);
+      return false;
+   }
+
+   private int freeSlots(LocalPlayer player) {
+      int n = 0;
+      Inventory inv = player.getInventory();
+      for (int i = 0; i < 36; i++) {
+         if (inv.getItem(i).isEmpty()) {
+            n++;
+         }
+      }
+
+      return n;
+   }
+
+   /** 满包但没能存盒时，把具体原因节流发到聊天，避免再次「什么都没发生」。 */
+   private void hint(String reason) {
+      // 用户主动关掉开关时降低频率，避免刷屏；开关开启时的异常才需要 10 秒一次地提醒。
+      long interval = Config.get().autoMineShulkerSave ? HINT_INTERVAL_MS : 60000L;
+      long now = System.currentTimeMillis();
+      if (now - this.lastHintMs < interval && Objects.equals(reason, this.lastHintReason)) {
+         return;
+      }
+
+      this.lastHintMs = now;
+      this.lastHintReason = reason;
+      this.warn("背包已满但未自动存盒：" + reason, ChatFormatting.YELLOW);
    }
 
    /**
@@ -223,7 +421,17 @@ public final class ShulkerAutoStore {
          if (this.cooldown > 0) {
             this.cooldown--;
          }
-         this.tryTrigger();
+         // 诊断会读取界面/背包/周围方块，任何异常都不能影响同一 END_CLIENT_TICK 上的
+         // 其它监听（自动进食、自动挖矿、鞘翅搜寻等）。
+         try {
+            this.tryTrigger();
+         } catch (Throwable t) {
+            long now = System.currentTimeMillis();
+            if (now - this.lastTriggerErrorMs > 10000L) {
+               this.lastTriggerErrorMs = now;
+               LOGGER.warn("[shulker-store] trigger scan failed", t);
+            }
+         }
          return;
       }
 
@@ -242,14 +450,19 @@ public final class ShulkerAutoStore {
       }
 
       if (mc.level != this.startLevel || this.totalTicks > TOTAL_TIMEOUT_TICKS) {
-         this.abort("存盒超时或切换了世界，正在收尾。", true);
+         if (this.timeoutRecovering) {
+            this.finish(false, "存盒超时，已停止；若地上有潜影盒请手动挖回。");
+         } else {
+            this.timeoutRecovering = true;
+            this.abort("存盒超时或切换了世界，正在收尾。", true);
+         }
          return;
       }
 
       if (this.placedPos != null
          && !(mc.level.getBlockState(this.placedPos).getBlock() instanceof ShulkerBoxBlock)
-         && this.state == State.BREAK) {
-         // 挖掘阶段盒子已经不在地上了，直接进入捡回确认（注意不能在 COLLECT 阶段重复触发，否则会死循环重置 ticks）。
+         && (this.state == State.BREAK || this.state == State.CLEAR_OBSTRUCTION)) {
+         // 挖掘/清障阶段盒子已经不在地上了，直接进入捡回确认（注意不能在 COLLECT 阶段重复触发，否则会死循环重置 ticks）。
          this.stopBreaking(mc);
          this.transition(State.COLLECT);
          return;
@@ -264,6 +477,7 @@ public final class ShulkerAutoStore {
             case WAIT_OPEN -> this.tickWaitOpen(mc, player);
             case STORE -> this.tickStore(mc, player);
             case WAIT_CLOSE -> this.tickWaitClose(mc, player);
+            case CLEAR_OBSTRUCTION -> this.tickClearObstruction(mc, player);
             case BREAK -> this.tickBreak(mc, player);
             case COLLECT -> this.tickCollect(mc, player);
             default -> this.finish(false, "存盒状态异常，已重置。");
@@ -275,10 +489,6 @@ public final class ShulkerAutoStore {
    }
 
    private void tryTrigger() {
-      if (this.cooldown > 0 || !Config.get().autoMineShulkerSave || AutoEatManager.INSTANCE.isBusy()) {
-         return;
-      }
-
       // 每 10 tick 扫一次条件即可，避免每帧遍历背包和周围方块。
       if (++this.scanCounter % 10 != 0) {
          return;
@@ -290,6 +500,21 @@ public final class ShulkerAutoStore {
       }
 
       LocalPlayer player = mc.player;
+
+      // 关键：背包已满且包里确实有潜影盒，却因为某个前置条件没能启动时，
+      // 必须明确告诉玩家原因（开关被旧配置关掉、附近没有放置点、盒子全满…），
+      // 否则表现就是「什么都没发生」，无法排查。
+      if (this.state == State.IDLE && this.inventoryFull(player) && this.countShulkers(player) > 0) {
+         String reason = this.diagnose(mc, player);
+         if (reason != null) {
+            this.hint(reason);
+         }
+      }
+
+      if (this.cooldown > 0 || !Config.get().autoMineShulkerSave || AutoEatManager.INSTANCE.isBusy()) {
+         return;
+      }
+
       // 不打断玩家正在进行的界面操作。
       if (Compat.screen(mc) != null || !(player.containerMenu instanceof InventoryMenu)) {
          return;
@@ -325,7 +550,11 @@ public final class ShulkerAutoStore {
       this.ticks = 0;
       this.totalTicks = 0;
       this.failed = false;
+      this.timeoutRecovering = false;
       this.breakStarted = false;
+      this.breakTarget = null;
+      this.breakTargetTicks = 0;
+      this.skippedBlockers.clear();
       this.moves = 0;
       this.nonOreMoves = 0;
       this.boxInvSlot = boxSlot;
@@ -625,11 +854,75 @@ public final class ShulkerAutoStore {
          }
 
          this.releaseUseKeys(mc);
-         this.transition(State.BREAK);
+         this.transition(State.CLEAR_OBSTRUCTION);
       }
    }
 
-   /** 挖回盒子：自动切换最优镐子，鼠标被抓取时交给原版驱动，否则自己驱动。 */
+   /**
+    * 装满后的清障：把挡在玩家视线里、或压在盒子正上方（挡住开盖 / 掉落物）的实心方块
+    * 逐个挖掉，然后才进入 BREAK 挖回盒子。
+    *
+    * <p>26.3 服务端破坏方块只校验距离、不校验视线，但客户端
+    * {@code Minecraft.handleKeybinds()} 每帧用「真实准星」驱动
+    * {@code continueDestroyBlock()}；视线被墙挡住时它会一直挖墙，
+    * 与我们对盒子的 START_DESTROY_BLOCK 交替，服务端的破坏进度被反复清零，
+    * 表现就是「阻挡方块没挖走、潜影盒也挖不掉」。这里显式把阻挡挖掉，
+    * 并用统一的手动驱动绕开准星。</p>
+    */
+   private void tickClearObstruction(Minecraft mc, LocalPlayer player) {
+      this.stabilizePlayer(mc, player);
+      if (this.ticks <= 1) {
+         // 存盒前鞘翅搜寻可能正在挖别的方块，先干净地结束那个破坏会话。
+         this.stopBreaking(mc);
+      }
+      if (this.placedPos == null
+         || !(mc.level.getBlockState(this.placedPos).getBlock() instanceof ShulkerBoxBlock)) {
+         this.stopBreaking(mc);
+         this.transition(State.COLLECT);
+         return;
+      }
+
+      if (this.ticks > MAX_CLEAR_TICKS) {
+         this.stopBreaking(mc);
+         this.warn("清除潜影盒周围阻挡超时，尝试直接挖回盒子。", ChatFormatting.YELLOW);
+         this.transition(State.BREAK);
+         return;
+      }
+
+      BlockPos blocker = this.findBreakObstruction(mc.level, player);
+      if (blocker == null) {
+         // 没有可清除的阻挡了：干净结束上一个破坏会话，再切到挖盒。
+         this.stopBreaking(mc);
+         this.breakTarget = null;
+         this.breakTargetTicks = 0;
+         this.transition(State.BREAK);
+         return;
+      }
+
+      if (!blocker.equals(this.breakTarget)) {
+         this.stopBreaking(mc);
+         this.breakTarget = blocker;
+         this.breakTargetTicks = 0;
+         this.equipForTarget(player, mc.level.getBlockState(blocker));
+         this.info("潜影盒被 " + this.blockLabel(mc.level.getBlockState(blocker))
+            + " 挡住，先挖掉阻挡方块 " + this.posText(blocker) + " …", ChatFormatting.GOLD);
+      }
+
+      this.breakTargetTicks++;
+      if (this.breakTargetTicks > MAX_BLOCKER_TICKS) {
+         this.skippedBlockers.add(blocker);
+         this.warn("阻挡方块 " + this.posText(blocker)
+            + " 挖不动（基岩 / 受保护 / 太硬），改为直接挖回潜影盒。", ChatFormatting.YELLOW);
+         this.stopBreaking(mc);
+         this.breakTarget = null;
+         this.breakTargetTicks = 0;
+         return;
+      }
+
+      this.driveBreak(mc, player, blocker, Vec3.atCenterOf(blocker));
+   }
+
+   /** 挖回盒子：与清障共用一套手动驱动，视线是否被挡都不影响。 */
    private void tickBreak(Minecraft mc, LocalPlayer player) {
       this.stabilizePlayer(mc, player);
       if (this.placedPos == null
@@ -646,45 +939,200 @@ public final class ShulkerAutoStore {
          return;
       }
 
-      BlockState boxState = mc.level.getBlockState(this.placedPos);
+      if (!this.placedPos.equals(this.breakTarget)) {
+         this.stopBreaking(mc);
+         this.breakTarget = this.placedPos;
+         this.breakTargetTicks = 0;
+         this.equipForTarget(player, mc.level.getBlockState(this.placedPos));
+      }
+
+      this.driveBreak(mc, player, this.placedPos, this.bestBoxAimPoint(mc.level, player));
+   }
+
+   /** 切换挖掘目标时只切一次工具，避免破坏中途换手把服务端进度清零。 */
+   private void equipForTarget(LocalPlayer player, BlockState state) {
       try {
-         FlyController.equipForMining(player, boxState);
+         FlyController.equipForMining(player, state);
          if (player.getInventory().getSelectedSlot() != this.originalSelectedSlot) {
             this.changedSelectedSlot = true;
          }
       } catch (Throwable ignored) {
       }
+   }
 
-      Vec3 center = Vec3.atCenterOf(this.placedPos);
-      this.faceAt(player, center);
-      mc.hitResult = new BlockHitResult(center, Direction.UP, this.placedPos, false);
+   /**
+    * 驱动一次方块破坏。{@code Minecraft.tick()} 会在 {@code handleKeybinds()}
+    * 之前用真实准星重算 {@code mc.hitResult}，所以准星本来就在目标上、且原版
+    * 能正常驱动时沿用原版链路；否则（视线被不可挖方块挡住、鼠标未抓取、
+    * 界面打开）松开左键自己 {@code continueDestroyBlock(target)}，并挂上
+    * {@link #isDestroyProtected()}，让原版 {@code continueAttack(false)} 每帧触发的
+    * {@code stopDestroyBlock()} 被 mixin 吃掉，服务端破坏进度才能连续累积。
+    * {@code continueDestroyBlock} 在目标变化时会自动重新 {@code startDestroyBlock}，
+    * 因此准星偶尔被实体抢占、或左键被玩家点了一下都能自愈。
+    */
+   private void driveBreak(Minecraft mc, LocalPlayer player, BlockPos target, Vec3 aim) {
+      this.stabilizePlayer(mc, player);
+      this.faceAt(player, aim);
+      Direction direction = Direction.getApproximateNearest(player.getEyePosition().subtract(aim));
+      mc.hitResult = new BlockHitResult(aim, direction, target, false);
 
-      boolean vanillaHandlesTick = mc.mouseHandler != null
-         && mc.mouseHandler.isMouseGrabbed()
-         && !player.isUsingItem();
-      mc.options.keyAttack.setDown(vanillaHandlesTick);
+      protectDestroy(1000L);
       mc.options.keyUse.setDown(false);
       mc.options.keyShift.setDown(false);
 
+      boolean vanillaHandlesTick = mc.mouseHandler != null
+         && mc.mouseHandler.isMouseGrabbed()
+         && !player.isUsingItem()
+         && Compat.screen(mc) == null
+         && this.crosshairHitsTarget(mc.level, player, target, aim);
+      mc.options.keyAttack.setDown(vanillaHandlesTick);
+
       try {
          if (vanillaHandlesTick) {
-            if (!this.breakStarted && !mc.gameMode.isDestroying()) {
-               mc.gameMode.startDestroyBlock(this.placedPos, Direction.UP);
+            // 原版 Minecraft.continueAttack(true) 每 tick 会调一次 continueDestroyBlock，
+            // 这里只在尚未开始破坏时补一次 START，避免重复推进破坏进度。
+            if (!mc.gameMode.isDestroying()) {
+               mc.gameMode.startDestroyBlock(target, direction);
             }
-         } else if (!mc.gameMode.isDestroying()) {
-            mc.gameMode.startDestroyBlock(this.placedPos, Direction.UP);
+         } else if (mc.gameMode.isDestroying()) {
+            mc.gameMode.continueDestroyBlock(target, direction);
          } else {
-            mc.gameMode.continueDestroyBlock(this.placedPos, Direction.UP);
+            mc.gameMode.startDestroyBlock(target, direction);
          }
          this.breakStarted = true;
       } catch (Throwable t) {
-         LOGGER.warn("[shulker-store] break failed", t);
+         LOGGER.warn("[shulker-store] break failed at {}", this.posText(target), t);
          this.stopBreaking(mc);
-         this.finish(false, null);
-         return;
+      }
+      player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+   }
+
+   /** 真实准星（忽略实体）是否正好落在要挖的方块上。 */
+   private boolean crosshairHitsTarget(Level level, LocalPlayer player, BlockPos target, Vec3 aim) {
+      try {
+         BlockHitResult hit = level.clip(
+            new ClipContext(player.getEyePosition(), aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player)
+         );
+         return hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(target);
+      } catch (Throwable ignored) {
+         return false;
+      }
+   }
+
+   /** 找出当前最该先挖掉的阻挡方块：盒子正上方实心块优先，其次是视线上的第一个实心块。 */
+   private BlockPos findBreakObstruction(Level level, LocalPlayer player) {
+      if (this.placedPos == null) {
+         return null;
       }
 
-      player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, false);
+      BlockPos above = this.placedPos.above();
+      if (this.isBreakableBlocker(level, above)
+         && !level.getBlockState(above).getCollisionShape(level, above).isEmpty()) {
+         return above;
+      }
+
+      Vec3 eye = player.getEyePosition();
+      BlockPos best = null;
+      double bestDistSq = Double.MAX_VALUE;
+      for (Vec3 aim : this.boxAimPoints(player)) {
+         try {
+            BlockHitResult hit = level.clip(
+               new ClipContext(eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player)
+            );
+            // 至少有一条视线直接命中盒子（或完全没碰到方块）→ 不需要清障。
+            if (hit.getType() != HitResult.Type.BLOCK || hit.getBlockPos().equals(this.placedPos)) {
+               return null;
+            }
+            BlockPos hitPos = hit.getBlockPos();
+            if (!this.isBreakableBlocker(level, hitPos)) {
+               continue;
+            }
+            double dSq = eye.distanceToSqr(hit.getLocation());
+            if (dSq < bestDistSq) {
+               bestDistSq = dSq;
+               best = hitPos;
+            }
+         } catch (Throwable ignored) {
+         }
+      }
+      return best;
+   }
+
+   /** 能挖、且值得挖的阻挡方块。容器 / 其它潜影盒 / 不可破坏方块交给「直接挖盒」兜底。 */
+   private boolean isBreakableBlocker(Level level, BlockPos pos) {
+      if (pos == null || pos.equals(this.placedPos) || this.skippedBlockers.contains(pos)) {
+         return false;
+      }
+      BlockState state = level.getBlockState(pos);
+      if (state.isAir() || state.getBlock() instanceof ShulkerBoxBlock || this.isInteractiveBlock(state)) {
+         return false;
+      }
+      if (state.is(Blocks.BEDROCK) || state.is(Blocks.BARRIER)
+         || state.is(Blocks.END_PORTAL) || state.is(Blocks.END_PORTAL_FRAME)) {
+         return false;
+      }
+      try {
+         float hardness = state.getDestroySpeed(level, pos);
+         // 不可破坏 / 黑曜石、远古残骸这类超硬方块不在这里硬耗，
+         // 直接交给「无视视线挖盒」兜底，避免一次存盒卡十几秒。
+         if (hardness < 0.0F || hardness > 20.0F) {
+            return false;
+         }
+      } catch (Throwable ignored) {
+      }
+      return true;
+   }
+
+   /** 盒子内部若干候选瞄点（都朝玩家一侧内缩），用于视线检测与手动破坏朝向。 */
+   private List<Vec3> boxAimPoints(LocalPlayer player) {
+      Vec3 fallback = this.placedPos == null ? player.getEyePosition() : Vec3.atCenterOf(this.placedPos);
+      List<Vec3> points = new ArrayList<>(5);
+      if (this.placedPos == null) {
+         points.add(fallback);
+         return points;
+      }
+      Vec3 eye = player.getEyePosition();
+      double cx = this.placedPos.getX() + 0.5;
+      double cy = this.placedPos.getY() + 0.5;
+      double cz = this.placedPos.getZ() + 0.5;
+      double sx = eye.x >= cx ? 0.34 : -0.34;
+      double sy = eye.y >= cy ? 0.34 : -0.34;
+      double sz = eye.z >= cz ? 0.34 : -0.34;
+      points.add(new Vec3(cx, cy, cz));
+      points.add(new Vec3(cx + sx, cy, cz + sz));
+      points.add(new Vec3(cx + sx, cy + sy, cz));
+      points.add(new Vec3(cx, cy + sy, cz + sz));
+      points.add(new Vec3(cx + sx, cy + sy, cz + sz));
+      return points;
+   }
+
+   /** 选一个视线能直接命中盒子的瞄点；都被挡住时退回中心，由手动驱动保证仍能挖到盒子。 */
+   private Vec3 bestBoxAimPoint(Level level, LocalPlayer player) {
+      Vec3 fallback = this.placedPos == null ? player.getEyePosition() : Vec3.atCenterOf(this.placedPos);
+      if (this.placedPos == null) {
+         return fallback;
+      }
+      Vec3 eye = player.getEyePosition();
+      for (Vec3 aim : this.boxAimPoints(player)) {
+         try {
+            BlockHitResult hit = level.clip(
+               new ClipContext(eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player)
+            );
+            if (hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(this.placedPos)) {
+               return aim;
+            }
+         } catch (Throwable ignored) {
+         }
+      }
+      return fallback;
+   }
+
+   private String blockLabel(BlockState state) {
+      try {
+         return BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
+      } catch (Throwable ignored) {
+         return "方块";
+      }
    }
 
    /** 确认带内容的潜影盒回到背包；等待原版 10 tick 掉落拾取延迟并在需要时靠近掉落物。 */
@@ -712,10 +1160,14 @@ public final class ShulkerAutoStore {
       }
 
       // 若在捡回潜影盒前地上的杂物恰好填满了最后一格背包，丢弃 1 格废块或普通可存杂物，确保潜影盒一定能进包。
+      // 清障阶段可能额外挖掉多个方块、掉落多格废石，所以每 10 tick 复查一次而不是只在第 25 tick 试一次。
       if (this.ticks == 25 && this.inventoryFull(player)) {
          if (!this.dropOneJunkSlotForPickup(mc, player)) {
             this.dropOneLowPrioritySlotForBox(mc, player);
          }
+      } else if (this.ticks >= 35 && this.ticks <= 95 && this.ticks % 10 == 0
+         && this.inventoryFull(player) && this.countShulkers(player) < this.initialShulkerCount) {
+         this.dropOneJunkSlotForPickup(mc, player);
       }
 
       Vec3 target = null;
@@ -806,6 +1258,8 @@ public final class ShulkerAutoStore {
    }
 
    private void stopBreaking(Minecraft mc) {
+      // 必须先解除保护，否则下面主动发出的 ABORT_DESTROY_BLOCK 也会被 mixin 吃掉。
+      clearDestroyProtection();
       if (mc.options != null) {
          mc.options.keyAttack.setDown(false);
       }
@@ -849,7 +1303,8 @@ public final class ShulkerAutoStore {
 
       if (recover && boxOnGround) {
          this.stopBreaking(mc);
-         this.transition(State.BREAK);
+         // 回收路径同样先清障，否则被墙挡住时依旧挖不回盒子。
+         this.transition(State.CLEAR_OBSTRUCTION);
       } else {
          this.finish(false, null);
       }
@@ -937,9 +1392,14 @@ public final class ShulkerAutoStore {
       this.startLevel = null;
       this.changedSelectedSlot = false;
       this.breakStarted = false;
+      this.breakTarget = null;
+      this.breakTargetTicks = 0;
+      this.skippedBlockers.clear();
       this.attemptedSlots.clear();
+      clearDestroyProtection();
       this.cooldown = ok ? 40 : 120;
       this.failed = false;
+      this.timeoutRecovering = false;
    }
 
    // ---------------------------------------------------------------- 判定辅助
@@ -1215,11 +1675,14 @@ public final class ShulkerAutoStore {
       BlockPos best = null;
       double bestScore = Double.MAX_VALUE;
 
-      for (int dy = -3; dy <= 2; dy++) {
-         for (int dx = -3; dx <= 3; dx++) {
-            for (int dz = -3; dz <= 3; dz++) {
+      // 半径放宽到 4 格、高度 -4..+3：末地船屋顶/竖井口附近常常只有一格能放盒子，
+      // 原来 3 格半径会直接返回 null，让整个功能静默失效。真正能否交互仍由
+      // MAX_REACH_SQ 与 placementStillValid 二次校验，放宽扫描不会导致远距离放置。
+      for (int dy = -4; dy <= 3; dy++) {
+         for (int dx = -4; dx <= 4; dx++) {
+            for (int dz = -4; dz <= 4; dz++) {
                int horizontal = dx * dx + dz * dz;
-               if (horizontal == 0 || horizontal > 9) {
+               if (horizontal == 0 || horizontal > 16) {
                   continue;
                }
 
@@ -1281,8 +1744,10 @@ public final class ShulkerAutoStore {
                   continue;
                }
 
-               // 优先选择完整实心顶面（sturdyTop）且与玩家处于相近高度的方块。
-               double score = distSq + (sturdyTop ? 0.0 : 6.0) + Math.abs(dy) * 0.5;
+               // 优先选择完整实心顶面（sturdyTop）、与玩家处于相近高度、且视线不被墙挡住的位置。
+               // 视线被挡不是硬性淘汰（竖井里常常只有这种位置），但优先清空地能少挖一格墙。
+               double score = distSq + (sturdyTop ? 0.0 : 6.0) + Math.abs(dy) * 0.5
+                  + (this.placementOccluded(level, player, support, target) ? 8.0 : 0.0);
                if (score < bestScore) {
                   bestScore = score;
                   best = support;
@@ -1292,6 +1757,22 @@ public final class ShulkerAutoStore {
       }
 
       return best;
+   }
+
+   /** 放置点到玩家眼睛之间是否隔着别的方块（支撑方块本身不算遮挡）。 */
+   private boolean placementOccluded(Level level, LocalPlayer player, BlockPos support, BlockPos target) {
+      try {
+         BlockHitResult hit = level.clip(new ClipContext(
+            player.getEyePosition(), Vec3.atCenterOf(target),
+            ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player
+         ));
+         if (hit.getType() != HitResult.Type.BLOCK) {
+            return false;
+         }
+         return !hit.getBlockPos().equals(support) && !hit.getBlockPos().equals(target);
+      } catch (Throwable ignored) {
+         return false;
+      }
    }
 
    private boolean placementStillValid(Level level, LocalPlayer player) {
