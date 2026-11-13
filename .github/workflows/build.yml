@@ -2,7 +2,7 @@ name: Build Fabric Mod
 
 on:
   push:
-    branches: [ "main", "master" ] # 可以根据你的默认分支修改，例如 main 或 master
+    branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
 
@@ -15,28 +15,29 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. 配置 Java 环境 (Fabric 1.18+ 通常需要 Java 17 或 21，请根据你的 gradle.properties 调整)
+      # 2. 配置 Java 环境（升级到 v5 消除警告）
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
 
-      # 3. 授予 Gradle Wrapper 执行权限 (Linux 环境下必需)
+      # 3. 授予 Gradle Wrapper 执行权限
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
-      # 4. 缓存 Gradle 依赖，加速后续构建
+      # 4. 缓存 Gradle 依赖（修复逗号导致的 Key 验证错误）
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${( hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') )}
+          # 注意：这里不能有逗号，改用空格或多个 hashFiles 拼接
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}-${{ hashFiles('**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 5. 执行 Gradle 构建 (编译并打包 mod)
+      # 5. 执行 Gradle 构建
       - name: Build with Gradle
         run: ./gradlew build
