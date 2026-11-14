@@ -1,0 +1,89 @@
+name: Release Fabric Mod
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (leave empty to use v<mod_version>)'
+        required: false
+        type: string
+      prerelease:
+        description: 'Publish as a prerelease'
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read release metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          properties = dict(
+              line.split('=', 1)
+              for raw in Path('gradle.properties').read_text().splitlines()
+              if (line := raw.strip()) and not line.startswith('#') and '=' in line
+          )
+          version = properties['mod_version'].strip()
+          name = properties['archives_base_name'].strip()
+          tag = os.environ['RELEASE_TAG'].strip() or f'v{version}'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag}\n')
+              output.write(f'jar=build/libs/{name}-{version}.jar\n')
+              output.write(f'sources=build/libs/{name}-{version}-sources.jar\n')
+          PY
+
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: git check-ref-format "refs/tags/$RELEASE_TAG"
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+          cache: gradle
+
+      - name: Build mod and sources
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean build
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          MOD_JAR: ${{ steps.metadata.outputs.jar }}
+          SOURCES_JAR: ${{ steps.metadata.outputs.sources }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          test -f "$MOD_JAR"
+          test -f "$SOURCES_JAR"
+          args=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "$MOD_JAR" "$SOURCES_JAR" \
+            --target "$GITHUB_SHA" \
+            --title "OreViewer $RELEASE_TAG" \
+            --generate-notes \
+            "${args[@]}"
